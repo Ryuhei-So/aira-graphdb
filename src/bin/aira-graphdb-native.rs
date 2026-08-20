@@ -122,6 +122,10 @@ struct Server {
     vector_values: HashMap<String, Vec<f64>>,
     cache_dirty: bool,
     batch_mode: bool,
+    wal_path: PathBuf,
+    wal_bytes: u64,
+    wal_replaying: bool,
+    last_persist_bytes: u64,
     node_keys_by_corpus: HashMap<String, Vec<String>>,
     edge_keys_by_corpus: HashMap<String, Vec<String>>,
     adjacent_edge_keys_by_node: HashMap<String, Vec<String>>,
@@ -202,6 +206,10 @@ impl Server {
         }
         Ok(Self {
             audit_log_path: db_path.with_extension("native-audit.log"),
+            wal_path: db_path.with_extension("agdb.wal"),
+            wal_bytes: 0,
+            wal_replaying: false,
+            last_persist_bytes: 0,
             vector_blob_path,
             db_path,
             state,
@@ -258,7 +266,7 @@ impl Server {
         );
     }
 
-    fn persist(&self) -> io::Result<()> {
+    fn persist(&mut self) -> io::Result<()> {
         let start = std::time::Instant::now();
         let mut persisted_state = self.state.clone();
         let vector_blob_payload =
@@ -310,6 +318,9 @@ impl Server {
             let _ = fs::remove_file(&tmp_path);
         }
 
+        // A successful full persist supersedes the WAL.
+        let _ = fs::remove_file(&self.wal_path);
+        self.last_persist_bytes = raw.len() as u64;
         let total_ms = start.elapsed().as_millis();
         eprintln!(
             "[persist] {}MB serialized in {}ms, written in {}ms",
@@ -321,11 +332,63 @@ impl Server {
     }
 
     fn persist_if_needed(&mut self) -> io::Result<()> {
-        if self.batch_mode {
-            Ok(())
-        } else {
-            self.persist()
+        // Durability is provided by the WAL (see wal_append); a full persist
+        // happens only on batch_commit, WAL compaction, or shutdown.
+        Ok(())
+    }
+
+    /// Methods whose successful execution must be captured in the WAL.
+    fn is_mutating_method(method: &str) -> bool {
+        matches!(method,
+            "upsert_nodes" | "upsert_edges" | "delete_nodes" | "delete_edges"
+            | "delete_by_document" | "delete_by_corpus"
+            | "vector_upsert" | "vector_delete_by_document" | "vector_delete_by_corpus"
+            | "memory_save" | "memory_upsert" | "memory_save_checkpoint"
+            | "lexical_index_passages" | "lexical_delete_by_document" | "lexical_delete_by_corpus"
+            | "index_status_save")
+    }
+
+    fn wal_append(&mut self, raw_line: &str) -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.wal_path)?;
+        file.write_all(raw_line.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        self.wal_bytes += raw_line.len() as u64 + 1;
+        // Adaptive compaction: keep WAL below a quarter of the last snapshot
+        // size (min 64MB) so total write cost grows O(n log n), not O(n^2).
+        let threshold = std::cmp::max(64 * 1024 * 1024, self.last_persist_bytes / 4);
+        if self.wal_bytes > threshold && !self.batch_mode {
+            self.persist()?;
+            self.wal_bytes = 0;
         }
+        Ok(())
+    }
+
+    fn replay_wal(&mut self) -> io::Result<usize> {
+        if !self.wal_path.exists() {
+            return Ok(0);
+        }
+        let content = fs::read_to_string(&self.wal_path)?;
+        self.wal_replaying = true;
+        let mut replayed = 0usize;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(req) = serde_json::from_str::<RpcRequest>(line) {
+                let resp = self.handle(req);
+                if resp.ok {
+                    replayed += 1;
+                }
+            }
+        }
+        self.wal_replaying = false;
+        self.wal_bytes = fs::metadata(&self.wal_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!("[wal] replayed {replayed} entries");
+        Ok(replayed)
     }
 
     fn key(corpus_id: &str, id: &str) -> String {
@@ -1063,6 +1126,73 @@ impl Server {
                     .map_err(|err| Self::execution_io_error(format!("persist failed: {err}")))?;
                 Ok(json!(null))
             }
+            "memory_upsert" => {
+                // Delta merge into the stored snapshot: callers send only the
+                // new document's passages/facts (+schema updates), so RPC
+                // payload and WAL growth stay O(delta) instead of O(corpus).
+                let corpus_id = req
+                    .params
+                    .get("corpusId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        Self::execution_client_error("missing corpusId".to_string())
+                    })?
+                    .to_string();
+                let snapshot = self
+                    .state
+                    .snapshots
+                    .entry(corpus_id.clone())
+                    .or_insert_with(|| json!({
+                        "corpusId": corpus_id,
+                        "schemaVersion": 1,
+                        "passages": [],
+                        "facts": [],
+                        "schemas": []
+                    }));
+                for (section, id_key) in [
+                    ("passages", "passageId"),
+                    ("facts", "factId"),
+                    ("schemas", "schemaId"),
+                ] {
+                    let incoming = match req.params.get(section).and_then(Value::as_array) {
+                        Some(items) if !items.is_empty() => items.clone(),
+                        _ => continue,
+                    };
+                    let existing = snapshot
+                        .get_mut(section)
+                        .and_then(Value::as_array_mut);
+                    if let Some(existing) = existing {
+                        let mut index: HashMap<String, usize> = HashMap::new();
+                        for (i, item) in existing.iter().enumerate() {
+                            if let Some(id) = item.get(id_key).and_then(Value::as_str) {
+                                index.insert(id.to_string(), i);
+                            }
+                        }
+                        for item in incoming {
+                            let id = item
+                                .get(id_key)
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            if let Some(&i) = index.get(&id) {
+                                existing[i] = item;
+                            } else {
+                                index.insert(id, existing.len());
+                                existing.push(item);
+                            }
+                        }
+                    } else {
+                        snapshot[section] = Value::Array(incoming);
+                    }
+                }
+                if let Some(exported) = req.params.get("exportedAt").cloned() {
+                    snapshot["exportedAt"] = exported;
+                }
+                self.mark_cache_dirty();
+                self.persist_if_needed()
+                    .map_err(|err| Self::execution_io_error(format!("persist failed: {err}")))?;
+                Ok(json!(null))
+            }
             "memory_save" => {
                 let snapshot = req
                     .params
@@ -1449,6 +1579,7 @@ fn main() -> io::Result<()> {
     }));
 
     let mut server = Server::open(db_path)?;
+    server.replay_wal()?;
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     for line_result in stdin.lock().lines() {
@@ -1504,7 +1635,17 @@ fn main() -> io::Result<()> {
             }
         };
         crash_tracker.set_last_request_id(req.id.to_string());
+        let method_for_wal = if Server::is_mutating_method(&req.method) {
+            Some(())
+        } else {
+            None
+        };
         let resp = server.handle(req);
+        if resp.ok && method_for_wal.is_some() {
+            if let Err(err) = server.wal_append(&line) {
+                eprintln!("[wal] append failed: {err}");
+            }
+        }
         let payload = serde_json::to_string(&resp)
             .map_err(|err| io::Error::other(format!("serialize response failed: {err}")))?;
         if let Err(write_err) = stdout
@@ -1519,6 +1660,10 @@ fn main() -> io::Result<()> {
             );
             return Err(write_err);
         }
+    }
+    // Flush any WAL-only state before exit.
+    if let Err(err) = server.persist() {
+        eprintln!("[wal] final persist failed: {err}");
     }
     Ok(())
 }
