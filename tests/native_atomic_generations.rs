@@ -10,7 +10,7 @@ use std::os::unix::fs::symlink;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 struct TempDb {
@@ -729,10 +729,12 @@ fn valid_base_wal_enters_recovery_pending_without_exposing_or_replaying_data() {
     let old = reopened.send(vector_search(109, [1.0, 0.0]));
     let new = reopened.send(vector_search(110, [0.0, 1.0]));
     assert_eq!(old["ok"], json!(true));
-    assert!(old["result"]
-        .as_array()
-        .expect("old search result")
-        .is_empty());
+    assert!(
+        old["result"]
+            .as_array()
+            .expect("old search result")
+            .is_empty()
+    );
     let new_items = new["result"].as_array().expect("new search result");
     assert_eq!(new_items.len(), 1);
     assert_eq!(new_items[0]["id"], json!("new-v"));
