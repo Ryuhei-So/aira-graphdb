@@ -2,12 +2,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::panic;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use aira_graphdb::graph::{InMemoryGraphStore, Properties, Value as GraphValue};
 use aira_graphdb::query::{CypherDialect, execute_query_with_dialect};
@@ -41,6 +43,15 @@ struct VectorBlobRef {
     len: u32,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct VectorBlobDescriptor {
+    basename: String,
+    size: u64,
+    sha256: String,
+    format: u16,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct VectorRecord {
@@ -71,14 +82,37 @@ struct State {
     passages: HashMap<String, Passage>,
     snapshots: HashMap<String, Value>,
     checkpoints: HashMap<String, Value>,
+    #[serde(default)]
+    generation: u64,
+    #[serde(
+        default,
+        rename = "vectorBlob",
+        skip_serializing_if = "Option::is_none"
+    )]
+    vector_blob: Option<VectorBlobDescriptor>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct RpcRequest {
     id: u64,
     method: String,
     #[serde(default)]
     params: Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WalRecord {
+    version: u16,
+    base_generation: u64,
+    request: RpcRequest,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DurableGenerationToken {
+    generation: u64,
+    vector_blob: VectorBlobDescriptor,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -116,7 +150,6 @@ struct CrashTracker {
 
 struct Server {
     db_path: PathBuf,
-    vector_blob_path: PathBuf,
     audit_log_path: PathBuf,
     state: State,
     vector_values: HashMap<String, Vec<f64>>,
@@ -126,12 +159,187 @@ struct Server {
     wal_bytes: u64,
     wal_replaying: bool,
     last_persist_bytes: u64,
+    fatal: bool,
     node_keys_by_corpus: HashMap<String, Vec<String>>,
     edge_keys_by_corpus: HashMap<String, Vec<String>>,
     adjacent_edge_keys_by_node: HashMap<String, Vec<String>>,
     vector_keys_by_corpus_namespace: HashMap<String, Vec<String>>,
     passage_keys_by_corpus: HashMap<String, Vec<String>>,
 }
+
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy)]
+struct MethodSpec {
+    name: &'static str,
+    classification: &'static str,
+    wal: bool,
+}
+
+// This table is the one policy authority used both by protocol_info and WAL
+// admission. Unknown methods deliberately have no read classification.
+const METHOD_SPECS: &[MethodSpec] = &[
+    MethodSpec {
+        name: "ping",
+        classification: "health",
+        wal: false,
+    },
+    MethodSpec {
+        name: "protocol_info",
+        classification: "health",
+        wal: false,
+    },
+    MethodSpec {
+        name: "batch_begin",
+        classification: "transaction",
+        wal: false,
+    },
+    MethodSpec {
+        name: "batch_commit",
+        classification: "commit",
+        wal: false,
+    },
+    MethodSpec {
+        name: "upsert_nodes",
+        classification: "mutation",
+        wal: true,
+    },
+    MethodSpec {
+        name: "upsert_edges",
+        classification: "mutation",
+        wal: true,
+    },
+    MethodSpec {
+        name: "get_node",
+        classification: "read",
+        wal: false,
+    },
+    MethodSpec {
+        name: "get_nodes",
+        classification: "read",
+        wal: false,
+    },
+    MethodSpec {
+        name: "get_edges",
+        classification: "read",
+        wal: false,
+    },
+    MethodSpec {
+        name: "get_adjacent",
+        classification: "read",
+        wal: false,
+    },
+    MethodSpec {
+        name: "delete_nodes",
+        classification: "mutation",
+        wal: true,
+    },
+    MethodSpec {
+        name: "delete_edges",
+        classification: "mutation",
+        wal: true,
+    },
+    MethodSpec {
+        name: "delete_by_document",
+        classification: "mutation",
+        wal: true,
+    },
+    MethodSpec {
+        name: "delete_by_corpus",
+        classification: "mutation",
+        wal: true,
+    },
+    MethodSpec {
+        name: "vector_upsert",
+        classification: "mutation",
+        wal: true,
+    },
+    MethodSpec {
+        name: "vector_search",
+        classification: "read",
+        wal: false,
+    },
+    MethodSpec {
+        name: "vector_delete_by_document",
+        classification: "mutation",
+        wal: true,
+    },
+    MethodSpec {
+        name: "memory_upsert",
+        classification: "mutation",
+        wal: true,
+    },
+    MethodSpec {
+        name: "memory_save",
+        classification: "mutation",
+        wal: true,
+    },
+    MethodSpec {
+        name: "memory_save_file",
+        classification: "mutation",
+        wal: true,
+    },
+    MethodSpec {
+        name: "memory_load",
+        classification: "read",
+        wal: false,
+    },
+    MethodSpec {
+        name: "memory_save_checkpoint",
+        classification: "mutation",
+        wal: true,
+    },
+    MethodSpec {
+        name: "memory_load_checkpoint",
+        classification: "read",
+        wal: false,
+    },
+    MethodSpec {
+        name: "memory_validate_integrity",
+        classification: "read",
+        wal: false,
+    },
+    MethodSpec {
+        name: "projection_get_transitions",
+        classification: "read",
+        wal: false,
+    },
+    MethodSpec {
+        name: "projection_get_dangling_nodes",
+        classification: "read",
+        wal: false,
+    },
+    MethodSpec {
+        name: "projection_get_node_count",
+        classification: "read",
+        wal: false,
+    },
+    MethodSpec {
+        name: "lexical_index_passages",
+        classification: "mutation",
+        wal: true,
+    },
+    MethodSpec {
+        name: "lexical_search",
+        classification: "read",
+        wal: false,
+    },
+    MethodSpec {
+        name: "lexical_delete_by_document",
+        classification: "mutation",
+        wal: true,
+    },
+    MethodSpec {
+        name: "cypher_query",
+        classification: "read",
+        wal: false,
+    },
+    MethodSpec {
+        name: "__debug_force_panic__",
+        classification: "debug",
+        wal: false,
+    },
+];
 
 impl CrashTracker {
     fn new(audit_log_path: PathBuf) -> Self {
@@ -189,16 +397,18 @@ impl CrashTracker {
 impl Server {
     const VECTOR_BLOB_MAGIC: &'static [u8; 4] = b"AGVB";
     const VECTOR_BLOB_VERSION: u16 = 1;
+    const WAL_VERSION: u16 = 2;
 
     fn open(db_path: PathBuf) -> io::Result<Self> {
         let mut state = if db_path.exists() {
             let raw = fs::read_to_string(&db_path)?;
-            serde_json::from_str(&raw).unwrap_or_default()
+            serde_json::from_str::<State>(&raw)
+                .map_err(|err| io::Error::other(format!("parse canonical state failed: {err}")))?
         } else {
             State::default()
         };
-        let vector_blob_path = db_path.with_extension("vblob");
-        let vector_values = Self::load_vector_values(&state, &vector_blob_path)?;
+        let legacy_vector_blob_path = db_path.with_extension("vblob");
+        let vector_values = Self::load_vector_values(&state, &db_path, &legacy_vector_blob_path)?;
         for (key, values) in &vector_values {
             if let Some(vector) = state.vectors.get_mut(key) {
                 vector.values = values.clone();
@@ -207,15 +417,19 @@ impl Server {
         Ok(Self {
             audit_log_path: db_path.with_extension("native-audit.log"),
             wal_path: db_path.with_extension("agdb.wal"),
-            wal_bytes: 0,
+            wal_bytes: fs::metadata(db_path.with_extension("agdb.wal"))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
             wal_replaying: false,
-            last_persist_bytes: 0,
-            vector_blob_path,
+            last_persist_bytes: fs::metadata(&db_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
             db_path,
             state,
             vector_values,
             cache_dirty: true,
             batch_mode: false,
+            fatal: false,
             node_keys_by_corpus: HashMap::new(),
             edge_keys_by_corpus: HashMap::new(),
             adjacent_edge_keys_by_node: HashMap::new(),
@@ -266,165 +480,189 @@ impl Server {
         );
     }
 
-    fn persist(&mut self) -> io::Result<()> {
-        let start = std::time::Instant::now();
-        let mut persisted_state = self.state.clone();
-        let vector_blob_payload =
-            Self::build_vector_blob_payload(&mut persisted_state, &self.vector_values)?;
-        let raw = serde_json::to_vec(&persisted_state)
-            .map_err(|err| io::Error::other(format!("serialize state failed: {err}")))?;
-        let serialize_ms = start.elapsed().as_millis();
-        let parent = self
-            .db_path
-            .parent()
+    fn parent_dir(path: &Path) -> PathBuf {
+        path.parent()
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        fs::create_dir_all(&parent)
-            .map_err(|err| io::Error::other(format!("create_dir_all({:?}): {err}", parent)))?;
-
-        Self::persist_vector_blob_atomic(&self.vector_blob_path, &vector_blob_payload)?;
-
-        // Write to tmp file first, then rename for atomicity
-        let tmp_path = self.db_path.with_extension("agdb.tmp");
-        let mut file = io::BufWriter::with_capacity(
-            8 * 1024 * 1024,
-            fs::File::create(&tmp_path)
-                .map_err(|err| io::Error::other(format!("File::create({:?}): {err}", tmp_path)))?,
-        );
-        file.write_all(&raw).map_err(|err| {
-            let _ = fs::remove_file(&tmp_path);
-            io::Error::other(format!("write_all({}bytes): {err}", raw.len()))
-        })?;
-        file.flush().map_err(|err| {
-            let _ = fs::remove_file(&tmp_path);
-            io::Error::other(format!("flush: {err}"))
-        })?;
-        let inner = file.into_inner().map_err(|err| {
-            let _ = fs::remove_file(&tmp_path);
-            io::Error::other(format!("into_inner: {err}"))
-        })?;
-        inner.sync_all().map_err(|err| {
-            let _ = fs::remove_file(&tmp_path);
-            io::Error::other(format!("sync_all: {err}"))
-        })?;
-        drop(inner);
-
-        // Atomic rename (fallback to copy+remove if rename fails)
-        if let Err(_rename_err) = fs::rename(&tmp_path, &self.db_path) {
-            // Fallback: copy then remove tmp (non-atomic but works across filesystems)
-            fs::copy(&tmp_path, &self.db_path).map_err(|err| {
-                io::Error::other(format!("copy({:?} -> {:?}): {err}", tmp_path, self.db_path))
-            })?;
-            let _ = fs::remove_file(&tmp_path);
-        }
-
-        // A successful full persist supersedes the WAL.
-        let _ = fs::remove_file(&self.wal_path);
-        self.last_persist_bytes = raw.len() as u64;
-        let total_ms = start.elapsed().as_millis();
-        eprintln!(
-            "[persist] {}MB serialized in {}ms, written in {}ms",
-            raw.len() / (1024 * 1024),
-            serialize_ms,
-            total_ms - serialize_ms
-        );
-        Ok(())
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
-    fn persist_if_needed(&mut self) -> io::Result<()> {
-        // Durability is provided by the WAL (see wal_append); a full persist
-        // happens only on batch_commit, WAL compaction, or shutdown.
-        Ok(())
+    fn sync_parent_dir(path: &Path) -> io::Result<()> {
+        fs::File::open(path)?.sync_all()
     }
 
-    /// Methods whose successful execution must be captured in the WAL.
-    fn is_mutating_method(method: &str) -> bool {
-        matches!(method,
-            "upsert_nodes" | "upsert_edges" | "delete_nodes" | "delete_edges"
-            | "delete_by_document" | "delete_by_corpus"
-            | "vector_upsert" | "vector_delete_by_document" | "vector_delete_by_corpus"
-            | "memory_save" | "memory_upsert" | "memory_save_checkpoint"
-            | "lexical_index_passages" | "lexical_delete_by_document" | "lexical_delete_by_corpus"
-            | "index_status_save")
+    fn temporary_path(target: &Path, suffix: &str) -> PathBuf {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let file_name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("aira-graphdb");
+        Self::parent_dir(target).join(format!(
+            ".{file_name}.{suffix}.{}.{}.tmp",
+            std::process::id(),
+            id
+        ))
     }
 
-    fn wal_append(&mut self, raw_line: &str) -> io::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.wal_path)?;
-        file.write_all(raw_line.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.flush()?;
-        self.wal_bytes += raw_line.len() as u64 + 1;
-        // Adaptive compaction: keep WAL below a quarter of the last snapshot
-        // size (min 64MB) so total write cost grows O(n log n), not O(n^2).
-        let threshold = std::cmp::max(64 * 1024 * 1024, self.last_persist_bytes / 4);
-        if self.wal_bytes > threshold && !self.batch_mode {
-            self.persist()?;
-            self.wal_bytes = 0;
-        }
-        Ok(())
+    fn failpoint_matches(var_name: &str, stage: &str) -> bool {
+        let after = format!("after_{stage}");
+        std::env::var(var_name)
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .any(|candidate| candidate == stage || candidate == after)
+            })
+            .unwrap_or(false)
     }
 
-    fn replay_wal(&mut self) -> io::Result<usize> {
-        if !self.wal_path.exists() {
-            return Ok(0);
-        }
-        let content = fs::read_to_string(&self.wal_path)?;
-        self.wal_replaying = true;
-        let mut replayed = 0usize;
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
+    /// Test-only, process-local durability probes. The kill variant exits
+    /// without a response so the caller can exercise the real reopen path.
+    fn durability_failpoint(stage: &str) -> io::Result<()> {
+        for variable in [
+            "AGDB_NATIVE_FAIL_POINT",
+            "AGDB_NATIVE_FAILPOINT",
+            "AGDB_FAILPOINT",
+        ] {
+            if Self::failpoint_matches(variable, stage) {
+                return Err(io::Error::other(format!(
+                    "injected durability failure at {stage}"
+                )));
             }
-            if let Ok(req) = serde_json::from_str::<RpcRequest>(line) {
-                let resp = self.handle(req);
-                if resp.ok {
-                    replayed += 1;
+        }
+        for variable in ["AGDB_NATIVE_KILL_POINT", "AGDB_NATIVE_KILLPOINT"] {
+            if Self::failpoint_matches(variable, stage) {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(libc::getpid(), libc::SIGKILL);
+                    std::process::abort();
                 }
+                #[cfg(not(unix))]
+                std::process::exit(137);
             }
         }
-        self.wal_replaying = false;
-        self.wal_bytes = fs::metadata(&self.wal_path).map(|m| m.len()).unwrap_or(0);
-        eprintln!("[wal] replayed {replayed} entries");
-        Ok(replayed)
+        Ok(())
     }
 
-    fn key(corpus_id: &str, id: &str) -> String {
-        format!("{corpus_id}:{id}")
+    fn write_durable_temp(target: &Path, bytes: &[u8], sync_stage: &str) -> io::Result<PathBuf> {
+        let tmp_path = Self::temporary_path(target, sync_stage);
+        let result = (|| {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .map_err(|err| io::Error::other(format!("create temp file failed: {err}")))?;
+            file.write_all(bytes)
+                .map_err(|err| io::Error::other(format!("write temp file failed: {err}")))?;
+            file.flush()
+                .map_err(|err| io::Error::other(format!("flush temp file failed: {err}")))?;
+            file.sync_all()
+                .map_err(|err| io::Error::other(format!("sync temp file failed: {err}")))?;
+            Self::durability_failpoint(sync_stage)?;
+            Ok::<(), io::Error>(())
+        })();
+        if let Err(err) = result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+        Ok(tmp_path)
+    }
+
+    fn validate_blob_basename(basename: &str) -> io::Result<()> {
+        let path = Path::new(basename);
+        if basename.is_empty()
+            || path.is_absolute()
+            || basename.contains('/')
+            || basename.contains('\\')
+            || basename == "."
+            || basename == ".."
+            || path.components().count() != 1
+        {
+            return Err(io::Error::other(
+                "vector blob basename is not a safe basename",
+            ));
+        }
+        Ok(())
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let digest = Sha256::digest(bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn read_validated_blob(
+        path: &Path,
+        descriptor: Option<&VectorBlobDescriptor>,
+    ) -> io::Result<Vec<u8>> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::other("vector blob is not a regular file"));
+        }
+        let raw = fs::read(path)?;
+        if raw.len() < Self::VECTOR_BLOB_MAGIC.len() + std::mem::size_of::<u16>() {
+            return Err(io::Error::other("vector blob file is truncated"));
+        }
+        if &raw[..Self::VECTOR_BLOB_MAGIC.len()] != Self::VECTOR_BLOB_MAGIC {
+            return Err(io::Error::other("vector blob magic mismatch"));
+        }
+        let version_start = Self::VECTOR_BLOB_MAGIC.len();
+        let version_end = version_start + std::mem::size_of::<u16>();
+        let version = u16::from_le_bytes(
+            raw[version_start..version_end]
+                .try_into()
+                .expect("validated slice length"),
+        );
+        if version != Self::VECTOR_BLOB_VERSION {
+            return Err(io::Error::other(format!(
+                "vector blob version mismatch: expected {}, got {version}",
+                Self::VECTOR_BLOB_VERSION
+            )));
+        }
+        if let Some(descriptor) = descriptor {
+            if descriptor.format != version {
+                return Err(io::Error::other("vector blob descriptor format mismatch"));
+            }
+            if descriptor.size != raw.len() as u64 {
+                return Err(io::Error::other(
+                    "vector blob size does not match descriptor",
+                ));
+            }
+            if descriptor.sha256 != Self::sha256_hex(&raw) {
+                return Err(io::Error::other(
+                    "vector blob hash does not match descriptor",
+                ));
+            }
+        }
+        Ok(raw)
     }
 
     fn load_vector_values(
         state: &State,
-        blob_path: &PathBuf,
+        db_path: &Path,
+        legacy_blob_path: &Path,
+    ) -> io::Result<HashMap<String, Vec<f64>>> {
+        if state.generation > 0 && state.vector_blob.is_none() {
+            return Err(io::Error::other(
+                "committed generation is missing its vector blob descriptor",
+            ));
+        }
+        let raw_blob = if let Some(descriptor) = state.vector_blob.as_ref() {
+            Self::validate_blob_basename(&descriptor.basename)?;
+            let blob_path = Self::parent_dir(db_path).join(&descriptor.basename);
+            Some(Self::read_validated_blob(&blob_path, Some(descriptor))?)
+        } else if legacy_blob_path.exists() {
+            Some(Self::read_validated_blob(legacy_blob_path, None)?)
+        } else {
+            None
+        };
+        Self::decode_vector_values(state, raw_blob.as_deref())
+    }
+
+    fn decode_vector_values(
+        state: &State,
+        raw_blob: Option<&[u8]>,
     ) -> io::Result<HashMap<String, Vec<f64>>> {
         let mut values = HashMap::new();
-        let mut raw_blob: Vec<u8> = Vec::new();
-        if blob_path.exists() {
-            raw_blob = fs::read(blob_path)?;
-            if raw_blob.len() < Self::VECTOR_BLOB_MAGIC.len() + std::mem::size_of::<u16>() {
-                return Err(io::Error::other("vector blob file is truncated"));
-            }
-            if &raw_blob[..Self::VECTOR_BLOB_MAGIC.len()] != Self::VECTOR_BLOB_MAGIC {
-                return Err(io::Error::other("vector blob magic mismatch"));
-            }
-            let version_start = Self::VECTOR_BLOB_MAGIC.len();
-            let version_end = version_start + std::mem::size_of::<u16>();
-            let version = u16::from_le_bytes(
-                raw_blob[version_start..version_end]
-                    .try_into()
-                    .expect("slice length"),
-            );
-            if version != Self::VECTOR_BLOB_VERSION {
-                return Err(io::Error::other(format!(
-                    "vector blob version mismatch: expected {}, got {}",
-                    Self::VECTOR_BLOB_VERSION,
-                    version
-                )));
-            }
-        }
-
         let payload_offset = Self::VECTOR_BLOB_MAGIC.len() + std::mem::size_of::<u16>();
         for (key, vector) in &state.vectors {
             if !vector.values.is_empty() {
@@ -434,12 +672,12 @@ impl Server {
             let Some(blob_ref) = &vector.blob_ref else {
                 continue;
             };
-            if raw_blob.is_empty() {
-                return Err(io::Error::other(
-                    "vector metadata references blob but blob file is missing",
-                ));
-            }
-            let start = payload_offset.saturating_add(blob_ref.offset as usize);
+            let raw_blob = raw_blob.ok_or_else(|| {
+                io::Error::other("vector metadata references blob but blob file is missing")
+            })?;
+            let start = payload_offset
+                .checked_add(blob_ref.offset as usize)
+                .ok_or_else(|| io::Error::other("vector blob offset overflow"))?;
             let byte_len = (blob_ref.len as usize)
                 .checked_mul(std::mem::size_of::<f64>())
                 .ok_or_else(|| io::Error::other("vector blob length overflow"))?;
@@ -451,12 +689,296 @@ impl Server {
             }
             let mut out = Vec::with_capacity(blob_ref.len as usize);
             for chunk in raw_blob[start..end].chunks_exact(std::mem::size_of::<f64>()) {
-                let num = f64::from_le_bytes(chunk.try_into().expect("slice length"));
-                out.push(num);
+                out.push(f64::from_le_bytes(
+                    chunk.try_into().expect("validated f64 chunk length"),
+                ));
             }
             values.insert(key.clone(), out);
         }
         Ok(values)
+    }
+
+    fn persist(&mut self) -> io::Result<DurableGenerationToken> {
+        let start = std::time::Instant::now();
+        let current_generation = self.state.generation;
+        let next_generation = current_generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("generation overflow"))?;
+        let wal_records = self.read_wal_records()?;
+        if wal_records
+            .iter()
+            .any(|record| record.base_generation != current_generation)
+        {
+            return Err(io::Error::other(
+                "cannot commit with WAL records from a different generation",
+            ));
+        }
+
+        let parent = Self::parent_dir(&self.db_path);
+        fs::create_dir_all(&parent)
+            .map_err(|err| io::Error::other(format!("create database directory failed: {err}")))?;
+
+        let mut persisted_state = self.state.clone();
+        let vector_blob_payload =
+            Self::build_vector_blob_payload(&mut persisted_state, &self.vector_values)?;
+        let blob_sha256 = Self::sha256_hex(&vector_blob_payload);
+        let blob_basename = format!(
+            "{}.g{next_generation:020}.{blob_sha256}.vblob",
+            self.db_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("vectors")
+        );
+        let blob_descriptor = VectorBlobDescriptor {
+            basename: blob_basename,
+            size: vector_blob_payload.len() as u64,
+            sha256: blob_sha256,
+            format: Self::VECTOR_BLOB_VERSION,
+        };
+        let blob_path = parent.join(&blob_descriptor.basename);
+
+        if blob_path.exists() {
+            Self::read_validated_blob(&blob_path, Some(&blob_descriptor))?;
+        } else {
+            let blob_tmp =
+                Self::write_durable_temp(&blob_path, &vector_blob_payload, "blob_temp_sync")?;
+            if let Err(err) = fs::rename(&blob_tmp, &blob_path) {
+                let _ = fs::remove_file(&blob_tmp);
+                return Err(io::Error::other(format!(
+                    "publish vector blob failed: {err}"
+                )));
+            }
+            Self::durability_failpoint("blob_rename")?;
+            Self::read_validated_blob(&blob_path, Some(&blob_descriptor))?;
+        }
+        Self::sync_parent_dir(&parent)?;
+        Self::durability_failpoint("blob_dir_fsync")?;
+
+        persisted_state.generation = next_generation;
+        persisted_state.vector_blob = Some(blob_descriptor.clone());
+        let raw = serde_json::to_vec(&persisted_state)
+            .map_err(|err| io::Error::other(format!("serialize state failed: {err}")))?;
+        let json_tmp = Self::write_durable_temp(&self.db_path, &raw, "json_temp_sync")?;
+        if let Err(err) = fs::rename(&json_tmp, &self.db_path) {
+            let _ = fs::remove_file(&json_tmp);
+            return Err(io::Error::other(format!(
+                "publish canonical state failed: {err}"
+            )));
+        }
+        Self::durability_failpoint("json_rename")?;
+        Self::sync_parent_dir(&parent)?;
+        Self::durability_failpoint("json_dir_fsync")?;
+
+        if self.wal_path.exists() {
+            fs::remove_file(&self.wal_path)
+                .map_err(|err| io::Error::other(format!("retire WAL failed: {err}")))?;
+        }
+        Self::durability_failpoint("wal_retire")?;
+        Self::sync_parent_dir(&parent)?;
+        Self::durability_failpoint("final_dir_fsync")?;
+
+        self.state = persisted_state;
+        self.last_persist_bytes = raw.len() as u64;
+        self.wal_bytes = 0;
+        let total_ms = start.elapsed().as_millis();
+        eprintln!(
+            "[persist] generation={} blobBytes={} blobSha256={} jsonBytes={} elapsedMs={total_ms}",
+            next_generation,
+            vector_blob_payload.len(),
+            blob_descriptor.sha256,
+            raw.len(),
+        );
+        Ok(DurableGenerationToken {
+            generation: next_generation,
+            vector_blob: blob_descriptor,
+        })
+    }
+
+    fn persist_if_needed(&mut self) -> io::Result<()> {
+        // Durability is provided by the WAL (see wal_append); a full persist
+        // happens only on batch_commit, WAL compaction, or shutdown.
+        Ok(())
+    }
+
+    fn needs_persist(&self) -> bool {
+        self.wal_path.exists() || (self.db_path.exists() && self.state.vector_blob.is_none())
+    }
+
+    fn method_spec(method: &str) -> Option<&'static MethodSpec> {
+        METHOD_SPECS.iter().find(|spec| spec.name == method)
+    }
+
+    /// WAL admission and protocol_info both use METHOD_SPECS. Unknown
+    /// methods are not treated as reads and therefore never enter the WAL.
+    fn is_mutating_method(method: &str) -> bool {
+        Self::method_spec(method).is_some_and(|spec| spec.wal)
+    }
+
+    fn read_wal_records(&self) -> io::Result<Vec<WalRecord>> {
+        if !self.wal_path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = fs::read_to_string(&self.wal_path)
+            .map_err(|err| io::Error::other(format!("read WAL failed: {err}")))?;
+        let mut records = Vec::new();
+        for (line_number, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record = match serde_json::from_str::<WalRecord>(line) {
+                Ok(record) => record,
+                Err(versioned_error) if self.state.generation == 0 => {
+                    // The pre-generation WAL was a raw RpcRequest. It is only
+                    // safe to interpret it while the canonical state is still
+                    // the legacy generation zero snapshot.
+                    let legacy_value = serde_json::from_str::<Value>(line).map_err(|_| {
+                        io::Error::other(format!(
+                            "malformed WAL record at line {}: {versioned_error}",
+                            line_number + 1
+                        ))
+                    })?;
+                    if legacy_value.as_object().is_none_or(|object| {
+                        object.contains_key("version")
+                            || object.contains_key("baseGeneration")
+                            || object.contains_key("request")
+                    }) {
+                        return Err(io::Error::other(format!(
+                            "malformed WAL record at line {}: {versioned_error}",
+                            line_number + 1
+                        )));
+                    }
+                    let request = serde_json::from_str::<RpcRequest>(line).map_err(|_| {
+                        io::Error::other(format!(
+                            "malformed WAL record at line {}: {versioned_error}",
+                            line_number + 1
+                        ))
+                    })?;
+                    WalRecord {
+                        version: Self::WAL_VERSION,
+                        base_generation: 0,
+                        request,
+                    }
+                }
+                Err(err) => {
+                    return Err(io::Error::other(format!(
+                        "malformed WAL record at line {}: {err}",
+                        line_number + 1
+                    )));
+                }
+            };
+            if record.version != Self::WAL_VERSION {
+                return Err(io::Error::other(format!(
+                    "unsupported WAL version {}",
+                    record.version
+                )));
+            }
+            if !Self::is_mutating_method(&record.request.method) {
+                return Err(io::Error::other(
+                    "WAL record contains a non-mutating method",
+                ));
+            }
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    fn rewrite_wal_records(&self, records: &[WalRecord]) -> io::Result<()> {
+        if records.is_empty() {
+            if self.wal_path.exists() {
+                fs::remove_file(&self.wal_path)?;
+                Self::sync_parent_dir(&Self::parent_dir(&self.wal_path))?;
+            }
+            return Ok(());
+        }
+        let mut bytes = Vec::new();
+        for record in records {
+            let encoded = serde_json::to_vec(record)
+                .map_err(|err| io::Error::other(format!("serialize WAL failed: {err}")))?;
+            bytes.extend_from_slice(&encoded);
+            bytes.push(b'\n');
+        }
+        let tmp = Self::write_durable_temp(&self.wal_path, &bytes, "wal_compact_sync")?;
+        if let Err(err) = fs::rename(&tmp, &self.wal_path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(io::Error::other(format!("replace WAL failed: {err}")));
+        }
+        Self::sync_parent_dir(&Self::parent_dir(&self.wal_path))
+    }
+
+    fn wal_append(&mut self, request: &RpcRequest) -> io::Result<()> {
+        let record = WalRecord {
+            version: Self::WAL_VERSION,
+            base_generation: self.state.generation,
+            request: request.clone(),
+        };
+        let encoded = serde_json::to_vec(&record)
+            .map_err(|err| io::Error::other(format!("serialize WAL record failed: {err}")))?;
+        let parent = Self::parent_dir(&self.wal_path);
+        fs::create_dir_all(&parent)?;
+        let wal_preexisted = self.wal_path.exists();
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.wal_path)?;
+        file.write_all(&encoded)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        file.sync_data()?;
+        if !wal_preexisted {
+            Self::sync_parent_dir(&parent)?;
+        }
+        Self::durability_failpoint("wal_sync")?;
+        self.wal_bytes += encoded.len() as u64 + 1;
+        // Adaptive compaction: keep WAL below a quarter of the last snapshot
+        // size (min 64MB) so total write cost grows O(n log n), not O(n^2).
+        let threshold = std::cmp::max(64 * 1024 * 1024, self.last_persist_bytes / 4);
+        if self.wal_bytes > threshold && !self.batch_mode {
+            let _ = self.persist()?;
+        }
+        Ok(())
+    }
+
+    fn replay_wal(&mut self) -> io::Result<usize> {
+        let records = self.read_wal_records()?;
+        let generation = self.state.generation;
+        let mut replayable = Vec::new();
+        let mut skipped = 0usize;
+        for record in records {
+            match record.base_generation.cmp(&generation) {
+                std::cmp::Ordering::Less => skipped += 1,
+                std::cmp::Ordering::Equal => replayable.push(record),
+                std::cmp::Ordering::Greater => {
+                    return Err(io::Error::other(format!(
+                        "WAL base generation {} is newer than canonical generation {generation}",
+                        record.base_generation
+                    )));
+                }
+            }
+        }
+        if skipped > 0 {
+            self.rewrite_wal_records(&replayable)?;
+        }
+        self.wal_replaying = true;
+        let mut replayed = 0usize;
+        for record in replayable {
+            let resp = self.handle(record.request);
+            if !resp.ok {
+                self.wal_replaying = false;
+                return Err(io::Error::other("WAL replay request failed"));
+            }
+            replayed += 1;
+        }
+        self.wal_replaying = false;
+        self.wal_bytes = fs::metadata(&self.wal_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "[wal] replayed={} skipped={} bytes={}",
+            replayed, skipped, self.wal_bytes
+        );
+        Ok(replayed)
+    }
+
+    fn key(corpus_id: &str, id: &str) -> String {
+        format!("{corpus_id}:{id}")
     }
 
     fn build_vector_blob_payload(
@@ -489,39 +1011,6 @@ impl Server {
                 .ok_or_else(|| io::Error::other("vector blob offset overflow"))?;
         }
         Ok(payload)
-    }
-
-    fn persist_vector_blob_atomic(path: &PathBuf, payload: &[u8]) -> io::Result<()> {
-        let tmp_path = path.with_extension("vblob.tmp");
-        let mut file = io::BufWriter::with_capacity(
-            8 * 1024 * 1024,
-            fs::File::create(&tmp_path)
-                .map_err(|err| io::Error::other(format!("File::create({:?}): {err}", tmp_path)))?,
-        );
-        file.write_all(payload).map_err(|err| {
-            let _ = fs::remove_file(&tmp_path);
-            io::Error::other(format!("write_all(vblob): {err}"))
-        })?;
-        file.flush().map_err(|err| {
-            let _ = fs::remove_file(&tmp_path);
-            io::Error::other(format!("flush(vblob): {err}"))
-        })?;
-        let inner = file.into_inner().map_err(|err| {
-            let _ = fs::remove_file(&tmp_path);
-            io::Error::other(format!("into_inner(vblob): {err}"))
-        })?;
-        inner.sync_all().map_err(|err| {
-            let _ = fs::remove_file(&tmp_path);
-            io::Error::other(format!("sync_all(vblob): {err}"))
-        })?;
-        drop(inner);
-        if let Err(_rename_err) = fs::rename(&tmp_path, path) {
-            fs::copy(&tmp_path, path).map_err(|err| {
-                io::Error::other(format!("copy({:?} -> {:?}): {err}", tmp_path, path))
-            })?;
-            let _ = fs::remove_file(&tmp_path);
-        }
-        Ok(())
     }
 
     fn node_key(corpus_id: &str, node_id: &str) -> String {
@@ -722,16 +1211,34 @@ impl Server {
     fn handle(&mut self, req: RpcRequest) -> RpcResponse {
         let result: Result<Value, AppError> = (|| match req.method.as_str() {
             "ping" => Ok(json!({"pong": true})),
+            "protocol_info" => {
+                let methods: Vec<Value> = METHOD_SPECS
+                    .iter()
+                    .map(|spec| {
+                        json!({
+                            "name": spec.name,
+                            "classification": spec.classification,
+                            "wal": spec.wal,
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "protocolVersion": "native-method-policy@1",
+                    "generation": self.state.generation,
+                    "methods": methods,
+                }))
+            }
             "batch_begin" => {
                 self.batch_mode = true;
                 Ok(json!(null))
             }
             "batch_commit" => {
                 self.batch_mode = false;
-                self.persist().map_err(|err| {
+                let token = self.persist().map_err(|err| {
+                    self.fatal = true;
                     Self::execution_io_error(format!("batch_commit persist failed: {err}"))
                 })?;
-                Ok(json!(null))
+                Ok(serde_json::to_value(token).unwrap_or(Value::Null))
             }
             "upsert_nodes" => {
                 let nodes = req
@@ -1134,21 +1641,21 @@ impl Server {
                     .params
                     .get("corpusId")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        Self::execution_client_error("missing corpusId".to_string())
-                    })?
+                    .ok_or_else(|| Self::execution_client_error("missing corpusId".to_string()))?
                     .to_string();
                 let snapshot = self
                     .state
                     .snapshots
                     .entry(corpus_id.clone())
-                    .or_insert_with(|| json!({
-                        "corpusId": corpus_id,
-                        "schemaVersion": 1,
-                        "passages": [],
-                        "facts": [],
-                        "schemas": []
-                    }));
+                    .or_insert_with(|| {
+                        json!({
+                            "corpusId": corpus_id,
+                            "schemaVersion": 1,
+                            "passages": [],
+                            "facts": [],
+                            "schemas": []
+                        })
+                    });
                 for (section, id_key) in [
                     ("passages", "passageId"),
                     ("facts", "factId"),
@@ -1158,9 +1665,7 @@ impl Server {
                         Some(items) if !items.is_empty() => items.clone(),
                         _ => continue,
                     };
-                    let existing = snapshot
-                        .get_mut(section)
-                        .and_then(Value::as_array_mut);
+                    let existing = snapshot.get_mut(section).and_then(Value::as_array_mut);
                     if let Some(existing) = existing {
                         let mut index: HashMap<String, usize> = HashMap::new();
                         for (i, item) in existing.iter().enumerate() {
@@ -1218,10 +1723,10 @@ impl Server {
                     .and_then(Value::as_str)
                     .ok_or_else(|| Self::execution_client_error("missing filePath".to_string()))?;
                 let file_content = std::fs::read_to_string(file_path).map_err(|err| {
-                    Self::execution_io_error(format!("read file {file_path}: {err}"))
+                    Self::execution_io_error(format!("read snapshot failed: {err}"))
                 })?;
                 let snapshot: Value = serde_json::from_str(&file_content).map_err(|err| {
-                    Self::execution_client_error(format!("parse JSON {file_path}: {err}"))
+                    Self::execution_client_error(format!("parse snapshot failed: {err}"))
                 })?;
                 let corpus_id = snapshot
                     .get("corpusId")
@@ -1241,7 +1746,8 @@ impl Server {
                     .map(|a| a.len())
                     .unwrap_or(0);
                 eprintln!(
-                    "[memory_save_file] Loading {file_path}: {facts_count} facts, {passages_count} passages"
+                    "[memory_save_file] facts={} passages={}",
+                    facts_count, passages_count
                 );
                 self.state.snapshots.insert(corpus_id, snapshot);
                 self.persist_if_needed()
@@ -1635,15 +2141,21 @@ fn main() -> io::Result<()> {
             }
         };
         crash_tracker.set_last_request_id(req.id.to_string());
-        let method_for_wal = if Server::is_mutating_method(&req.method) {
-            Some(())
-        } else {
-            None
-        };
-        let resp = server.handle(req);
-        if resp.ok && method_for_wal.is_some() {
-            if let Err(err) = server.wal_append(&line) {
-                eprintln!("[wal] append failed: {err}");
+        let method_for_wal = Server::is_mutating_method(&req.method);
+        let mut resp = server.handle(req.clone());
+        if resp.ok && method_for_wal {
+            if let Err(err) = server.wal_append(&req) {
+                server.fatal = true;
+                resp = RpcResponse {
+                    id: req.id,
+                    ok: false,
+                    result: None,
+                    error: Some(RpcError {
+                        code: "REQUEST_EXECUTION_FAILED".to_string(),
+                        message: format!("durability failure: {err}"),
+                        failure_class: Some("IO_FAILURE".to_string()),
+                    }),
+                };
             }
         }
         let payload = serde_json::to_string(&resp)
@@ -1660,10 +2172,16 @@ fn main() -> io::Result<()> {
             );
             return Err(write_err);
         }
+        if server.fatal {
+            return Err(io::Error::other(
+                "native durability boundary entered fail-closed state",
+            ));
+        }
     }
-    // Flush any WAL-only state before exit.
-    if let Err(err) = server.persist() {
-        eprintln!("[wal] final persist failed: {err}");
+    // Flush any WAL-only state before exit. A failed final commit is fatal;
+    // silently continuing would discard the only durable acknowledgement path.
+    if server.needs_persist() {
+        server.persist()?;
     }
     Ok(())
 }
@@ -1684,7 +2202,23 @@ mod tests {
     fn cleanup(path: &PathBuf) {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(path.with_extension("vblob"));
+        let _ = fs::remove_file(path.with_extension("agdb.wal"));
         let _ = fs::remove_file(path.with_extension("native-audit.log"));
+        if let Some(parent) = path.parent() {
+            let stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if let Ok(entries) = fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with(&format!("{stem}.g")) && name.ends_with(".vblob") {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1708,12 +2242,17 @@ mod tests {
         };
         let resp = server.handle(req);
         assert!(resp.ok);
+        let token = server.persist().expect("persist vector generation");
 
         let db_raw = fs::read_to_string(&path).expect("read db");
         assert!(db_raw.contains("\"blobRef\""));
         assert!(!db_raw.contains("[1.0,0.0,0.5]"));
 
-        let blob = fs::read(path.with_extension("vblob")).expect("read blob");
+        let blob_path = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(&token.vector_blob.basename);
+        let blob = fs::read(blob_path).expect("read blob");
         assert!(blob.starts_with(Server::VECTOR_BLOB_MAGIC));
 
         let mut reopened = Server::open(path.clone()).expect("reopen");
@@ -1777,7 +2316,15 @@ mod tests {
         let db_raw = fs::read_to_string(&path).expect("read migrated db");
         assert!(db_raw.contains("\"blobRef\""));
         assert!(!db_raw.contains("\"values\":[0.5,0.5]"));
-        let blob = fs::read(path.with_extension("vblob")).expect("read migrated blob");
+        let descriptor = serde_json::from_str::<State>(&db_raw)
+            .expect("parse migrated state")
+            .vector_blob
+            .expect("migrated descriptor");
+        let blob_path = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(descriptor.basename);
+        let blob = fs::read(blob_path).expect("read migrated blob");
         assert!(blob.starts_with(Server::VECTOR_BLOB_MAGIC));
 
         let mut reopened = Server::open(path.clone()).expect("reopen migrated");
@@ -1793,6 +2340,109 @@ mod tests {
         });
         assert!(search_again.ok);
 
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reads_legacy_adjacent_vblob_without_a_generation_descriptor() {
+        let path = temp_path("agdb-native-vblob-adjacent-legacy");
+        let legacy = json!({
+            "nodes": {},
+            "edges": {},
+            "vectors": {
+                "c1:vec-legacy": {
+                    "id": "vec-legacy",
+                    "corpusId": "c1",
+                    "namespace": "default",
+                    "blobRef": {"offset": 0, "len": 2},
+                    "metadata": {"documentId":"d3"}
+                }
+            },
+            "passages": {},
+            "snapshots": {},
+            "checkpoints": {}
+        });
+        fs::write(&path, legacy.to_string()).expect("write legacy state");
+        let mut blob = Vec::new();
+        blob.extend_from_slice(Server::VECTOR_BLOB_MAGIC);
+        blob.extend_from_slice(&Server::VECTOR_BLOB_VERSION.to_le_bytes());
+        blob.extend_from_slice(&1.0f64.to_le_bytes());
+        blob.extend_from_slice(&0.0f64.to_le_bytes());
+        fs::write(path.with_extension("vblob"), blob).expect("write legacy adjacent blob");
+
+        let mut server = Server::open(path.clone()).expect("open legacy adjacent pair");
+        let search = server.handle(RpcRequest {
+            id: 1,
+            method: "vector_search".to_string(),
+            params: json!({
+                "corpusId":"c1",
+                "namespace":"default",
+                "queryVector":[1.0,0.0],
+                "topK": 1
+            }),
+        });
+        assert!(search.ok);
+        assert_eq!(search.result.unwrap()[0]["id"].as_str(), Some("vec-legacy"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rejects_invalid_committed_blob_descriptor_without_rewriting_json() {
+        let path = temp_path("agdb-native-descriptor-rejection");
+        let mut server = Server::open(path.clone()).expect("open server");
+        let response = server.handle(RpcRequest {
+            id: 1,
+            method: "vector_upsert".to_string(),
+            params: json!({
+                "records": [{
+                    "id": "vec-1",
+                    "corpusId": "c1",
+                    "namespace": "default",
+                    "values": [1.0, 0.0],
+                    "metadata": {"documentId":"d4"}
+                }]
+            }),
+        });
+        assert!(response.ok);
+        server.persist().expect("persist valid generation");
+        let canonical = fs::read(&path).expect("read canonical state");
+        let state: State = serde_json::from_slice(&canonical).expect("parse state");
+        let descriptor = state.vector_blob.clone().expect("descriptor");
+
+        let cases: &[(&str, fn(&mut VectorBlobDescriptor))] = &[
+            ("missing", |descriptor: &mut VectorBlobDescriptor| {
+                descriptor.basename = "missing.vblob".to_string();
+            }),
+            ("hash", |descriptor: &mut VectorBlobDescriptor| {
+                descriptor.sha256 = "00".repeat(32);
+            }),
+            ("size", |descriptor: &mut VectorBlobDescriptor| {
+                descriptor.size += 1;
+            }),
+            ("format", |descriptor: &mut VectorBlobDescriptor| {
+                descriptor.format = 99;
+            }),
+            ("path", |descriptor: &mut VectorBlobDescriptor| {
+                descriptor.basename = "../escape.vblob".to_string();
+            }),
+        ];
+        for (label, mutate) in cases {
+            let mut tampered = state.clone();
+            let mut tampered_descriptor = descriptor.clone();
+            mutate(&mut tampered_descriptor);
+            tampered.vector_blob = Some(tampered_descriptor);
+            fs::write(&path, serde_json::to_vec(&tampered).unwrap())
+                .unwrap_or_else(|_| panic!("write {label} descriptor"));
+            assert!(
+                Server::open(path.clone()).is_err(),
+                "{label} must fail closed"
+            );
+            assert_eq!(
+                fs::read(&path).expect("tampered canonical JSON remains"),
+                serde_json::to_vec(&tampered).expect("tampered JSON serialization")
+            );
+        }
+        fs::write(&path, canonical).expect("restore canonical state");
         cleanup(&path);
     }
 }
