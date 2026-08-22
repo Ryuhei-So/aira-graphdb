@@ -10,7 +10,7 @@ use std::os::unix::fs::symlink;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 struct TempDb {
@@ -123,17 +123,41 @@ impl Drop for NativeProcess {
 }
 
 fn vector_upsert(id: u64, values: [f64; 2], generation: &str) -> Value {
+    vector_upsert_for_document(id, "v1", "d1", values, generation)
+}
+
+fn vector_upsert_for_document(
+    id: u64,
+    vector_id: &str,
+    document_id: &str,
+    values: [f64; 2],
+    generation: &str,
+) -> Value {
     json!({
         "id": id,
         "method": "vector_upsert",
         "params": {
             "records": [{
-                "id": "v1",
+                "id": vector_id,
                 "corpusId": "c1",
                 "namespace": "default",
                 "values": values,
-                "metadata": {"documentId": "d1", "generation": generation}
+                "metadata": {"documentId": document_id, "generation": generation}
             }]
+        }
+    })
+}
+
+fn vector_search(id: u64, query_vector: [f64; 2]) -> Value {
+    json!({
+        "id": id,
+        "method": "vector_search",
+        "params": {
+            "corpusId":"c1",
+            "namespace":"default",
+            "queryVector": query_vector,
+            "threshold": 0.9,
+            "topK": 10
         }
     })
 }
@@ -162,6 +186,73 @@ fn generation(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+fn encoded_wal_record(base_generation: u64, request: &Value) -> Vec<u8> {
+    let id = request["id"].as_u64().expect("WAL request id");
+    let method = request["method"].as_str().expect("WAL request method");
+    let params = request.get("params").unwrap_or(&Value::Null);
+    let method = serde_json::to_string(method).expect("encode WAL method");
+    let params = serde_json::to_string(params).expect("encode WAL params");
+    let mut encoded = String::from("{\"version\":2,\"baseGeneration\":");
+    encoded.push_str(&base_generation.to_string());
+    encoded.push_str(",\"request\":{\"id\":");
+    encoded.push_str(&id.to_string());
+    encoded.push_str(",\"method\":");
+    encoded.push_str(&method);
+    encoded.push_str(",\"params\":");
+    encoded.push_str(&params);
+    encoded.push_str("}}\n");
+    encoded.into_bytes()
+}
+
+fn write_wal_record(path: &Path, base_generation: u64, request: &Value) -> Vec<u8> {
+    let bytes = encoded_wal_record(base_generation, request);
+    std::fs::write(path.with_extension("agdb.wal"), &bytes).expect("write WAL record");
+    bytes
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn discard_pending_recovery(path: &Path) {
+    let mut native = NativeProcess::spawn(path, &[]);
+    let info = native.send(json!({
+        "id": 900,
+        "method": "protocol_info",
+        "params": {}
+    }));
+    if info["result"]["state"] == json!("recoveryPending") {
+        let recovery = &info["result"]["recovery"];
+        let response = native.send(json!({
+            "id": 901,
+            "method": "recovery_discard",
+            "params": {
+                "baseGeneration": recovery["baseGeneration"],
+                "walDigest": recovery["walDigest"],
+            }
+        }));
+        assert_eq!(response["ok"], json!(true), "recovery discard: {response}");
+    }
+    assert_eq!(native.finish().code(), Some(0));
+}
+
+fn quarantined_wal_paths(dir: &Path, wal_bytes: &[u8]) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .expect("read database directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".quarantine"))
+        })
+        .filter(|path| std::fs::read(path).ok().as_deref() == Some(wal_bytes))
+        .collect()
+}
+
 fn seed_vector(path: &Path) {
     let mut native = NativeProcess::spawn(path, &[]);
     assert_eq!(native.send(batch_begin(0))["ok"], json!(true));
@@ -176,6 +267,7 @@ fn seed_vector(path: &Path) {
 }
 
 fn probe_vector_pair(path: &Path) {
+    discard_pending_recovery(path);
     let mut native = NativeProcess::spawn(path, &[]);
     let old = native.send(json!({
         "id": 10,
@@ -268,14 +360,14 @@ fn partial_blob_is_rejected_without_rewriting_canonical_json() {
 #[test]
 fn every_native_commit_kill_point_reopens_a_complete_vector_generation() {
     for stage in [
-        "blob_temp_sync",
-        "blob_rename",
-        "blob_dir_fsync",
-        "json_temp_sync",
-        "json_rename",
-        "json_dir_fsync",
-        "wal_retire",
-        "final_dir_fsync",
+        "after_blob_temp_sync_fsync",
+        "after_blob_rename",
+        "after_blob_dir_fsync",
+        "after_json_temp_sync_fsync",
+        "after_json_rename",
+        "after_json_dir_fsync",
+        "after_wal_retire",
+        "after_final_dir_fsync",
     ] {
         let db = TempDb::new(stage);
         seed_vector(&db.path);
@@ -287,14 +379,14 @@ fn every_native_commit_kill_point_reopens_a_complete_vector_generation() {
         );
         native.send_without_read(batch_commit(4));
         assert_native_killed(native.finish(), stage);
-        if stage == "json_dir_fsync" {
+        if stage == "after_json_dir_fsync" {
             assert!(
                 db.path.with_extension("agdb.wal").exists(),
                 "base-generation WAL must remain after JSON publication"
             );
         }
         probe_vector_pair(&db.path);
-        if stage == "json_dir_fsync" {
+        if stage == "after_json_dir_fsync" {
             assert!(
                 !db.path.with_extension("agdb.wal").exists(),
                 "reopen must retire WAL already included by JSON"
@@ -306,10 +398,12 @@ fn every_native_commit_kill_point_reopens_a_complete_vector_generation() {
 #[test]
 fn injected_write_sync_rename_and_directory_failures_never_return_a_token() {
     for stage in [
+        "blob_temp_sync_create",
         "blob_temp_sync_write",
         "blob_temp_sync_fsync",
         "blob_rename",
         "blob_dir_fsync",
+        "json_temp_sync_create",
         "json_temp_sync_write",
         "json_temp_sync_fsync",
         "json_rename",
@@ -317,30 +411,37 @@ fn injected_write_sync_rename_and_directory_failures_never_return_a_token() {
         "wal_retire",
         "final_dir_fsync",
     ] {
-        let db = TempDb::new(stage);
-        seed_vector(&db.path);
-        let before = std::fs::read(&db.path).expect("base canonical JSON");
-        let mut native = NativeProcess::spawn(&db.path, &[("AGDB_NATIVE_FAIL_POINT", stage)]);
-        assert_eq!(native.send(batch_begin(5))["ok"], json!(true));
-        assert_eq!(
-            native.send(vector_upsert(6, [0.0, 1.0], "new"))["ok"],
-            json!(true)
-        );
-        let commit = native.send(batch_commit(7));
-        assert_eq!(commit["ok"], json!(false), "failpoint {stage}");
-        assert!(
-            commit.get("result").is_none(),
-            "failpoint {stage} returned token"
-        );
-        assert_ne!(native.finish().code(), Some(0));
+        for phase in ["before", "after"] {
+            let failpoint = format!("{phase}_{stage}");
+            let db = TempDb::new(&format!("{phase}-{stage}"));
+            seed_vector(&db.path);
+            let before = std::fs::read(&db.path).expect("base canonical JSON");
+            let mut native =
+                NativeProcess::spawn(&db.path, &[("AGDB_NATIVE_FAIL_POINT", failpoint.as_str())]);
+            assert_eq!(native.send(batch_begin(5))["ok"], json!(true));
+            assert_eq!(
+                native.send(vector_upsert(6, [0.0, 1.0], "new"))["ok"],
+                json!(true)
+            );
+            let commit = native.send(batch_commit(7));
+            assert_eq!(commit["ok"], json!(false), "failpoint {failpoint}");
+            assert!(
+                commit.get("result").is_none(),
+                "failpoint {failpoint} returned token"
+            );
+            assert_ne!(native.finish().code(), Some(0));
 
-        let canonical_after = std::fs::read(&db.path).expect("canonical JSON remains readable");
-        let after_generation = generation(&db.path);
-        assert!(after_generation == 1 || after_generation == 2);
-        if after_generation == 1 {
-            assert_eq!(canonical_after, before, "failpoint {stage} advanced JSON");
+            let canonical_after = std::fs::read(&db.path).expect("canonical JSON remains readable");
+            let after_generation = generation(&db.path);
+            assert!(after_generation == 1 || after_generation == 2);
+            if after_generation == 1 {
+                assert_eq!(
+                    canonical_after, before,
+                    "failpoint {failpoint} advanced JSON"
+                );
+            }
+            probe_vector_pair(&db.path);
         }
-        probe_vector_pair(&db.path);
     }
 }
 
@@ -442,54 +543,250 @@ fn wal_sync_failure_returns_failure_and_stops_request_service() {
 }
 
 #[test]
-fn wal_base_generation_replays_once_skips_committed_and_rejects_future() {
-    let db = TempDb::new("wal-replay");
-    seed_vector(&db.path);
-    let request = json!({
+fn valid_base_wal_enters_recovery_pending_without_exposing_or_replaying_data() {
+    let db = TempDb::new("wal-recovery-pending");
+    let request = vector_upsert_for_document(7, "old-v", "old-document", [1.0, 0.0], "old");
+    let wal_path = db.path.with_extension("agdb.wal");
+    let wal_bytes = write_wal_record(&db.path, 0, &request);
+    let wal_digest = digest_hex(&wal_bytes);
+
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    let info = native.send(json!({"id":1,"method":"protocol_info","params":{}}));
+    assert_eq!(info["ok"], json!(true));
+    assert_eq!(info["result"]["generation"], json!(0));
+    assert_eq!(info["result"]["state"], json!("recoveryPending"));
+    assert_eq!(info["result"]["recovery"]["baseGeneration"], json!(0));
+    assert_eq!(info["result"]["recovery"]["walDigest"], json!(wal_digest));
+    assert_eq!(info["result"]["recovery"]["recordCount"], json!(1));
+
+    for (id, request) in [
+        (2, vector_search(2, [1.0, 0.0])),
+        (
+            3,
+            json!({
+                "id": 3,
+                "method": "get_nodes",
+                "params": {"corpusId":"c1"}
+            }),
+        ),
+        (
+            4,
+            json!({
+                "id": 4,
+                "method": "memory_load",
+                "params": {"corpusId":"c1"}
+            }),
+        ),
+        (
+            5,
+            json!({
+                "id": 5,
+                "method": "lexical_search",
+                "params": {"corpusId":"c1", "query":"old"}
+            }),
+        ),
+        (
+            6,
+            json!({
+                "id": 6,
+                "method": "projection_get_node_count",
+                "params": {"corpusId":"c1"}
+            }),
+        ),
+    ] {
+        let response = native.send(request);
+        assert_eq!(
+            response["ok"],
+            json!(false),
+            "WAL-only data leaked: {response}"
+        );
+        assert!(
+            response.get("result").is_none(),
+            "blocked read returned data: {response}"
+        );
+        assert_eq!(response["id"], json!(id));
+    }
+
+    let methods = info["result"]["methods"]
+        .as_array()
+        .expect("method inventory");
+    for method in methods {
+        let name = method["name"].as_str().expect("method name");
+        let classification = method["classification"]
+            .as_str()
+            .expect("method classification");
+        if classification == "health" || name == "recovery_discard" {
+            continue;
+        }
+        // A blocked mutator is allowed to fail-closed and terminate the
+        // request service. Probe each policy tuple from a fresh pending
+        // process so one such termination cannot hide later methods.
+        let mut probe = NativeProcess::spawn(&db.path, &[]);
+        let probe_info = probe.send(json!({
+            "id": 200,
+            "method": "protocol_info",
+            "params": {}
+        }));
+        assert_eq!(probe_info["result"]["state"], json!("recoveryPending"));
+        let response = probe.send(json!({
+            "id": 100,
+            "method": name,
+            "params": {}
+        }));
+        assert_eq!(
+            response["ok"],
+            json!(false),
+            "non-health method was allowed: {name}"
+        );
+        assert!(
+            response.get("result").is_none(),
+            "non-health result leaked: {response}"
+        );
+        let _ = probe.finish();
+    }
+    assert_eq!(
+        native.send(json!({"id":101,"method":"ping","params":{}}))["ok"],
+        json!(true)
+    );
+
+    let wrong_digest = "0".repeat(64);
+    assert_ne!(wrong_digest, wal_digest);
+    let wrong_digest_response = native.send(json!({
+        "id": 102,
+        "method": "recovery_discard",
+        "params": {"baseGeneration":0, "walDigest":wrong_digest}
+    }));
+    assert_eq!(wrong_digest_response["ok"], json!(false));
+    assert_eq!(
+        std::fs::read(&wal_path).expect("WAL remains after wrong digest"),
+        wal_bytes
+    );
+
+    let wrong_base_response = native.send(json!({
+        "id": 103,
+        "method": "recovery_discard",
+        "params": {"baseGeneration":1, "walDigest":wal_digest}
+    }));
+    assert_eq!(wrong_base_response["ok"], json!(false));
+    assert_eq!(
+        std::fs::read(&wal_path).expect("WAL remains after wrong base"),
+        wal_bytes
+    );
+    assert!(quarantined_wal_paths(&db.dir, &wal_bytes).is_empty());
+
+    let discard = native.send(json!({
+        "id": 104,
+        "method": "recovery_discard",
+        "params": {"baseGeneration":0, "walDigest":wal_digest}
+    }));
+    assert_eq!(
+        discard["ok"],
+        json!(true),
+        "exact recovery discard failed: {discard}"
+    );
+    assert_eq!(discard["result"]["baseGeneration"], json!(0));
+    assert_eq!(discard["result"]["walDigest"], json!(wal_digest));
+    assert_eq!(discard["result"]["recordCount"], json!(1));
+    assert_eq!(discard["result"]["quarantined"], json!(true));
+    assert!(
+        !wal_path.exists(),
+        "discard must quarantine, not leave active WAL"
+    );
+    let quarantine = quarantined_wal_paths(&db.dir, &wal_bytes);
+    assert_eq!(quarantine.len(), 1, "discarded WAL must remain recoverable");
+    assert_eq!(
+        native.send(json!({"id":105,"method":"protocol_info","params":{}}))["result"]["state"],
+        json!("idle")
+    );
+    assert_eq!(native.finish().code(), Some(0));
+    assert!(
+        !db.path.exists(),
+        "discard must not publish a canonical generation"
+    );
+
+    let mut unrelated = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(unrelated.send(batch_begin(106))["ok"], json!(true));
+    assert_eq!(
+        unrelated.send(vector_upsert_for_document(
+            107,
+            "new-v",
+            "new-document",
+            [0.0, 1.0],
+            "new",
+        ))["ok"],
+        json!(true)
+    );
+    let commit = unrelated.send(batch_commit(108));
+    assert_eq!(
+        commit["ok"],
+        json!(true),
+        "unrelated document commit failed: {commit}"
+    );
+    assert_eq!(commit["result"]["generation"], json!(1));
+    assert_eq!(unrelated.finish().code(), Some(0));
+
+    let mut reopened = NativeProcess::spawn(&db.path, &[]);
+    let old = reopened.send(vector_search(109, [1.0, 0.0]));
+    let new = reopened.send(vector_search(110, [0.0, 1.0]));
+    assert_eq!(old["ok"], json!(true));
+    assert!(old["result"]
+        .as_array()
+        .expect("old search result")
+        .is_empty());
+    let new_items = new["result"].as_array().expect("new search result");
+    assert_eq!(new_items.len(), 1);
+    assert_eq!(new_items[0]["id"], json!("new-v"));
+    assert_eq!(reopened.finish().code(), Some(0));
+    assert_eq!(quarantined_wal_paths(&db.dir, &wal_bytes), quarantine);
+}
+
+#[test]
+fn committed_wal_is_skipped_but_future_and_malformed_wal_fail_closed() {
+    let skipped = TempDb::new("wal-skipped");
+    seed_vector(&skipped.path);
+    let already_committed = json!({
         "id": 7,
         "method": "memory_upsert",
         "params": {
             "corpusId": "c1",
-            "passages": [{"passageId":"p1", "text":"one"}],
-            "facts": [{"factId":"f1", "value":"one"}],
-            "schemas": [{"schemaId":"s1", "name":"one"}]
+            "passages": [{"passageId":"p1", "text":"must-not-replay"}],
+            "facts": [{"factId":"f1", "value":"must-not-replay"}],
+            "schemas": []
         }
     });
-    let record = json!({"version":2,"baseGeneration":1,"request":request});
     std::fs::write(
-        db.path.with_extension("agdb.wal"),
-        format!("{}\n{}\n", record, record),
+        skipped.path.with_extension("agdb.wal"),
+        encoded_wal_record(0, &already_committed),
     )
-    .expect("write generation-bound WAL");
-    let mut native = NativeProcess::spawn(&db.path, &[]);
-    let snapshot = native.send(json!({
-        "id": 8,
-        "method": "memory_load",
-        "params": {"corpusId":"c1"}
-    }));
-    assert_eq!(snapshot["result"]["passages"].as_array().unwrap().len(), 1);
-    assert_eq!(snapshot["result"]["facts"].as_array().unwrap().len(), 1);
-    assert_eq!(snapshot["result"]["schemas"].as_array().unwrap().len(), 1);
+    .expect("write already-committed WAL");
+    let mut native = NativeProcess::spawn(&skipped.path, &[]);
+    let info = native.send(json!({"id":1,"method":"protocol_info","params":{}}));
+    assert_eq!(info["ok"], json!(true));
+    assert_eq!(info["result"]["generation"], json!(1));
+    assert_eq!(info["result"]["state"], json!("idle"));
     assert_eq!(native.finish().code(), Some(0));
-    assert!(db.path.with_extension("agdb.wal").exists());
-
-    let mut recovery = NativeProcess::spawn(&db.path, &[]);
-    assert_eq!(recovery.send(batch_begin(9))["ok"], json!(true));
-    assert_eq!(recovery.send(request.clone())["ok"], json!(true));
-    assert_eq!(recovery.send(batch_commit(10))["ok"], json!(true));
-    assert_eq!(recovery.finish().code(), Some(0));
-    assert!(!db.path.with_extension("agdb.wal").exists());
+    assert!(!skipped.path.with_extension("agdb.wal").exists());
+    let mut skipped_read = NativeProcess::spawn(&skipped.path, &[]);
+    let memory = skipped_read.send(json!({
+        "id":2,
+        "method":"memory_load",
+        "params":{"corpusId":"c1"}
+    }));
+    assert_eq!(memory["ok"], json!(true));
+    assert!(memory["result"]["passages"].as_array().unwrap().is_empty());
+    assert!(memory["result"]["facts"].as_array().unwrap().is_empty());
+    assert_eq!(skipped_read.finish().code(), Some(0));
 
     let future = TempDb::new("wal-future");
     seed_vector(&future.path);
-    let future_record = json!({"version":2,"baseGeneration":99,"request":request});
     std::fs::write(
         future.path.with_extension("agdb.wal"),
-        format!("{}\n", future_record),
+        encoded_wal_record(99, &already_committed),
     )
     .expect("write future WAL");
     let native = NativeProcess::spawn(&future.path, &[]);
     assert_ne!(native.finish().code(), Some(0));
+    assert!(future.path.with_extension("agdb.wal").exists());
 
     let malformed = TempDb::new("wal-malformed");
     seed_vector(&malformed.path);
@@ -497,6 +794,7 @@ fn wal_base_generation_replays_once_skips_committed_and_rejects_future() {
         .expect("write malformed WAL");
     let native = NativeProcess::spawn(&malformed.path, &[]);
     assert_ne!(native.finish().code(), Some(0));
+    assert!(malformed.path.with_extension("agdb.wal").exists());
 }
 
 #[test]
@@ -509,15 +807,66 @@ fn protocol_info_is_the_method_policy_and_unknown_is_not_a_read() {
         json!("native-method-policy@1")
     );
     assert_eq!(info["result"]["generation"], json!(0));
+    assert_eq!(info["result"]["state"], json!("idle"));
+    assert_eq!(info["result"]["recovery"], Value::Null);
     let methods = info["result"]["methods"]
         .as_array()
         .expect("method inventory");
-    let vector_upsert = methods
+    let actual: Vec<(String, String, bool)> = methods
         .iter()
-        .find(|method| method["name"] == json!("vector_upsert"))
-        .expect("vector_upsert policy");
-    assert_eq!(vector_upsert["classification"], json!("mutation"));
-    assert_eq!(vector_upsert["wal"], json!(true));
+        .map(|method| {
+            (
+                method["name"].as_str().expect("method name").to_string(),
+                method["classification"]
+                    .as_str()
+                    .expect("method classification")
+                    .to_string(),
+                method["wal"].as_bool().expect("method WAL flag"),
+            )
+        })
+        .collect();
+    let expected = vec![
+        ("ping", "health", false),
+        ("protocol_info", "health", false),
+        ("batch_begin", "transaction", false),
+        ("batch_commit", "commit", false),
+        ("recovery_discard", "recovery", false),
+        ("upsert_nodes", "mutation", true),
+        ("upsert_edges", "mutation", true),
+        ("get_node", "read", false),
+        ("get_nodes", "read", false),
+        ("get_edges", "read", false),
+        ("get_adjacent", "read", false),
+        ("delete_nodes", "mutation", true),
+        ("delete_edges", "mutation", true),
+        ("delete_by_document", "mutation", true),
+        ("delete_by_corpus", "mutation", true),
+        ("vector_upsert", "mutation", true),
+        ("vector_search", "read", false),
+        ("vector_delete_by_document", "mutation", true),
+        ("memory_upsert", "mutation", true),
+        ("memory_save", "mutation", true),
+        ("memory_save_file", "mutation", true),
+        ("memory_load", "read", false),
+        ("memory_save_checkpoint", "mutation", true),
+        ("memory_load_checkpoint", "read", false),
+        ("memory_validate_integrity", "read", false),
+        ("projection_get_transitions", "read", false),
+        ("projection_get_dangling_nodes", "read", false),
+        ("projection_get_node_count", "read", false),
+        ("lexical_index_passages", "mutation", true),
+        ("lexical_search", "read", false),
+        ("lexical_delete_by_document", "mutation", true),
+        ("cypher_query", "read", false),
+        ("__debug_force_panic__", "debug", false),
+    ]
+    .into_iter()
+    .map(|(name, classification, wal)| (name.to_string(), classification.to_string(), wal))
+    .collect::<Vec<_>>();
+    assert_eq!(
+        actual, expected,
+        "protocol_info is the complete method policy"
+    );
     let unknown = native.send(json!({"id":2,"method":"never_a_read","params":{}}));
     assert_eq!(unknown["ok"], json!(false));
     assert_eq!(
@@ -581,22 +930,32 @@ fn eof_mid_batch_preserves_wal_without_publishing_generation() {
     );
     assert_eq!(native.finish().code(), Some(0));
     assert!(!db.path.exists());
-    assert!(db.path.with_extension("agdb.wal").exists());
+    let wal_path = db.path.with_extension("agdb.wal");
+    let wal_bytes = std::fs::read(&wal_path).expect("EOF preserves WAL");
+    let wal_digest = digest_hex(&wal_bytes);
 
     let mut reopened = NativeProcess::spawn(&db.path, &[]);
     let info = reopened.send(json!({"id":3,"method":"protocol_info","params":{}}));
     assert_eq!(info["result"]["generation"], json!(0));
+    assert_eq!(info["result"]["state"], json!("recoveryPending"));
+    assert_eq!(info["result"]["recovery"]["walDigest"], json!(wal_digest));
     let search = reopened.send(json!({
         "id":4,
         "method":"vector_search",
         "params":{"corpusId":"c1","namespace":"default","queryVector":[1.0,0.0],"topK":1}
     }));
-    assert_eq!(
-        search["result"][0]["metadata"]["generation"],
-        json!("uncommitted")
-    );
+    assert_eq!(search["ok"], json!(false));
+    assert!(search.get("result").is_none());
+    let discard = reopened.send(json!({
+        "id":5,
+        "method":"recovery_discard",
+        "params":{"baseGeneration":0,"walDigest":wal_digest}
+    }));
+    assert_eq!(discard["ok"], json!(true));
     assert_eq!(reopened.finish().code(), Some(0));
-    assert!(db.path.with_extension("agdb.wal").exists());
+    assert!(!wal_path.exists());
+    assert_eq!(quarantined_wal_paths(&db.dir, &wal_bytes).len(), 1);
+    assert!(!db.path.exists(), "EOF must not publish a generation");
 }
 
 #[test]
@@ -613,12 +972,18 @@ fn memory_save_file_wal_is_self_contained_after_source_replacement() {
     let mut native = NativeProcess::spawn(&db.path, &[]);
     assert_eq!(native.send(batch_begin(1))["ok"], json!(true));
     assert_eq!(native.send(memory_save_file(2, &source))["ok"], json!(true));
+    let wal_before_source_replacement =
+        std::fs::read_to_string(db.path.with_extension("agdb.wal")).expect("canonical memory WAL");
+    assert!(wal_before_source_replacement.contains("\"method\":\"memory_save\""));
+    assert!(!wal_before_source_replacement.contains("memory_save_file"));
+    assert!(!wal_before_source_replacement.contains("snapshot.json"));
     std::fs::write(
         &source,
         json!({"corpusId":"c1","facts":[{"factId":"f1","value":"replaced"}]}).to_string(),
     )
     .expect("replace source after acknowledgement");
     std::fs::remove_file(&source).expect("delete source after replacement");
+    assert_eq!(native.send(batch_commit(3))["ok"], json!(true));
     assert_eq!(native.finish().code(), Some(0));
 
     let mut reopened = NativeProcess::spawn(&db.path, &[]);
@@ -629,12 +994,7 @@ fn memory_save_file_wal_is_self_contained_after_source_replacement() {
     }));
     assert_eq!(snapshot["result"], original);
     assert_eq!(reopened.finish().code(), Some(0));
-
-    let wal =
-        std::fs::read_to_string(db.path.with_extension("agdb.wal")).expect("canonical memory WAL");
-    assert!(wal.contains("\"method\":\"memory_save\""));
-    assert!(!wal.contains("memory_save_file"));
-    assert!(!wal.contains("snapshot.json"));
+    assert!(!db.path.with_extension("agdb.wal").exists());
 }
 
 #[test]
@@ -731,4 +1091,18 @@ fn mixed_valid_invalid_mutations_fail_closed_before_wal_append() {
             "{label} appended WAL before validation"
         );
     }
+}
+
+#[test]
+fn mutation_preflight_does_not_clone_the_server_or_dispatch_a_clone() {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/aira-graphdb-native.rs");
+    let source = std::fs::read_to_string(source_path).expect("native source");
+    assert!(
+        !source.contains("struct Server: Clone"),
+        "Server must not be Clone for mutation preflight"
+    );
+    assert!(
+        !source.contains("server.clone().handle_prepared"),
+        "mutation preflight must validate through the live server without cloning it"
+    );
 }
