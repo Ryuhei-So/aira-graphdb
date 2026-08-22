@@ -51,13 +51,23 @@ Active
   -- canonicalized mutation + durable WAL + apply --> Active(mutation_seen=true)
 Active(mutation_seen=true)
   -- batch_commit --> publish N+1 --> Idle(generation=N+1)
+
+startup with base-N WAL
+  --> RecoveryPending(base=N, wal_digest, record_count)
+RecoveryPending
+  -- recovery_discard(base, digest) --> quarantine WAL --> Idle(generation=N)
 ```
 
-Mutation outside `Active` is rejected. A second `batch_begin`, a bare
-`batch_commit`, and a recovery `batch_commit` without a new successful mutation
-are rejected. WAL replay reconstructs state at base N but does not create an
-active transaction; the recovering writer must begin a new batch and replay the
-document before it can publish. Stable IDs make that replay idempotent.
+Mutation outside `Active` is rejected. A second `batch_begin` and a bare
+`batch_commit` are rejected. Startup never applies WAL to the readable live
+state. It parses and validates the WAL, computes a digest over its canonical
+bytes, enters `RecoveryPending`, and rejects every read, transaction, mutation,
+and commit other than health/status and a digest-matched `recovery_discard`.
+The discard atomically quarantines the WAL and fsyncs its directory, leaving
+canonical generation N unchanged. The owner then requeues the whole uncompleted
+document from its durable source and begins a fresh batch. Stable IDs make that
+full replay idempotent; an unrelated document can never publish an interrupted
+prefix.
 
 EOF, signal exit, WAL-size compaction, read-only open/close, and legacy format
 migration never publish a generation. EOF with WAL or an active/recovery batch
@@ -99,6 +109,10 @@ Required invariants:
   `memory_save_file` is expanded to a self-contained `memory_save` payload so
   replay never depends on a mutable external path. WAL failure or any mutator
   error is fatal/fail-closed; no later commit can publish an unlogged prefix.
+- Validation and preparation are O(request delta). They must not clone `Server`,
+  `State`, the vector map, or whole-corpus caches. After durable WAL append the
+  prepared mutation applies in place; any unexpected apply error exits without
+  EOF publication and is recovered from canonical N plus durable job requeue.
 - Only the method-policy authority classifies WAL mutations. The debug panic and
   file-import RPC remain unavailable to an untrusted read client.
 - The canonical JSON path is resolved once before sidecars are derived. An
@@ -131,6 +145,10 @@ make replay replace existing logical records rather than duplicate them.
 - Corrupt/missing/hash-mismatched referenced blob: startup fails closed without
   rewriting JSON or falling back to a different blob.
 - Malformed/future WAL: startup fails closed and preserves files for diagnosis.
+- Valid base-N WAL: startup exposes only `RecoveryPending` metadata (base,
+  digest, record count), never its uncommitted content. Digest-matched discard
+  quarantines rather than deletes the WAL; legacy `memory_save_file` WAL is
+  reported as unsafe and requires the same explicit quarantine/preflight path.
 - Legacy DB rollback: before deployment retain the existing JSON, `.vblob`, and
   WAL backup. The new binary is backward-readable; the old binary is not
   forward-readable after generation 1, so rollback restores that complete
@@ -200,3 +218,10 @@ Tests use the real native persistence code, not a fake that omits file writes.
     tests include a swap attempt between path validation and publication.
 15. Repeated temp-stage kills do not create a permanent PID/name collision or
     unbounded recognized-temp leak. Relative and default CLI DB paths work.
+16. A base-N WAL at startup exposes no WAL-only vector, node, memory, lexical,
+    or projection content. All non-health RPCs fail until a matching
+    `recovery_discard(base, digest)` quarantines it; a wrong digest fails without
+    mutation. A different document cannot commit the old prefix.
+17. Production-sized validation performs no whole-state/vector/cache clone.
+    A structural test rejects `Server: Clone` and exercises many small mutations
+    under a bounded RSS-growth gate.
