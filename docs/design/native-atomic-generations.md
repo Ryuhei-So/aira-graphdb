@@ -42,7 +42,30 @@ consumer cgroup limit does not address mixed-generation corruption.
 
 ## Commit state machine and invariants
 
-For committed generation N:
+All mutation is owned by one explicit native transaction state machine:
+
+```text
+Idle(generation=N)
+  -- batch_begin --> Active(base=N, mutation_seen=false)
+Active
+  -- canonicalized mutation + durable WAL + apply --> Active(mutation_seen=true)
+Active(mutation_seen=true)
+  -- batch_commit --> publish N+1 --> Idle(generation=N+1)
+```
+
+Mutation outside `Active` is rejected. A second `batch_begin`, a bare
+`batch_commit`, and a recovery `batch_commit` without a new successful mutation
+are rejected. WAL replay reconstructs state at base N but does not create an
+active transaction; the recovering writer must begin a new batch and replay the
+document before it can publish. Stable IDs make that replay idempotent.
+
+EOF, signal exit, WAL-size compaction, read-only open/close, and legacy format
+migration never publish a generation. EOF with WAL or an active/recovery batch
+leaves the canonical generation unchanged and preserves WAL for replay. The
+only publication entrypoint is an explicit successful `batch_commit` and its
+durable token.
+
+For committed generation N and an active, mutated batch:
 
 1. Serialize state N+1 and build the vector payload without changing the
    published in-memory generation.
@@ -71,25 +94,38 @@ Required invariants:
   its basename, format, length, and SHA-256 must validate before serving data.
 - Generation never advances after any failed validation or durability step.
 - A successful mutator is acknowledged only after its WAL v2 record is
-  `sync_data` durable. WAL failure is fatal/fail-closed; the mutated in-memory
-  process must not continue accepting work.
+  `sync_data` durable. Requests are normalized and fully validated before any
+  state change. The identical canonical request is written to WAL and applied;
+  `memory_save_file` is expanded to a self-contained `memory_save` payload so
+  replay never depends on a mutable external path. WAL failure or any mutator
+  error is fatal/fail-closed; no later commit can publish an unlogged prefix.
 - Only the method-policy authority classifies WAL mutations. The debug panic and
   file-import RPC remain unavailable to an untrusted read client.
+- The canonical JSON path is resolved once before sidecars are derived. An
+  existing DB must be a regular, single-link file. A new relative/default path
+  resolves its existing parent and uses `.` rather than an empty parent.
+- Referenced blobs are opened with no symlink following; regular-file, link
+  count, size, format, and hash are checked through that same descriptor. A
+  pre-existing content-addressed blob is `sync_all`ed before JSON publication.
 
 ## Concurrency and idempotency
 
 The native stdio server remains single-threaded. One request is completed before
-the next is read, so publication and WAL retirement cannot interleave with
-another request. The future Literature Hub owner supplies process exclusivity,
-writer CAS, reader leases, and request-level generation pinning. Stable node,
-edge, vector, passage, fact, schema, and checkpoint identifiers make replay and
-document reprocessing replace existing logical records rather than duplicate
-them; tests must prove this for the document-shaped mutation set.
+the next is read. Dispatch first requires a `METHOD_SPECS` entry, so the policy
+table gates the manual handler and unknown arms cannot execute. A mutation is
+prepared and validated in full, written durably to WAL, then applied without a
+fallible partial loop. As an interim fail-closed guard, any mutator error exits
+without the EOF persistence path. The future Literature Hub owner supplies
+process exclusivity, writer CAS, reader leases, and request-level generation
+pinning. Stable node, edge, vector, passage, fact, schema, and checkpoint IDs
+make replay replace existing logical records rather than duplicate them.
 
 ## Failure and rollback
 
 - Before JSON rename: JSON N still selects blob N; orphan N+1 temp/final blobs
-  are ignored and may be garbage-collected only after a later successful open.
+  are ignored. Recognized same-directory temp names include a cryptographic
+  nonce and are conservatively removed on an exclusive later startup only when
+  no committed JSON references them; unknown files fail closed or remain.
 - After JSON rename but before WAL retirement: JSON N+1 opens its blob; WAL
   records with base N are already committed and are not replayed.
 - Corrupt/missing/hash-mismatched referenced blob: startup fails closed without
@@ -102,6 +138,10 @@ them; tests must prove this for the document-shaped mutation set.
 - Blob GC is not part of the first boundary. Keeping old immutable blobs is a
   bounded short-term disk tradeoff during validation; safe reachability-based GC
   is a separate deliverable.
+- Process-crash SIGKILL tests prove ordering with the host/page cache intact.
+  A filesystem fault seam separately injects failure before each write, file
+  sync, rename, directory sync, and WAL retirement; neither is described as a
+  substitute for real power-loss testing.
 
 ## Privacy and logging
 
@@ -136,13 +176,27 @@ Tests use the real native persistence code, not a fake that omits file writes.
    request service.
 5. Reject missing, truncated, hash-mismatched, non-regular, escaping-path, and
    wrong-format blobs without modifying canonical files.
-6. Prove the JSON publication rename never falls back to copy and a rename
-   failure leaves N readable.
+6. Prove every injected write/sync/rename/directory-sync failure leaves N
+   readable and returns no token. Prove the JSON publication rename never falls
+   back to copy.
 7. Migrate an existing inline-vector file and a legacy JSON + `.vblob` pair;
    reopen values and metadata exactly.
 8. Compare `protocol_info` with the actual dispatch inventory and prove every
-   non-read method is fail-closed/writer-classified for the downstream owner.
+   expected method, class, and WAL flag exhaustively; unknown methods must be
+   rejected before the handler match.
 9. Replay the same document-shaped WAL/mutation sequence twice and prove stable
    logical IDs and counts (no duplicate completed document data).
 10. Run the complete Cargo test suite on the supported Rust toolchain and a
     release binary smoke test before the consumer boundary starts.
+11. Acknowledged `memory_save_file`, followed by deletion or replacement of its
+    source and a crash, replays the exact acknowledged snapshot without logging
+    or reopening the source path.
+12. Mixed valid/invalid collection mutations return failure, exit fail-closed,
+    and cannot publish the valid prefix after reopen. Cover every collection
+    mutator family.
+13. EOF mid-batch, EOF with replayed WAL, and legacy read-only open/close never
+    advance generation or migrate format; only explicit commit does.
+14. Canonical DB and blob symlink/hard-link aliases are rejected before write;
+    tests include a swap attempt between path validation and publication.
+15. Repeated temp-stage kills do not create a permanent PID/name collision or
+    unbounded recognized-temp leak. Relative and default CLI DB paths work.
