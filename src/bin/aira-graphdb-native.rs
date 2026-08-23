@@ -550,6 +550,7 @@ impl Server {
     }
 
     fn open_resolved(db_path: PathBuf) -> io::Result<Self> {
+        Self::probe_noreplace_support(&db_path)?;
         let mut state = if let Ok(metadata) = fs::symlink_metadata(&db_path) {
             Self::require_regular_single_link(&db_path, &metadata)?;
             let raw = Self::read_regular_nofollow(&db_path)?;
@@ -664,7 +665,11 @@ impl Server {
     fn is_durable_temp_stage(stage: &str) -> bool {
         matches!(
             stage,
-            "blob_temp_sync" | "json_temp_sync" | "wal_compact_sync" | "wal_retire"
+            "blob_temp_sync"
+                | "json_temp_sync"
+                | "wal_compact_sync"
+                | "wal_retire"
+                | "rename_probe"
         )
     }
 
@@ -809,6 +814,75 @@ impl Server {
         ))
     }
 
+    fn probe_noreplace_support(db_path: &Path) -> io::Result<()> {
+        let parent = Self::parent_dir(db_path);
+        let source = Self::temporary_path(db_path, "rename_probe")?;
+        let destination = Self::temporary_path(db_path, "rename_probe")?;
+        let create_probe = |path: &Path, bytes: &[u8]| -> io::Result<()> {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            let mut file = options.open(path)?;
+            file.write_all(bytes)?;
+            file.sync_all()
+        };
+        create_probe(&source, b"source")?;
+        if let Err(err) = create_probe(&destination, b"destination") {
+            let _ = fs::remove_file(&source);
+            let _ = Self::sync_parent_dir(&parent);
+            return Err(err);
+        }
+        Self::sync_parent_dir(&parent)?;
+
+        let probe_result =
+            if Self::failpoint_matches("AGDB_NATIVE_FAIL_POINT", "noreplace_unsupported") {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "injected no-replace capability failure",
+                ))
+            } else {
+                Self::rename_noreplace(&source, &destination)
+            };
+        let result = match probe_result {
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                let source_ok = fs::read(&source).is_ok_and(|raw| raw == b"source");
+                let destination_ok = fs::read(&destination).is_ok_and(|raw| raw == b"destination");
+                if source_ok && destination_ok {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(
+                        "atomic no-replace probe altered a collision target",
+                    ))
+                }
+            }
+            Ok(()) => Err(io::Error::other(
+                "atomic no-replace probe replaced an existing destination",
+            )),
+            Err(err) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "native persistence requires Linux renameat2 RENAME_NOREPLACE support in {}: {err}",
+                    parent.display()
+                ),
+            )),
+        };
+        let source_cleanup = match fs::remove_file(&source) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        };
+        let destination_cleanup = match fs::remove_file(&destination) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        };
+        Self::sync_parent_dir(&parent)?;
+        source_cleanup?;
+        destination_cleanup?;
+        result
+    }
+
     fn cleanup_retired_wal_exact(
         path: &Path,
         wal_path: &Path,
@@ -835,6 +909,7 @@ impl Server {
         Self::durability_pausepoint("before_startup_wal_retire_claim")?;
         Self::rename_noreplace(path, &claimed)?;
         Self::durability_pausepoint("after_startup_wal_retire_claim")?;
+        Self::durability_failpoint("after_startup_wal_retire_claim")?;
         Self::validate_regular_path_identity(&claimed, identity)?;
         held.seek(SeekFrom::Start(0))?;
         let mut claimed_raw = Vec::new();
@@ -845,9 +920,14 @@ impl Server {
             ));
         }
         let parent = Self::parent_dir(wal_path);
+        Self::durability_failpoint("before_startup_wal_retire_dir_fsync")?;
         Self::sync_parent_dir(&parent)?;
+        Self::durability_failpoint("after_startup_wal_retire_dir_fsync")?;
+        Self::durability_failpoint("before_startup_wal_retire_unlink")?;
         fs::remove_file(&claimed)?;
+        Self::durability_failpoint("after_startup_wal_retire_unlink")?;
         Self::sync_parent_dir(&parent)?;
+        Self::durability_failpoint("after_startup_wal_retire_final_dir_fsync")?;
         Ok(true)
     }
 

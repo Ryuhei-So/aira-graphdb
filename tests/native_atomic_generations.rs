@@ -392,6 +392,33 @@ fn recognized_wal_retire_paths(db: &TempDb) -> Vec<PathBuf> {
         .collect()
 }
 
+fn rename_probe_paths(db: &TempDb) -> Vec<PathBuf> {
+    std::fs::read_dir(&db.dir)
+        .expect("read database directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(".rename_probe.") && name.ends_with(".tmp"))
+        })
+        .collect()
+}
+
+fn generation_blob_paths(db: &TempDb) -> Vec<PathBuf> {
+    let mut paths = std::fs::read_dir(&db.dir)
+        .expect("read database directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "vblob")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
 fn seed_vector(path: &Path) {
     let mut native = NativeProcess::spawn(path, &[]);
     assert_eq!(native.send(batch_begin(0))["ok"], json!(true));
@@ -691,6 +718,67 @@ fn startup_retires_only_empty_or_already_published_wal_artifacts() {
             1,
             "{label} advanced canonical generation"
         );
+    }
+}
+
+#[test]
+fn unsupported_noreplace_fails_before_loading_or_mutating_canonical_state() {
+    let db = TempDb::new("noreplace-preflight");
+    seed_vector(&db.path);
+    let canonical_before = std::fs::read(&db.path).expect("canonical before preflight failure");
+    let blobs_before = generation_blob_paths(&db);
+    let native = NativeProcess::spawn(
+        &db.path,
+        &[("AGDB_NATIVE_FAIL_POINT", "noreplace_unsupported")],
+    );
+    assert_ne!(native.finish().code(), Some(0));
+    assert_eq!(std::fs::read(&db.path).unwrap(), canonical_before);
+    assert_eq!(generation_blob_paths(&db), blobs_before);
+    assert!(!db.path.with_extension("agdb.wal").exists());
+    assert!(rename_probe_paths(&db).is_empty());
+}
+
+#[test]
+fn startup_wal_retire_cleanup_kill_and_failure_seams_leave_no_orphans() {
+    for (mode, env_name) in [
+        ("kill", "AGDB_NATIVE_KILL_POINT"),
+        ("failure", "AGDB_NATIVE_FAIL_POINT"),
+    ] {
+        for stage in [
+            "after_startup_wal_retire_claim",
+            "after_startup_wal_retire_dir_fsync",
+            "after_startup_wal_retire_unlink",
+        ] {
+            let db = TempDb::new(&format!("startup-retire-{mode}-{stage}"));
+            seed_vector(&db.path);
+            let request = vector_upsert_for_document(1, "old-v", "old-document", [1.0, 0.0], "old");
+            let retired = recognized_wal_retire_path(&db, 12);
+            std::fs::write(&retired, encoded_wal_record(0, &request))
+                .expect("write retired WAL orphan");
+
+            let native = NativeProcess::spawn(&db.path, &[(env_name, stage)]);
+            let status = native.finish();
+            if mode == "kill" {
+                assert_native_killed(status, stage);
+            } else {
+                assert_ne!(status.code(), Some(0), "{stage} failure stayed alive");
+            }
+            assert_eq!(generation(&db.path), 1);
+
+            let mut reopened = NativeProcess::spawn(&db.path, &[]);
+            assert_eq!(
+                reopened.send(json!({"id":1,"method":"protocol_info","params":{}}))["ok"],
+                json!(true),
+                "{mode} {stage} did not recover"
+            );
+            assert_eq!(reopened.finish().code(), Some(0));
+            assert!(
+                recognized_wal_retire_paths(&db).is_empty(),
+                "{mode} {stage} left a retired WAL artifact"
+            );
+            assert!(rename_probe_paths(&db).is_empty());
+            assert_eq!(generation(&db.path), 1);
+        }
     }
 }
 
