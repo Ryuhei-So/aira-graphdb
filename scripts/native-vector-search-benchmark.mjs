@@ -9,7 +9,7 @@ import { basename, dirname, resolve } from 'node:path';
 const DEFAULT_DIMENSIONS = 1024;
 const DEFAULT_REPETITIONS = 3;
 const REQUEST_TIMEOUT_MS = 300_000;
-const SAMPLE_INTERVAL_MS = 20;
+const DEFAULT_SAMPLE_INTERVAL_MS = 250;
 
 function usage(message) {
   if (message) console.error(`error: ${message}`);
@@ -17,7 +17,9 @@ function usage(message) {
     'usage: native-vector-search-benchmark.mjs',
     '  --db COPIED_SNAPSHOT_JSON --old OLD_BINARY --new NEW_BINARY',
     '  --out ARTIFACT_JSON [--old-sha SHA] [--new-sha SHA]',
-    '  [--repetitions N] [--corpus ID] [--namespace NAME] [--top-k N]',
+    '  [--repetitions N] [--old-repetitions N] [--new-repetitions N]',
+    '  [--timeout-ms N] [--startup-timeout-ms N] [--sample-interval-ms N] [--preload]',
+    '  [--corpus ID] [--namespace NAME] [--top-k N]',
   ].join('\n'));
   process.exit(2);
 }
@@ -29,6 +31,10 @@ function parseArgs(argv) {
     if (!arg.startsWith('--')) usage(`unknown argument ${arg}`);
     const key = arg.slice(2).replaceAll('-', '_');
     if (key === 'help') usage();
+    if (key === 'preload') {
+      values[key] = 'true';
+      continue;
+    }
     const value = argv[index + 1];
     if (!value || value.startsWith('--')) usage(`missing value for --${key.replaceAll('_', '-')}`);
     values[key] = value;
@@ -111,7 +117,7 @@ function resultParity(response) {
   };
 }
 
-function runRequest(child, request) {
+function runRequest(child, request, timeoutMs) {
   return new Promise((resolvePromise, reject) => {
     let buffer = '';
     let settled = false;
@@ -133,9 +139,9 @@ function runRequest(child, request) {
       if (!settled) {
         settled = true;
         cleanup();
-        reject(new Error(`request timeout after ${REQUEST_TIMEOUT_MS}ms`));
+        reject(new Error(`request timeout after ${timeoutMs}ms`));
       }
-    }, REQUEST_TIMEOUT_MS);
+    }, timeoutMs);
     const onData = (chunk) => {
       buffer += chunk;
       const newline = buffer.indexOf('\n');
@@ -157,8 +163,9 @@ function runRequest(child, request) {
   });
 }
 
-async function runBinary(binary, request, repetitions) {
+async function runBinary(binary, request, repetitions, timeoutMs, preload, startupTimeoutMs, sampleIntervalMs) {
   const samples = [];
+  const preloadMs = [];
   const coldMs = [];
   const warmMs = [];
   const parity = [];
@@ -172,20 +179,46 @@ async function runBinary(binary, request, repetitions) {
     const poll = setInterval(() => {
       const memory = readMemory(child.pid);
       if (memory) samples.push(memory);
-    }, SAMPLE_INTERVAL_MS);
+    }, sampleIntervalMs);
     try {
+      if (preload) {
+        const preloadStart = process.hrtime.bigint();
+        try {
+          await runRequest(child, { id: repetition * 3 + 1, method: 'ping', params: {} }, startupTimeoutMs);
+          preloadMs.push(Number(process.hrtime.bigint() - preloadStart) / 1e6);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          preloadMs.push(Number(process.hrtime.bigint() - preloadStart) / 1e6);
+          parity.push({ preload: { ok: false, error: message }, cold: null, warm: null });
+          continue;
+        }
+      }
       const coldStart = process.hrtime.bigint();
-      const cold = await runRequest(child, { ...request.rpc, id: repetition * 2 + 1 });
-      coldMs.push(Number(process.hrtime.bigint() - coldStart) / 1e6);
+      let cold;
+      try {
+        cold = await runRequest(child, { ...request.rpc, id: repetition * 3 + 2 }, timeoutMs);
+        coldMs.push(Number(process.hrtime.bigint() - coldStart) / 1e6);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        coldMs.push(Number(process.hrtime.bigint() - coldStart) / 1e6);
+        parity.push({ cold: { ok: false, error: message }, warm: null });
+        continue;
+      }
+      const coldParity = resultParity(cold);
       const warmStart = process.hrtime.bigint();
-      const warm = await runRequest(child, { ...request.rpc, id: repetition * 2 + 2 });
-      warmMs.push(Number(process.hrtime.bigint() - warmStart) / 1e6);
-      parity.push({ cold: resultParity(cold), warm: resultParity(warm) });
+      try {
+        const warm = await runRequest(child, { ...request.rpc, id: repetition * 3 + 3 }, timeoutMs);
+        warmMs.push(Number(process.hrtime.bigint() - warmStart) / 1e6);
+        parity.push({ cold: coldParity, warm: resultParity(warm) });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        warmMs.push(Number(process.hrtime.bigint() - warmStart) / 1e6);
+        parity.push({ cold: coldParity, warm: { ok: false, error: message } });
+      }
       child.stdin.end();
-      await new Promise((resolvePromise, reject) => {
-        child.once('close', resolvePromise);
-        child.once('error', reject);
-      });
+      if (child.exitCode === null && child.signalCode === null) {
+        await new Promise((resolvePromise) => child.once('close', resolvePromise));
+      }
     } finally {
       clearInterval(poll);
       killGroup(child);
@@ -195,10 +228,12 @@ async function runBinary(binary, request, repetitions) {
     binary: resolve(binary),
     binarySha256: sha256Bytes(readFileSync(binary)),
     repetitions,
+    preloadMs,
     coldMs,
     warmMs,
-    p50Ms: { cold: percentile(coldMs, 0.5), warm: percentile(warmMs, 0.5) },
-    p95Ms: { cold: percentile(coldMs, 0.95), warm: percentile(warmMs, 0.95) },
+    p50Ms: { preload: percentile(preloadMs, 0.5), cold: percentile(coldMs, 0.5), warm: percentile(warmMs, 0.5) },
+    p95Ms: { preload: percentile(preloadMs, 0.95), cold: percentile(coldMs, 0.95), warm: percentile(warmMs, 0.95) },
+    timeoutMs,
     peakMemory: maxMemory(samples),
     parity,
   };
@@ -227,16 +262,23 @@ if (canonical) {
     }
   }
 }
-const state = existsSync(`${db}.vblob`) ? {} : JSON.parse(await readFile(db, 'utf8'));
+const adjacentBlob = db.endsWith('.json') ? `${db.slice(0, -'.json'.length)}.vblob` : `${db}.vblob`;
+const state = existsSync(adjacentBlob) ? {} : JSON.parse(await readFile(db, 'utf8'));
 const snapshotPaths = [db];
 if (state.vectorBlob?.basename) snapshotPaths.push(resolve(dirname(db), state.vectorBlob.basename));
-else if (existsSync(`${db}.vblob`)) snapshotPaths.push(`${db}.vblob`);
+else if (existsSync(adjacentBlob)) snapshotPaths.push(adjacentBlob);
 const snapshotFiles = [];
 for (const path of snapshotPaths) snapshotFiles.push(await fileDigest(path, canonicalIdentities));
 const snapshotHash = sha256Bytes(snapshotFiles.map((file) => `${basename(file.path)}:${file.sha256}\n`).join(''));
 
 const dimensions = Number(args.dimensions ?? DEFAULT_DIMENSIONS);
 const repetitions = Number(args.repetitions ?? DEFAULT_REPETITIONS);
+const oldRepetitions = Number(args.old_repetitions ?? repetitions);
+const newRepetitions = Number(args.new_repetitions ?? repetitions);
+const timeoutMs = Number(args.timeout_ms ?? REQUEST_TIMEOUT_MS);
+const startupTimeoutMs = Number(args.startup_timeout_ms ?? timeoutMs);
+const sampleIntervalMs = Number(args.sample_interval_ms ?? DEFAULT_SAMPLE_INTERVAL_MS);
+const preload = args.preload === 'true';
 const queryVector = Array.from({ length: dimensions }, (_, index) => (index === 0 ? 1 : 0.001));
 const rpc = {
   method: 'vector_search',
@@ -248,8 +290,8 @@ const rpc = {
   },
 };
 const request = { db, rpc };
-const oldResult = await runBinary(args.old, request, repetitions);
-const newResult = await runBinary(args.new, request, repetitions);
+const oldResult = await runBinary(args.old, request, oldRepetitions, timeoutMs, preload, startupTimeoutMs, sampleIntervalMs);
+const newResult = await runBinary(args.new, request, newRepetitions, timeoutMs, preload, startupTimeoutMs, sampleIntervalMs);
 const parity = oldResult.parity.map((oldRun, index) => ({
   repetition: index + 1,
   coldEqual: JSON.stringify(oldRun.cold) === JSON.stringify(newResult.parity[index]?.cold),
@@ -262,14 +304,19 @@ const artifact = {
   copiedSnapshotOnly: true,
   snapshot: { db, snapshotHash, files: snapshotFiles },
   rpc,
-  repetitions,
+  repetitions: { old: oldRepetitions, new: newRepetitions },
+  timeoutMs,
+  startupTimeoutMs,
+  sampleIntervalMs,
+  preload,
   timingDefinition: {
-    cold: 'fresh native process; elapsed from request write until response line',
-    warm: 'same native process immediately after cold response; elapsed from request write until response line',
+    preload: 'optional fresh native process ping; includes process startup and full snapshot load, elapsed from ping write until response line',
+    cold: 'elapsed from vector_search request write until response line; with --preload this is the first retrieval after a completed preload',
+    warm: 'same native process immediately after cold response; elapsed from vector_search request write until response line',
     p50: 'nearest-rank percentile over repetition wall-clock samples',
     p95: 'nearest-rank percentile over repetition wall-clock samples',
   },
-  memoryDefinition: '20ms polling of /proc/$pid/status VmRSS/VmSwap and /proc/$pid/smaps_rollup Pss; peaks can under-sample short-lived maxima',
+  memoryDefinition: `${sampleIntervalMs}ms polling of /proc/$pid/status VmRSS/VmSwap and /proc/$pid/smaps_rollup Pss; peaks can under-sample short-lived maxima`,
   binaries: { old: { ...oldResult, gitSha: args.old_sha ?? gitSha(args.old) }, new: { ...newResult, gitSha: args.new_sha ?? gitSha(args.new) } },
   parity,
 };
