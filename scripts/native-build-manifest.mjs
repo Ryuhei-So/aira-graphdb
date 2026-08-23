@@ -37,8 +37,11 @@ function killBuild(signal) {
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => {
     terminationSignal = signal;
-    killBuild('SIGTERM');
-    terminationEscalation = setTimeout(() => killBuild('SIGKILL'), 2000);
+    process.exitCode = 128 + (signal === 'SIGINT' ? 2 : 15);
+    if (activeBuild) {
+      killBuild('SIGTERM');
+      terminationEscalation = setTimeout(() => killBuild('SIGKILL'), 2000);
+    }
   });
 }
 
@@ -173,6 +176,7 @@ async function main() {
     const destinationHandle = await open(destination, constants.O_RDONLY | constants.O_DIRECTORY);
     await destinationHandle.sync();
     await destinationHandle.close();
+    if (terminationSignal) fail(`build terminated by ${terminationSignal}`);
 
     // The unguessable directory is the capability. It becomes authoritative
     // only when this success token is emitted, so no shared pathname is ever
