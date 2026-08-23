@@ -217,6 +217,41 @@ fn digest_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn recovery_discard(id: u64, base_generation: u64, wal_digest: &str) -> Value {
+    json!({
+        "id": id,
+        "method": "recovery_discard",
+        "params": {
+            "baseGeneration": base_generation,
+            "walDigest": wal_digest
+        }
+    })
+}
+
+fn open_recovery_pending(path: &Path, request: &Value) -> (NativeProcess, Vec<u8>, String) {
+    open_recovery_pending_with_env(path, request, &[])
+}
+
+fn open_recovery_pending_with_env(
+    path: &Path,
+    request: &Value,
+    envs: &[(&str, &str)],
+) -> (NativeProcess, Vec<u8>, String) {
+    let wal_bytes = write_wal_record(path, 0, request);
+    let wal_digest = digest_hex(&wal_bytes);
+    let mut native = NativeProcess::spawn(path, envs);
+    let info = native.send(json!({
+        "id": 900,
+        "method": "protocol_info",
+        "params": {}
+    }));
+    assert_eq!(info["ok"], json!(true));
+    assert_eq!(info["result"]["state"], json!("recoveryPending"));
+    assert_eq!(info["result"]["recovery"]["baseGeneration"], json!(0));
+    assert_eq!(info["result"]["recovery"]["walDigest"], json!(wal_digest));
+    (native, wal_bytes, wal_digest)
+}
+
 fn discard_pending_recovery(path: &Path) {
     let mut native = NativeProcess::spawn(path, &[]);
     let info = native.send(json!({
@@ -534,7 +569,8 @@ fn relative_and_default_database_paths_resolve_existing_parents() {
 #[test]
 fn wal_sync_failure_returns_failure_and_stops_request_service() {
     let db = TempDb::new("wal-failure");
-    let mut native = NativeProcess::spawn(&db.path, &[("AGDB_NATIVE_FAIL_POINT", "wal_sync")]);
+    let mut native =
+        NativeProcess::spawn(&db.path, &[("AGDB_NATIVE_FAIL_POINT", "before_wal_sync")]);
     assert_eq!(native.send(batch_begin(0))["ok"], json!(true));
     let response = native.send(vector_upsert(1, [1.0, 0.0], "new"));
     assert_eq!(response["ok"], json!(false));
@@ -740,6 +776,250 @@ fn valid_base_wal_enters_recovery_pending_without_exposing_or_replaying_data() {
     assert_eq!(new_items[0]["id"], json!("new-v"));
     assert_eq!(reopened.finish().code(), Some(0));
     assert_eq!(quarantined_wal_paths(&db.dir, &wal_bytes), quarantine);
+}
+
+#[test]
+fn recovery_pending_memory_save_file_rejects_before_reading_external_snapshot() {
+    let db = TempDb::new("memory-save-file-recovery-gate");
+    let unreadable_snapshot = db.dir.join("snapshot-sentinel-directory");
+    std::fs::create_dir(&unreadable_snapshot).expect("create unreadable snapshot sentinel");
+    let request =
+        vector_upsert_for_document(1, "pending-v", "pending-document", [1.0, 0.0], "pending");
+    let (mut native, wal_bytes, _) = open_recovery_pending(&db.path, &request);
+
+    let response = native.send(memory_save_file(2, &unreadable_snapshot));
+    assert_eq!(response["ok"], json!(false));
+    assert_ne!(response["error"]["failureClass"], json!("IO_FAILURE"));
+    let message = response["error"]["message"]
+        .as_str()
+        .expect("recovery rejection message");
+    assert!(
+        message.contains("recovery"),
+        "wrong rejection boundary: {message}"
+    );
+    assert!(
+        !message.contains("read snapshot"),
+        "external snapshot was read: {message}"
+    );
+    assert_eq!(
+        std::fs::read(db.path.with_extension("agdb.wal")).unwrap(),
+        wal_bytes
+    );
+    assert_eq!(
+        native.send(json!({"id":3,"method":"ping","params":{}}))["ok"],
+        json!(true)
+    );
+    assert_eq!(native.finish().code(), Some(0));
+}
+
+#[test]
+fn idle_memory_save_file_rejects_before_reading_external_snapshot() {
+    let db = TempDb::new("memory-save-file-idle-gate");
+    let unreadable_snapshot = db.dir.join("snapshot-sentinel-directory");
+    std::fs::create_dir(&unreadable_snapshot).expect("create unreadable snapshot sentinel");
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+
+    let response = native.send(memory_save_file(1, &unreadable_snapshot));
+    assert_eq!(response["ok"], json!(false));
+    assert_ne!(response["error"]["failureClass"], json!("IO_FAILURE"));
+    let message = response["error"]["message"]
+        .as_str()
+        .expect("idle rejection message");
+    assert!(
+        message.contains("active batch"),
+        "wrong idle rejection boundary: {message}"
+    );
+    assert!(
+        !message.contains("read snapshot"),
+        "external snapshot was read: {message}"
+    );
+    assert!(!db.path.exists());
+    assert!(!db.path.with_extension("agdb.wal").exists());
+    assert_ne!(native.finish().code(), Some(0));
+}
+
+#[test]
+fn recovery_discard_rejects_wal_replacement_and_append_without_quarantine() {
+    let replacement_db = TempDb::new("recovery-wal-replacement");
+    let request = vector_upsert_for_document(
+        1,
+        "replacement-v",
+        "replacement-document",
+        [1.0, 0.0],
+        "replacement",
+    );
+    let (mut native, original, digest) = open_recovery_pending(&replacement_db.path, &request);
+    let replacement = encoded_wal_record(
+        0,
+        &vector_upsert_for_document(
+            2,
+            "replacement-v2",
+            "replacement-document-2",
+            [0.0, 1.0],
+            "replacement-2",
+        ),
+    );
+    let replacement_tmp = replacement_db.dir.join("replacement.wal.tmp");
+    std::fs::write(&replacement_tmp, &replacement).expect("write replacement WAL");
+    std::fs::rename(
+        &replacement_tmp,
+        replacement_db.path.with_extension("agdb.wal"),
+    )
+    .expect("atomically replace active WAL");
+    let response = native.send(recovery_discard(2, 0, &digest));
+    assert_eq!(response["ok"], json!(false));
+    assert!(response.get("result").is_none());
+    assert_eq!(
+        std::fs::read(replacement_db.path.with_extension("agdb.wal")).unwrap(),
+        replacement
+    );
+    assert!(quarantined_wal_paths(&replacement_db.dir, &original).is_empty());
+    assert!(quarantined_wal_paths(&replacement_db.dir, &replacement).is_empty());
+    assert_ne!(native.finish().code(), Some(0));
+
+    let append_db = TempDb::new("recovery-wal-append");
+    let request =
+        vector_upsert_for_document(4, "append-v", "append-document", [1.0, 0.0], "append");
+    let (mut native, original, digest) = open_recovery_pending(&append_db.path, &request);
+    let appended_record = encoded_wal_record(
+        0,
+        &vector_upsert_for_document(5, "append-v2", "append-document-2", [0.0, 1.0], "append-2"),
+    );
+    let wal_path = append_db.path.with_extension("agdb.wal");
+    let mut appended = original.clone();
+    appended.extend_from_slice(&appended_record);
+    std::fs::write(&wal_path, &appended).expect("append WAL record");
+    let response = native.send(recovery_discard(6, 0, &digest));
+    assert_eq!(response["ok"], json!(false));
+    assert!(response.get("result").is_none());
+    assert_eq!(std::fs::read(&wal_path).unwrap(), appended);
+    assert!(quarantined_wal_paths(&append_db.dir, &original).is_empty());
+    assert!(quarantined_wal_paths(&append_db.dir, &appended).is_empty());
+    assert_ne!(native.finish().code(), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_discard_rejects_wal_symlink_and_hardlink_without_quarantine() {
+    let symlink_db = TempDb::new("recovery-wal-symlink");
+    let request =
+        vector_upsert_for_document(1, "symlink-v", "symlink-document", [1.0, 0.0], "symlink");
+    let (mut native, original, digest) = open_recovery_pending(&symlink_db.path, &request);
+    let wal_path = symlink_db.path.with_extension("agdb.wal");
+    let target = symlink_db.dir.join("symlink-target.wal");
+    std::fs::write(&target, &original).expect("write symlink WAL target");
+    std::fs::remove_file(&wal_path).expect("remove active WAL for symlink");
+    symlink(&target, &wal_path).expect("create WAL symlink");
+    let response = native.send(recovery_discard(2, 0, &digest));
+    assert_eq!(response["ok"], json!(false));
+    assert!(response.get("result").is_none());
+    assert!(
+        std::fs::symlink_metadata(&wal_path)
+            .expect("symlink remains")
+            .file_type()
+            .is_symlink()
+    );
+    assert!(quarantined_wal_paths(&symlink_db.dir, &original).is_empty());
+    assert_ne!(native.finish().code(), Some(0));
+
+    let hardlink_db = TempDb::new("recovery-wal-hardlink");
+    let request =
+        vector_upsert_for_document(3, "hardlink-v", "hardlink-document", [1.0, 0.0], "hardlink");
+    let (mut native, original, digest) = open_recovery_pending(&hardlink_db.path, &request);
+    let wal_path = hardlink_db.path.with_extension("agdb.wal");
+    let target = hardlink_db.dir.join("hardlink-target.wal");
+    std::fs::write(&target, &original).expect("write hardlink WAL target");
+    std::fs::remove_file(&wal_path).expect("remove active WAL for hardlink");
+    hard_link(&target, &wal_path).expect("create WAL hardlink");
+    let response = native.send(recovery_discard(4, 0, &digest));
+    assert_eq!(response["ok"], json!(false));
+    assert!(response.get("result").is_none());
+    assert!(wal_path.exists());
+    assert!(target.exists());
+    assert!(quarantined_wal_paths(&hardlink_db.dir, &original).is_empty());
+    assert_ne!(native.finish().code(), Some(0));
+}
+
+#[test]
+fn recovery_quarantine_failpoints_never_return_a_success_token() {
+    for stage in [
+        "before_recovery_quarantine_rename",
+        "after_recovery_quarantine_rename",
+        "before_recovery_quarantine_dir_fsync",
+        "after_recovery_quarantine_dir_fsync",
+    ] {
+        let db = TempDb::new(stage);
+        let request =
+            vector_upsert_for_document(1, "fault-v", "fault-document", [1.0, 0.0], "fault");
+        let (mut native, wal_bytes, digest) = open_recovery_pending_with_env(
+            &db.path,
+            &request,
+            &[("AGDB_NATIVE_FAIL_POINT", stage)],
+        );
+        let response = native.send(recovery_discard(2, 0, &digest));
+        assert_eq!(response["ok"], json!(false), "fault point {stage}");
+        assert!(
+            response.get("result").is_none(),
+            "fault point {stage} returned token"
+        );
+        assert_ne!(native.finish().code(), Some(0));
+        assert!(
+            !db.path.exists(),
+            "fault point {stage} published canonical state"
+        );
+        let wal_path = db.path.with_extension("agdb.wal");
+        if stage == "before_recovery_quarantine_rename" {
+            assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes);
+            assert!(quarantined_wal_paths(&db.dir, &wal_bytes).is_empty());
+        } else {
+            assert!(!wal_path.exists());
+            assert_eq!(quarantined_wal_paths(&db.dir, &wal_bytes).len(), 1);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_quarantine_killpoints_leave_a_recoverable_boundary() {
+    for stage in [
+        "before_recovery_quarantine_rename",
+        "after_recovery_quarantine_rename",
+        "before_recovery_quarantine_dir_fsync",
+        "after_recovery_quarantine_dir_fsync",
+    ] {
+        let db = TempDb::new(stage);
+        let request = vector_upsert_for_document(1, "kill-v", "kill-document", [1.0, 0.0], "kill");
+        let wal_bytes = write_wal_record(&db.path, 0, &request);
+        let digest = digest_hex(&wal_bytes);
+        let mut native = NativeProcess::spawn(&db.path, &[("AGDB_NATIVE_KILL_POINT", stage)]);
+        let info = native.send(json!({"id":1,"method":"protocol_info","params":{}}));
+        assert_eq!(info["result"]["state"], json!("recoveryPending"));
+        native.send_without_read(recovery_discard(2, 0, &digest));
+        let status = native.finish();
+        #[cfg(unix)]
+        assert_eq!(status.signal(), Some(9), "kill point {stage}");
+
+        let wal_path = db.path.with_extension("agdb.wal");
+        if stage == "before_recovery_quarantine_rename" {
+            assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes);
+            assert!(quarantined_wal_paths(&db.dir, &wal_bytes).is_empty());
+            discard_pending_recovery(&db.path);
+            assert!(!wal_path.exists());
+            assert_eq!(quarantined_wal_paths(&db.dir, &wal_bytes).len(), 1);
+        } else {
+            assert!(!wal_path.exists());
+            assert_eq!(quarantined_wal_paths(&db.dir, &wal_bytes).len(), 1);
+            let mut reopened = NativeProcess::spawn(&db.path, &[]);
+            let info = reopened.send(json!({"id":3,"method":"protocol_info","params":{}}));
+            assert_eq!(info["result"]["state"], json!("idle"));
+            assert_eq!(info["result"]["generation"], json!(0));
+            assert_eq!(reopened.finish().code(), Some(0));
+        }
+        assert!(
+            !db.path.exists(),
+            "kill point {stage} published canonical state"
+        );
+    }
 }
 
 #[test]
