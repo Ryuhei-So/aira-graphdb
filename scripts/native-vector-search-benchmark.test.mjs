@@ -83,7 +83,15 @@ test('build manifest generator owns fixed clean build and rejects dirty/wrong/co
   const destination = await mkdtemp(join(tmpdir(), 'aira-private-output-')); await chmod(destination, 0o700);
   const generated = await runManifest(['--repo', repo, '--source-sha', sha, '--destination-dir', destination]);
   assert.equal(generated.code, 0);
-  assert.notEqual((await runManifest(['--repo', repo, '--source-sha', sha, '--destination-dir', destination])).code, 0);
+  assert.equal((await runManifest(['--repo', repo, '--source-sha', sha, '--destination-dir', destination])).code, 0);
+  const published = (await readdir(destination)).filter((entry) => entry.startsWith('.build-result-'));
+  assert.equal(published.length, 2);
+  assert.equal((await readdir(destination)).some((entry) => entry.startsWith('.cargo-target-')), false);
+  const foreign = join(destination, '.build-result-foreign-owner');
+  await mkdir(foreign);
+  await writeFile(join(foreign, 'sentinel'), 'owned elsewhere');
+  assert.equal((await runManifest(['--repo', repo, '--source-sha', sha, '--destination-dir', destination])).code, 0);
+  assert.equal(await readFile(join(foreign, 'sentinel'), 'utf8'), 'owned elsewhere');
   const dirty = await mkdtemp(join(tmpdir(), 'aira-build-dirty-')); await mkdir(join(dirty, 'src'));
   await writeFile(join(dirty, 'Cargo.toml'), '[package]\nname="aira-graphdb"\nversion="0.1.0"\nedition="2021"\n[[bin]]\nname="aira-graphdb-native"\npath="src/main.rs"\n'); await writeFile(join(dirty, 'src/main.rs'), 'fn main() {}\n');
   await exec('cargo', ['generate-lockfile'], { cwd: dirty });
@@ -91,6 +99,43 @@ test('build manifest generator owns fixed clean build and rejects dirty/wrong/co
   const dirtySha = (await exec('git', ['-C', dirty, 'rev-parse', 'HEAD'])).stdout.trim(); await writeFile(join(dirty, 'dirty.txt'), 'dirty'); const dirtyOut = join(dirty, 'out'); await mkdir(dirtyOut); await chmod(dirtyOut, 0o700);
   assert.notEqual((await runManifest(['--repo', dirty, '--source-sha', dirtySha, '--destination-dir', dirtyOut])).code, 0);
   assert.notEqual((await runManifest(['--repo', repo, '--source-sha', '0'.repeat(40), '--destination-dir', join(repo, 'other-out')])).code, 0);
+});
+
+test('build manifest SIGTERM reaps its process group and cleans only its owned directories', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'aira-build-signal-'));
+  await mkdir(join(repo, 'src'));
+  await writeFile(join(repo, 'Cargo.toml'), '[package]\nname="aira-graphdb"\nversion="0.1.0"\nedition="2021"\nbuild="build.rs"\n[[bin]]\nname="aira-graphdb-native"\npath="src/main.rs"\n');
+  await writeFile(join(repo, 'src/main.rs'), 'fn main() {}\n');
+  await writeFile(join(repo, 'build.rs'), 'fn main() { std::fs::write("build-script.pid", std::process::id().to_string()).unwrap(); std::thread::sleep(std::time::Duration::from_secs(30)); }\n');
+  await exec('cargo', ['generate-lockfile'], { cwd: repo });
+  await exec('git', ['init', '-q', repo]);
+  await exec('git', ['-C', repo, 'config', 'user.email', 'test@example.invalid']);
+  await exec('git', ['-C', repo, 'config', 'user.name', 'test']);
+  await exec('git', ['-C', repo, 'add', '.']);
+  await exec('git', ['-C', repo, 'commit', '-qm', 'fixture']);
+  const sha = (await exec('git', ['-C', repo, 'rev-parse', 'HEAD'])).stdout.trim();
+  const destination = await mkdtemp(join(tmpdir(), 'aira-build-signal-output-'));
+  await chmod(destination, 0o700);
+  const foreign = join(destination, '.build-result-foreign-owner');
+  await mkdir(foreign);
+  await writeFile(join(foreign, 'sentinel'), 'owned elsewhere');
+  const child = spawn(process.execPath, [manifestScript, '--repo', repo, '--source-sha', sha, '--destination-dir', destination], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const deadline = Date.now() + 10_000;
+  let buildPid = null;
+  while (Date.now() < deadline) {
+    try { buildPid = Number((await readFile(join(repo, 'build-script.pid'), 'utf8')).trim()); break; }
+    catch { await new Promise((resolvePromise) => setTimeout(resolvePromise, 25)); }
+  }
+  assert.ok(Number.isSafeInteger(buildPid));
+  child.kill('SIGTERM');
+  const exit = await Promise.race([
+    new Promise((resolvePromise) => child.once('close', (code, signal) => resolvePromise({ code, signal }))),
+    new Promise((_, rejectPromise) => setTimeout(() => rejectPromise(new Error('generator did not terminate')), 5000)),
+  ]);
+  assert.equal(exit.code, 143);
+  await assert.rejects(readFile(`/proc/${buildPid}/status`, 'utf8'));
+  assert.equal(await readFile(join(foreign, 'sentinel'), 'utf8'), 'owned elsewhere');
+  assert.deepEqual((await readdir(destination)).sort(), ['.build-result-foreign-owner']);
 });
 
 test('SIGTERM kills child and removes owned temporary workspace', async () => {

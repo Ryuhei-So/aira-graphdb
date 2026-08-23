@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from 'node:crypto';
-import { chmod, lstat, mkdtemp, open, readFile, readdir, realpath, rm } from 'node:fs/promises';
+import { chmod, lstat, mkdtemp, open, readdir, realpath, rm } from 'node:fs/promises';
 import { constants, existsSync, readFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -20,6 +20,15 @@ const DEFAULT_OVERALL_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const MAX_OVERALL_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 const activeChildren = new Set();
 let terminationSignal = null;
+
+function checkLifecycle(deadline) {
+  if (terminationSignal) {
+    throw Object.assign(new Error(`terminated by ${terminationSignal}`), { code: 'TERMINATED' });
+  }
+  if (Date.now() >= deadline) {
+    throw Object.assign(new Error('overall benchmark deadline exceeded'), { code: 'OVERALL_DEADLINE' });
+  }
+}
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => {
@@ -70,7 +79,8 @@ function sha256Bytes(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-async function fileDigest(path, canonicalIdentities) {
+async function fileDigest(path, canonicalIdentities, deadline) {
+  checkLifecycle(deadline);
   const [metadata, resolvedPath] = await Promise.all([lstat(path), realpath(path)]);
   if (!metadata.isFile() || metadata.nlink !== 1) {
     throw new Error(`benchmark snapshot file must be a private regular inode: ${path}`);
@@ -86,7 +96,11 @@ async function fileDigest(path, canonicalIdentities) {
       throw new Error(`snapshot inode changed during validation: ${path}`);
     }
     const digest = createHash('sha256');
-    for await (const chunk of handle.createReadStream({ autoClose: false })) digest.update(chunk);
+    for await (const chunk of handle.createReadStream({ autoClose: false })) {
+      checkLifecycle(deadline);
+      digest.update(chunk);
+    }
+    checkLifecycle(deadline);
     return { path, realpath: resolvedPath, bytes: held.size, sha256: digest.digest('hex'), device: held.dev, inode: held.ino };
   } finally {
     await handle.close();
@@ -114,8 +128,7 @@ async function copyPrivate(source, target, mode, deadline) {
   const digest = createHash('sha256');
   try {
     for await (const chunk of source.handle.createReadStream({ autoClose: false })) {
-      if (terminationSignal) throw Object.assign(new Error(`terminated by ${terminationSignal}`), { code: 'TERMINATED' });
-      if (Date.now() >= deadline) throw Object.assign(new Error('overall benchmark deadline exceeded'), { code: 'OVERALL_DEADLINE' });
+      checkLifecycle(deadline);
       digest.update(chunk);
       await output.write(chunk);
     }
@@ -131,6 +144,32 @@ async function copyPrivate(source, target, mode, deadline) {
   await chmod(target, mode);
   const copied = await lstat(target);
   return { path: target, realpath: await realpath(target), bytes: copied.size, sha256: digest.digest('hex'), device: copied.dev, inode: copied.ino };
+}
+
+async function readCanonicalDescriptor(path, deadline) {
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const metadata = await handle.stat();
+    const maxTailBytes = 64 * 1024;
+    const length = Math.min(metadata.size, maxTailBytes);
+    const buffer = Buffer.alloc(length);
+    checkLifecycle(deadline);
+    const { bytesRead } = await handle.read(buffer, 0, length, metadata.size - length);
+    checkLifecycle(deadline);
+    const tail = buffer.subarray(0, bytesRead).toString('utf8').trimEnd();
+    const marker = ',"generation":';
+    const offset = tail.lastIndexOf(marker);
+    if ((offset < 0 && !tail.startsWith('{"generation":')) || !tail.endsWith('}')) {
+      usage('canonical generation descriptor is absent from the bounded state suffix');
+    }
+    const descriptor = JSON.parse(offset < 0 ? tail : `{${tail.slice(offset + 1)}`);
+    if (Object.keys(descriptor).some((key) => key !== 'generation' && key !== 'vectorBlob')) {
+      usage('canonical generation descriptor suffix has unexpected fields');
+    }
+    return descriptor;
+  } finally {
+    await handle.close();
+  }
 }
 
 function percentile(values, probability) {
@@ -413,10 +452,7 @@ async function main() {
     const args = parseArgs(process.argv.slice(2));
     const overallTimeoutMs = boundedInteger(args.overall_timeout_ms ?? DEFAULT_OVERALL_TIMEOUT_MS, 'overall-timeout-ms', { min: 1, max: MAX_OVERALL_TIMEOUT_MS });
     const overallDeadline = Date.now() + overallTimeoutMs;
-    const checkDeadline = () => {
-      if (terminationSignal) throw Object.assign(new Error(`terminated by ${terminationSignal}`), { code: 'TERMINATED' });
-      if (Date.now() >= overallDeadline) throw Object.assign(new Error('overall benchmark deadline exceeded'), { code: 'OVERALL_DEADLINE' });
-    };
+    const checkDeadline = () => checkLifecycle(overallDeadline);
     checkDeadline();
     const sourceDb = resolve(args.db);
     const sourceBlob = resolve(args.blob);
@@ -447,7 +483,7 @@ async function main() {
     }
     const oldManifest = await readBuildManifest(args.old, args.old_sha, binaryFiles.old.sha256); checkDeadline();
     const newManifest = await readBuildManifest(args.new, args.new_sha, binaryFiles.new.sha256); checkDeadline();
-    const state = JSON.parse(await readFile(db, 'utf8'));
+    const state = await readCanonicalDescriptor(db, overallDeadline);
     const descriptorBlob = state.vectorBlob?.basename ? resolve(dirname(db), state.vectorBlob.basename) : null;
     if (descriptorBlob && dirname(descriptorBlob) !== dirname(db)) usage('vector blob descriptor must remain in private directory');
     if (!descriptorBlob) usage('atomic-generation benchmark requires a vectorBlob descriptor; legacy snapshots are rejected');
@@ -485,11 +521,14 @@ let snapshotStable = true;
 let snapshotRevalidationError = null;
 try {
   const finalSnapshotFiles = [];
-  for (const file of snapshotFiles) finalSnapshotFiles.push(await fileDigest(file.path, new Set()));
+  for (const file of snapshotFiles) {
+    finalSnapshotFiles.push(await fileDigest(file.path, new Set(), overallDeadline));
+  }
   snapshotStable = JSON.stringify(finalSnapshotFiles.map((file) => [file.realpath, file.bytes, file.sha256, file.device, file.inode]))
     === JSON.stringify(snapshotFiles.map((file) => [file.realpath, file.bytes, file.sha256, file.device, file.inode]));
   if (!snapshotStable) snapshotRevalidationError = { code: 'SNAPSHOT_CHANGED', message: 'snapshot identity or digest changed during benchmark' };
 } catch (error) {
+  if (error.code === 'OVERALL_DEADLINE' || error.code === 'TERMINATED') throw error;
   snapshotStable = false;
   snapshotRevalidationError = { code: 'SNAPSHOT_REVALIDATION_FAILED', message: error instanceof Error ? error.message : String(error) };
 }
