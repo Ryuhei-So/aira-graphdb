@@ -523,6 +523,25 @@ impl Server {
         Ok((raw, file_identity))
     }
 
+    fn validate_regular_path_identity(path: &Path, expected: (u64, u64)) -> io::Result<()> {
+        let path_metadata = fs::symlink_metadata(path)?;
+        Self::require_regular_single_link(path, &path_metadata)?;
+        if Self::metadata_identity(&path_metadata) != expected {
+            return Err(io::Error::other(format!(
+                "{} no longer names the expected inode",
+                path.display()
+            )));
+        }
+        let file = Self::open_regular_nofollow(path)?;
+        if Self::metadata_identity(&file.metadata()?) != expected {
+            return Err(io::Error::other(format!(
+                "{} changed during identity validation",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)]
     fn open(db_path: PathBuf) -> io::Result<Self> {
         Self::open_resolved(Self::resolve_db_path(db_path)?)
@@ -1319,6 +1338,8 @@ impl Server {
             Self::sync_parent_dir(&parent)?;
             Self::durability_failpoint("after_wal_dir_fsync")?;
         }
+        Self::durability_pausepoint("after_wal_sync_before_identity_check");
+        Self::validate_regular_path_identity(&self.wal_path, wal_identity)?;
         self.wal_identity = Some(wal_identity);
         self.wal_bytes += encoded.len() as u64 + 1;
         Ok(())
@@ -1345,12 +1366,17 @@ impl Server {
             self.rewrite_wal_records(&replayable)?;
             wal_identity = self.read_wal_records_with_identity()?.1;
         }
-        self.wal_bytes = fs::metadata(&self.wal_path).map(|m| m.len()).unwrap_or(0);
         if replayable.is_empty() {
+            if wal_identity.is_some() {
+                self.rewrite_wal_records(&[])?;
+            }
+            self.wal_bytes = 0;
+            self.wal_identity = None;
             self.transaction = TransactionState::Idle;
             eprintln!("[wal] recoveryPending=false skipped={skipped} bytes=0");
             return Ok(0);
         }
+        self.wal_bytes = fs::metadata(&self.wal_path).map(|m| m.len()).unwrap_or(0);
         let encoded = Self::encoded_wal_records(&replayable)?;
         let digest = Self::digest_bytes(&encoded);
         let (wal_device, wal_inode) = wal_identity.ok_or_else(|| {
