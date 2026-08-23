@@ -43,10 +43,6 @@ pub struct ErrorCodeEntry {
     pub code: String,
     pub category: String,
     pub description: String,
-    #[serde(default)]
-    pub retryable: bool,
-    #[serde(default, rename = "failureClass")]
-    pub failure_class: String,
 }
 
 #[derive(Debug, Deserialize)]

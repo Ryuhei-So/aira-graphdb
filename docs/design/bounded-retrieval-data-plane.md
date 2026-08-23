@@ -1,226 +1,279 @@
 # Bounded retrieval data plane
 
-Status: design checkpoint; no native method is authorized by this document.
+Status: design checkpoint only.  This document does not authorize native
+method or validator implementation.
 
-This design supersedes the single `retrieve_bounded` pipeline proposed in the
-first issue-4 contract checkpoint.  Aira Synapse remains the query-policy
-authority.  Aira GraphDB executes a small set of bounded read plans over one
-exact committed generation; it does not independently choose retrieval,
-fusion, seed, ranking, or context policy.
+This design replaces the first issue-4 `retrieve_bounded` contract.  Aira
+Synapse is the sole query-policy authority.  Aira GraphDB provides three
+versioned, bounded data operations over one committed generation.  Literature
+Hub owns the generation session, availability policy, and retry circuit.
 
-## Decision and alternatives
+## Decision
 
-The selected boundary is three bulk phases under one Literature Hub owner
+One semantic retrieval uses three bulk operations inside one exclusive owner
 reader lease:
 
-1. `candidate_search_bounded` executes the requested passage, fact, and schema
-   vector searches and materializes only those candidates.
-2. Synapse applies its versioned node-initialization policy to those bounded
-   candidates.  When the active policy requests comparison expansion,
-   `fact_expand_bounded` returns a bounded, stable set of matching facts.
-3. `ppr_materialize_bounded` executes the explicit PPR plan and materializes
-   only the ranked passages and facts required by the caller.
+1. `candidate_search_bounded@1` performs explicitly requested vector searches
+   and materializes only their domain objects.
+2. `fact_expand_bounded@1` performs an explicit bounded entity-match plan when
+   Synapse requests one.
+3. `ppr_materialize_bounded@1` runs an explicit graph plan and materializes only
+   its selected passages and facts.
 
-All three requests carry the same decimal-string `expectedGeneration`.  The
-owner holds and renews one reader lease around the whole sequence, rejects a
-different generation, and final-validates the generation before releasing the
-result.  Native also checks the expected generation at admission.  Publication
-of generation N+1 remains blocked until the lease for N is released.
+The operations do not name, default, or validate a Synapse profile.  Their
+`protocol_info` entries advertise operation schema digests, hard limits,
+`classification=read`, and `wal=false`.  A profile id may be echoed as opaque
+audit data but never changes native behavior.
 
-Alternatives rejected:
+Rejected alternatives:
 
-- A single query-pipeline RPC duplicates Synapse policy in Rust and can silently
-  change ranking when either repository evolves.
-- Per-node or per-edge RPCs preserve authority but amplify queueing and lease
-  duration at production graph size.
-- Full immutable snapshots preserve generation consistency but duplicate
-  multi-GiB state and retain the transfer/cache failure mode.
-- Larger deadlines, response lines, cgroups, or restart delays do not bound
-  work or establish generation authority.
+- A single query-pipeline RPC makes Rust a second query-policy authority.
+- Per-node/per-edge RPCs make queue and lease duration proportional to graph
+  fan-out.
+- Full immutable reader snapshots retain multi-GiB memory and transfer costs.
+- Larger timeouts, response lines, cgroups, or restart delays do not establish
+  correctness or bounded work.
 
-## Authority and supported profile
+## Authorities
 
-- Canonical JSON and its generation descriptor are the only committed data
-  authority.  The owner is the only process allowed to reach native stdio.
-- The owner owns roles, reader leases, writer exclusion, generation admission,
-  native-death classification, and publication blocking.  Requests contain no
-  caller-supplied role or lease identifier.
-- Native owns storage lookup, exact vector scoring, graph traversal, domain
-  object lookup, hard resource accounting, and response framing.
-- Synapse owns normalization, embedding, query-mode detection, feature flags,
-  candidate/seed policy, PPR parameters, context construction, answers, and
-  provenance formatting.
-- The first supported policy profile is the production v15 path:
-  `VectorMemoryFilter` (passage/fact/schema), `SimpleNodeInitializer`, and
-  `SimplePPR`.  Lexical RRF, dictionary injection, subquery decomposition, and
-  other profiles are not silently approximated.  A client requesting an
-  unadvertised profile fails before work with `PROTOCOL_VERSION_MISMATCH`.
+- Canonical JSON and its referenced vector blob are the committed GraphDB data
+  authority.  The adjacent owner generation manifest records owner admission
+  state; it does not replace the canonical JSON publication pointer.  WAL is
+  unpublished recovery input and is never reader-visible.
+- The owner alone reaches native stdio and owns roles, writer exclusion, reader
+  lease admission/renewal/release, publication blocking, and native-death
+  classification.  Native requests contain no caller role or lease claim.
+- Native owns storage lookup, exact vector arithmetic, graph arithmetic,
+  domain-object lookup, work counters, checked allocation, and response
+  framing for the requested data operations.
+- Synapse owns a machine-readable `V15RetrievalPlan` and the pure functions that
+  produce it.  The legacy JS path and bounded adapter call the same functions.
+  Synapse alone decides normalization, embedding, search slots, comparison
+  mode, expansion parameters, seeds, PPR parameters, output limits, context,
+  answer, and provenance.
+- Literature Hub owns a `GenerationSession` around the complete retrieval and
+  an infrastructure retry budget independent of document failure counts.
 
-The Synapse adapter supplies every policy value that native executes.  Native
-must not fill missing policy values from its own defaults.  The request records
-the Synapse profile version so cross-repository fixtures can detect drift.
+No native default may fill a missing policy value.  Unknown fields and absent
+required operation values fail before corpus-sized allocation or work.
 
-## Generation and state machine
+## Generation session
 
-Generation values cross JSON boundaries as canonical unsigned decimal strings
-(`"0"`, `"1"`, ...), with no leading zero except `"0"`.  This avoids loss of
-integer identity in JavaScript.  Native converts to `u64` only after lexical
-validation and overflow checking.
+Generation is a JSON safe integer in `0..9007199254740991` at every existing
+boundary: owner hello/status/lease, native request/response, commit token, and
+owner manifest.  Native rejects a larger persisted or requested generation
+before conversion or increment.  A future u64 migration must change all of
+these boundaries atomically; issue 4 does not introduce a string/number split.
 
-The sequence is:
+Bridge v1 deliberately supports one active semantic query.  Its bounded queue
+may hold waiting HTTP requests, but a single `GenerationSession` owns one
+control connection, one reader connection, and one lease for the active query.
+The session:
 
-1. Owner admits a control-client lease for committed generation N.
-2. Each bulk RPC is admitted only when native is Idle at N.  RecoveryPending,
-   partial generation state, N-1/N+1, and a dirty state with a different base
-   generation fail closed.
-3. A writer may become queued/dirty at base N, but no native mutation or N+1
-   publication occurs while the lease is live and renewable.
-4. Each response repeats N.  Synapse rejects a missing or different generation.
-5. After the last response, the owner performs final lease renewal/validation,
-   then releases the lease.  Only then may queued publication proceed.
+1. acquires committed generation N;
+2. heartbeats before TTL and awaits any in-flight renewal;
+3. passes N to every bulk operation and rejects any response not equal to N;
+4. permits a queued writer to mark the owner manifest dirty only at base N,
+   while native mutation/publication remains blocked;
+5. performs final renewal/validation after the last operation; and
+6. releases in `finally` exactly once.
 
-No read RPC writes WAL, changes the manifest, advances a generation, populates
-a persistent cache, or mutates canonical in-memory state.
+Lease loss, generation mismatch, reader disconnect, or failed final validation
+discards the whole retrieval.  A later concurrency version must use distinct
+query sessions or a reviewed reference-counted lease manager; it may not share
+one mutable acquire/release pair between concurrent queries.
 
-## Bulk contracts
+Native admits each operation only while its state is Idle at N.  RecoveryPending
+and stale generation fail closed.  Read operations never write WAL, populate a
+persistent cache, change manifest/canonical artifacts, or advance generation.
 
-All request objects are versioned, reject unknown fields, and are validated
-before corpus-sized allocation or work.  Contract limits are advertised by
-`protocol_info`; clients may request smaller values but never enlarge native
-hard maxima.
+## Synapse policy authority and parity ledger
+
+Before native implementation, Synapse must extract the active production path
+(`VectorMemoryFilter`, `SimpleNodeInitializer`, `SimplePPR`) into shared pure
+plan/order helpers.  Both the legacy and bounded paths consume the same helper
+output.  Hybrid lexical RRF, dictionary injection, subquery decomposition, and
+other feature profiles remain unsupported by the bounded adapter until their
+own plan versions and parity fixtures exist.  Synapse, not native, fails closed
+when active feature flags lack a bounded plan.
+
+The v15 parity ledger is explicit:
+
+| Behavior | Current behavior | Issue-4 contract |
+| --- | --- | --- |
+| vector slots | passage `topK`, fact `topM`, schema `10` | preserve; values supplied by Synapse |
+| threshold | finite exact-vector domain, including negative | preserve |
+| missing domain object for a vector hit | silently skipped | harden to integrity failure only after a copied-production audit proves zero; otherwise block rollout |
+| fact expansion population | all facts, including inactive | preserve |
+| entity normalization | ECMAScript `toLowerCase()` | move to one Synapse-owned helper with cross-language vectors; native operation implements that digest only |
+| expansion scoring | max matching seed-entity score times `0.3`, top 20 | preserve; all values explicit in the plan |
+| expansion tie | snapshot-order stable sort | harden to fact id ascending after legacy JS adopts the same order |
+| seed score | any finite signed vector score | preserve; do not require nonnegative values |
+| PPR order and rank ties | incidental map/projection insertion order | harden to canonical order after legacy JS adopts it |
+| dangling mass | dropped | preserve |
+| context materialization | selected passages; fact-layer entries from ranked entities | preserve complete domain shapes; separately test the existing index-to-fact association |
+
+Every hardening is first implemented in the legacy JS reference, evaluated on
+the copied production generation, and recorded with before/after ids, ranks,
+and scores.  It is not described as parity until that evidence is accepted.
+
+## Data operations
 
 ### Candidate search
 
-The request contains an exact query vector and an ordered list of search slots.
-Each slot names a supported namespace, threshold, and result limit.  The v15
-profile requires exactly one passage slot, one fact slot, and one schema slot.
-Results preserve the slot boundary and contain the complete Synapse domain
-object plus exact cosine score.  Missing or malformed referenced objects fail
-the whole request; they are not silently dropped.
+Synapse supplies an ordered list of slots containing namespace, finite query
+vector, threshold, and result limit.  Native returns one ordered result list
+per slot with exact cosine score, native id, and the complete corresponding
+Passage, Fact, or Schema object.  It returns a missing-object integrity error
+only after the parity-ledger gate above selects that hardening.
 
-Tie order is score descending then native node id ascending.  This formalizes a
-stable order where the previous JavaScript sort depended on projection order;
-golden parity must show unchanged scores and explicitly review equal-score
-ordering as the only intentional semantic hardening.
+Candidate order is score descending then native id ascending.  The same order
+must already be active in the legacy JS reference.  Candidate and domain object
+shapes come from a SHA-pinned cross-repository fixture generated from Synapse
+types, not an independently invented GraphDB shape.
 
-### Comparison fact expansion
+### Fact expansion
 
-Synapse decides whether comparison expansion applies.  When enabled it submits
-a bounded map of case-folded seed entity to its highest finite seed similarity,
-plus the explicit attenuation and result limit from its versioned profile.
-Native finds active facts sharing a head or tail entity, excludes existing
-seeds, derives `max(matchingEntityScore) * attenuation`, and returns score
-descending then fact id ascending up to the requested limit.  These operations
-are an explicit data-plane plan; native neither detects comparison queries nor
-chooses attenuation or limits.  This preserves the current highest-entity-score
-and top-20 behavior without transferring every fact to Synapse.
+Synapse decides whether expansion applies and supplies:
+
+- normalized seed entity keys and their highest finite signed seed scores;
+- excluded seed fact ids;
+- explicit attenuation and result limit; and
+- the normalization-contract digest produced by the Synapse authority.
+
+Native scans the requested corpus facts, applies only that operation, and
+returns derived score descending then fact id ascending.  It includes inactive
+facts to preserve v15 behavior.  It does not detect comparison queries or
+choose normalization, attenuation, or limits.
 
 ### PPR and materialization
 
-Synapse submits the final bounded map of node-id to finite, nonnegative seed
-score plus all PPR values.  For the v15 profile native executes the current
-`SimplePPR` semantics exactly:
+Synapse supplies the final bounded node-id/finite-score seed map,
+`teleportProbability`, `convergenceEpsilon`, `maxIterations`,
+`hubDegreeThreshold`, and separate passage/entity rank limits.
 
-- nodes are the endpoints present in the corpus graph projection;
-- seed scores on absent nodes do not enter the teleport vector;
-- teleport is L1-normalized, or uniform when no submitted seed is present;
-- each non-dangling node distributes `(1 - teleportProbability)` by normalized
-  outgoing edge weight;
-- dangling mass is dropped, matching the current implementation;
-- teleport contribution is `teleportProbability * teleport[v]`;
-- schema targets whose total in+out degree exceeds `hubDegreeThreshold` receive
-  damping `1 / log2(totalDegree + 2)`;
-- convergence is the L1 delta threshold after each complete iteration;
-- passages and non-passage entities are ranked separately by score descending,
-  then node id ascending.
+The shared reference and native use these canonical orders:
 
-The response contains ranked node ids/scores and complete passage/fact domain
-objects for the selected ranks.  It does not invent a generic `Fact.value` and
-does not serialize schemas/entities that the v15 context builder discards.
-Materialized objects retain the fields needed for citation and provenance.
+- seed entries: node id ascending;
+- graph nodes: node id ascending;
+- outgoing edges: source id, target id, edge id ascending;
+- floating-point accumulation: the above serial order with no parallel
+  reduction or fused alternative;
+- ranked passages/entities: score descending, then node id ascending.
 
-## Hard resource accounting
+Arithmetic follows current `SimplePPR`: only graph endpoint nodes exist; absent
+seeds are ignored; teleport is L1-normalized when its sum is positive and is
+uniform otherwise; non-dangling nodes distribute `(1-teleportProbability)` by
+normalized outgoing weight; dangling mass is dropped; schema targets above the
+degree threshold receive `1/log2(totalDegree+2)` damping; convergence uses L1
+delta after a complete iteration.
 
-Native hard maxima, not request values, are the allocation authority.  Initial
-production values must be derived from a copied production generation and kept
-in one Rust contract module shared by validation, `protocol_info`, and tests.
-They include:
+Cross-language golden tests require identical ids/ranks/iteration/convergence
+and finite scores within absolute `1e-12`; they do not claim bit identity across
+JavaScript and Rust.  Copied-production comparison records maximum score delta
+and every top-rank difference.  Native returns ranked node ids/scores plus full
+Passage/Fact objects required by the existing context/provenance path; it never
+returns a full projection or memory snapshot and never invents `Fact.value`.
 
-- query dimensions and total query bytes;
-- vector comparisons per slot and total;
-- seed count;
-- facts scanned and expansion results;
-- graph nodes, graph edges, and PPR iterations;
-- returned passage count, fact count, per-object encoded bytes, and complete
-  JSON-RPC frame bytes;
-- monotonic elapsed deadline.
+## Hard resource model
 
-Counters use checked integer arithmetic.  A preflight count exceeding a hard or
-requested work cap fails before work.  Each vector comparison, fact inspected,
-node initialized, edge visited per iteration, and object considered for output
-has one specified counter increment.  Deadline and cancellation checks occur at
-least every 1024 work units and before materialization.
+One Rust contract module is the authority for validation, `protocol_info`,
+checked allocation formulas, and tests.  Request values may reduce but never
+raise hard maxima.  Initial ceilings are reviewed against the copied production
+generation and provide at least 2x count headroom while remaining below the
+owner cgroup headroom:
 
-Output is encoded incrementally into a buffer whose capacity never exceeds the
-hard frame maximum.  Before cloning or encoding variable-size text, arrays, or
-metadata, native checks stored byte/count metadata against the remaining item
-and frame budgets.  If the next complete item cannot fit, the entire RPC fails
-with `RETRIEVE_BOUNDED_RESPONSE_LIMIT`; it never truncates a domain object and
-never returns partial success.  The byte count covers the complete UTF-8
-JSON-RPC line including envelope and newline.
+- vector dimensions 4096; total vector comparisons 1,500,000;
+- graph nodes 1,500,000; graph edges 4,000,000; iterations 128;
+- search result limit 100 per slot; expansion results 64; seeds 512;
+- returned passages 100 and facts 100, combined objects 128;
+- one encoded object 256 KiB; complete JSON-RPC line 2 MiB;
+- transient request memory 512 MiB; hard operation deadline 60 seconds.
 
-## Failure ownership
+Production configuration starts lower where the current query requires it and
+alerts at 80% of any count, byte, deadline, `MemoryHigh`, or owner queue limit.
+The 2 MiB native frame must remain below both owner per-line and aggregate queue
+limits.  The 512 MiB transient ceiling plus measured native steady PSS and
+concurrent service allowance must remain below `MemoryHigh`; otherwise deploy
+is blocked rather than raising the cgroup boundary.
 
-- Native returns structured validation, version, stale-generation,
-  RecoveryPending, work-limit, response-limit, and deadline errors while it is
-  alive.
-- A client disconnect does not authorize unbounded background work.  The owner
-  cancellation/deadline path must cause native work to stop before the request
-  slot is reused.
-- Native death, SIGKILL, cgroup OOM, or a partial frame cannot be reported by
-  dead native code.  The owner maps them to the existing authoritative native
-  transport/death error, fails closed, and does not restart in a tight loop.
-- Literature Hub treats all GraphDB/owner/durability failures as retryable
-  infrastructure failures.  They never consume a document failure budget.
-- Every failure path leaves canonical JSON, descriptor/blob, manifest, WAL,
-  and generation unchanged.
+At generation load, native builds an immutable read catalog containing domain
+id references, encoded-size metadata, corpus/namespace counts, and canonical
+adjacency.  This is part of steady-state PSS and is measured separately from
+per-request transient memory.  It must not duplicate domain text or vectors.
 
-New codes belong in the central AGDB error registry with one retryability and
-failure-class definition.  Contract files may reference those codes but may
-not define a second local registry.
+Counters use checked integers.  Preflight counts reject a plan before work when
+the corpus cannot fit its requested/hard bound.  One unit is charged for each
+vector compared, fact inspected, node initialized per iteration, edge visited
+per iteration, and object considered for encoding.  Allocation checks cover
+both array capacity and bytes before allocation.  Response serialization uses
+borrowed typed objects and an upper-bounded writer; no full `serde_json::Value`
+result clone is allowed.  If one complete object cannot fit, the whole request
+fails with a response-limit error.  Bytes include the JSON-RPC envelope and
+newline.  No truncation or partial success is valid.
 
-## Test and rollout gates
+Version 1 promises a hard monotonic deadline, not immediate client
+cancellation.  Work checks the deadline at least every 1024 units and before
+every allocation/materialization step.  A disconnect may leave work running
+only until that deadline; the owner does not reuse the native request slot or
+report success meanwhile.  Immediate cancellation requires a later reviewed
+worker/cancel protocol.
 
-Before algorithm implementation:
+## Failure and retry authority
 
-- freeze typed request/response structs, one Rust validator/cap authority, and
-  cross-repository v15 fixtures derived from the actual Synapse domain shapes;
-- make boundary tests execute the validator rather than inspect contract text;
-- record the intentional equal-score tie hardening and otherwise require exact
-  candidate, seed, PPR score, rank, domain-object, and generation parity.
+Native returns structured errors only while alive.  Death, SIGKILL, cgroup OOM,
+or a partial frame is synthesized by the owner/client from the existing native
+transport/death authority.  Every failure leaves canonical JSON, referenced
+blob, owner manifest generation, and WAL unchanged.
 
-Before method wiring:
+Central error behavior is:
 
-- real native `protocol_info` advertises every method as `read`, `wal=false`,
-  with the exact contract/profile and hard-limit digest;
-- real-native negatives cover generation N, stale/overflow generation,
-  RecoveryPending, policy drift, malformed/non-finite input, every cap at and
-  above the boundary, deadline/cancel, response framing, native kill/OOM, and
-  canonical/manifest/blob byte invariance;
-- a writer is demonstrably blocked across the complete multi-RPC lease and one
-  atomic N+1 commit proceeds only after final validation and release.
+| Class | Retry policy |
+| --- | --- |
+| validation, unsupported operation/digest, hard cap | nonretryable configuration error; service stays unavailable until corrected |
+| stale generation or lease loss | at most 2 attempts per HTTP request with bounded backoff and a fresh session |
+| operation deadline | no same-request replay; return 503 and record work counters |
+| RecoveryPending or durability failure | no automatic loop; operator reconciliation required |
+| native death or OOM | open circuit immediately; owner fails closed; systemd start limit is the restart bound |
 
-Before deploy:
+Indexing infrastructure errors never consume the document-content failure
+budget, but that exemption is not an unlimited retry.  The worker records a
+separate durable infra-attempt timestamp/count, requeues the document once,
+exits, and relies on the bounded service start limit.  Repeated recovery/OOM
+opens an operator-visible circuit instead of a 30-second reload loop.
 
-- Aira Synapse uses the new data-plane only for the advertised v15 profile and
-  has no generation-unaware snapshot cache on that path;
-- copied-production tests record score/rank/domain parity, response bytes,
-  latency, RSS/PSS/VmSwap, work counters, and exact generation;
-- Literature Hub returns a real semantic result while acquisition,
-  interpretation, and indexing continue, and restart/OOM counters remain flat.
+## Negative-test and rollout gates
 
-Rollback is code-only: keep the canonical data format unchanged and retain the
-old low-level reads during migration.  If the bounded capability or profile is
-absent, production fails closed unless an explicit operator-controlled legacy
-fallback is enabled for a copied/test database; it does not silently return to
-the generation-mixing production path.
+Before typed operation implementation:
+
+- delete the superseded single-RPC contract, fixtures, ignored test, and local
+  error definitions so only this design remains authoritative;
+- land the Synapse `V15RetrievalPlan`/ordering helpers and cross-repository
+  domain/parity fixtures without weakening its existing test gates;
+- test the exclusive `GenerationSession`: renewal ordering, lease loss,
+  `finally` release, queued writer, and two simultaneous HTTP requests where
+  only one session is active.
+
+Before native algorithm wiring:
+
+- executable validator tests cover every type, unknown field, safe-generation
+  boundary, signed/non-finite score, count/byte/allocation formula, operation
+  digest, and limit at/above the boundary;
+- real `protocol_info` advertises each operation as read/WAL-free with the exact
+  schema/limit digest;
+- real-native tests cover nonzero generation, stale generation,
+  RecoveryPending, writer waiting across all three operations, deadline via
+  fake monotonic clock, allocation failpoints, response budget, partial frame,
+  kill/OOM classification, and byte-invariant canonical/manifest/blob state.
+
+CI uses deterministic clock/counter/allocation seams.  A separate copied-state
+cgroup run measures actual PSS/RSS/VmSwap, p50/p95 latency, work counters,
+response bytes, ranks, and maximum score delta.  Production activation is
+blocked unless it fits the existing owner timeout, lease heartbeat, cgroup
+headroom, and HTTP latency budget with margin.
+
+Migration keeps the canonical format unchanged and retains legacy reads until
+bounded production E2E passes.  The production bridge has no implicit legacy
+fallback: missing capability/digest or unsupported active policy fails closed.
+Rollback selects the prior code while worker/bridge are drained; it never
+rewrites or downgrades canonical data.
