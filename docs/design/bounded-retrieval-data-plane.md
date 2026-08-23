@@ -421,6 +421,36 @@ records that evaluated Synapse authority in the artifact.  The checker emits
 stable error classes only and never logs private values.  Public repositories
 pin only the generated public schema and exact public-attestation bytes.
 
+The artifact builder is not a public boundary that accepts caller-assembled
+comparison rows, case booleans, or behavioral observations.  Synapse owns one
+`V15ParityEvaluator` which selects the versioned fixture cases, invokes the
+evaluated legacy and candidate operations through typed read-only ports, and
+derives candidate, expansion, PPR, association, missing-object, absent-seed,
+signed-sum, dangling-loss, hub-damping, convergence, and tie-order traces from
+those calls.  Only that evaluator can call the internal builder.  A Hub driver
+may provide copied-state and exact-runtime operation ports, source metadata,
+and held manifest bytes; it cannot provide a precomputed trace, required-case
+map, verdict, or public-manifest digest.  Tests use instrumented ports to prove
+the evaluator issued every required call and that omitted, reordered,
+short-circuited, or substituted calls cannot produce an artifact.  The Linux
+copied-production gate then uses real base/candidate ports and records the
+operation-transcript digest and per-case call counts in the private artifact.
+
+Execution authority is established outside the checker before any private
+path is disclosed.  The Hub-owned bootstrap receives only public repository
+locations and expected commits, creates or selects clean detached checkouts,
+verifies commit existence, strict ancestry, tracked cleanliness, and tree
+digests, force-builds the checker from the candidate checkout, and launches
+the absolute script inside that same checkout.  Only after those checks pass
+does it provide copied-root, artifact, manifest, or fixture paths to the child.
+The child also compares its `import.meta.url` real path with the expected
+checkout as defense in depth, but an already-loaded checker never treats a
+caller-provided decoy checkout as proof of its own identity.  Bootstrap tests
+execute a checker from checkout A while presenting clean checkout B and require
+rejection before B receives any private path.  A stale incremental build and a
+modified ignored `dist` tree are also rejected or overwritten by a forced
+fresh emit before launch.
+
 The source fields and CI inputs are named by lifecycle, not by an ambiguous
 `toolSha`.  The detailed private artifact records
 `evaluatedSynapseBaseCommit/treeDigest`,
@@ -448,6 +478,13 @@ indent, one trailing LF, finite numbers only, and `-0` normalized to `0`).  A
 checker reserializes a parsed manifest, detailed artifact, or public
 attestation and requires byte equality before hashing it.  This avoids both a
 self-hash field and a second ad-hoc canonical-JSON implementation.
+
+All Git/source-authority subprocesses have an explicit monotonic deadline,
+bounded stdout and stderr, and process-group termination and reap on timeout.
+A timeout is a stable fail-closed source-authority error and never a partial
+success.  Hosted CI runs the parity schema, evaluator, bootstrap, and CLI
+negative suites on both Node 22 and the supported production Node 24 runtime;
+Unicode-only Node 24 coverage is not sufficient for this boundary.
 
 Comparison evidence is derived, not declared.  Each result list has unique
 IDs, ranks exactly `1..N`, array order equal to rank order, finite scores, and
