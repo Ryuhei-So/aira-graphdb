@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -95,6 +97,42 @@ struct State {
         skip_serializing_if = "Option::is_none"
     )]
     vector_blob: Option<VectorBlobDescriptor>,
+}
+
+const MAX_VECTOR_SEARCH_WORKERS: usize = 8;
+const MAX_VECTOR_DIMENSIONS: usize = 4_096;
+const MAX_VECTOR_SEARCH_TOP_K: usize = 10_000;
+
+#[derive(Debug)]
+struct ScoredVector {
+    key: String,
+    score: f64,
+}
+
+impl PartialEq for ScoredVector {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.score.to_bits() == other.score.to_bits()
+    }
+}
+
+impl Eq for ScoredVector {}
+
+/// The heap root is the worst retained candidate: lower score first, then
+/// lexicographically larger key.  This keeps the exact search bounded and
+/// makes ties independent of HashMap iteration order.
+impl Ord for ScoredVector {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.key.cmp(&other.key))
+    }
+}
+
+impl PartialOrd for ScoredVector {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2046,22 +2084,202 @@ impl Server {
         Vec::new()
     }
 
-    fn cosine(a: &[f64], b: &[f64]) -> f64 {
-        if a.is_empty() || b.is_empty() || a.len() != b.len() {
+    #[inline]
+    fn stable_cosine(a: &[f64], b: &[f64]) -> f64 {
+        let scale_a = a.iter().map(|value| value.abs()).fold(0.0, f64::max);
+        let scale_b = b.iter().map(|value| value.abs()).fold(0.0, f64::max);
+        if scale_a == 0.0 || scale_b == 0.0 {
             return 0.0;
         }
         let mut dot = 0.0;
         let mut norm_a = 0.0;
         let mut norm_b = 0.0;
-        for i in 0..a.len() {
-            dot += a[i] * b[i];
-            norm_a += a[i] * a[i];
-            norm_b += b[i] * b[i];
+        for (a_value, b_value) in a.iter().zip(b) {
+            let scaled_a = a_value / scale_a;
+            let scaled_b = b_value / scale_b;
+            dot += scaled_a * scaled_b;
+            norm_a += scaled_a * scaled_a;
+            norm_b += scaled_b * scaled_b;
         }
-        if norm_a == 0.0 || norm_b == 0.0 {
+        let denominator = norm_a.sqrt() * norm_b.sqrt();
+        if denominator == 0.0 || !denominator.is_finite() {
             return 0.0;
         }
-        dot / (norm_a.sqrt() * norm_b.sqrt())
+        let score = dot / denominator;
+        if score.is_finite() { score } else { 0.0 }
+    }
+
+    #[inline]
+    fn safe_norm(values: &[f64]) -> Option<f64> {
+        if values.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let norm_squared = values.iter().map(|value| value * value).sum::<f64>();
+        if norm_squared.is_finite() {
+            return Some(norm_squared.sqrt());
+        }
+        let scale = values.iter().map(|value| value.abs()).fold(0.0, f64::max);
+        if scale == 0.0 {
+            return Some(0.0);
+        }
+        Some(
+            values
+                .iter()
+                .map(|value| {
+                    let scaled = value / scale;
+                    scaled * scaled
+                })
+                .sum::<f64>()
+                .sqrt()
+                * scale,
+        )
+    }
+
+    #[inline]
+    fn cosine_with_query_norm(query: &[f64], query_norm: f64, vector: &[f64]) -> f64 {
+        if query.is_empty()
+            || vector.is_empty()
+            || query.len() != vector.len()
+            || query_norm == 0.0
+            || vector.iter().any(|value| !value.is_finite())
+        {
+            return 0.0;
+        }
+        if !query_norm.is_finite() {
+            return Self::stable_cosine(query, vector);
+        }
+        let mut dot = 0.0;
+        let mut norm_b = 0.0;
+        for (query_value, vector_value) in query.iter().zip(vector) {
+            dot += query_value * vector_value;
+            norm_b += vector_value * vector_value;
+        }
+        let denominator = query_norm * norm_b.sqrt();
+        if dot.is_finite() && norm_b.is_finite() && denominator.is_finite() && denominator != 0.0 {
+            let score = dot / denominator;
+            if score.is_finite() {
+                return score;
+            }
+        }
+        Self::stable_cosine(query, vector)
+    }
+
+    fn retain_top_k(heap: &mut BinaryHeap<ScoredVector>, candidate: ScoredVector, top_k: usize) {
+        if top_k == 0 {
+            return;
+        }
+        if heap.len() < top_k {
+            heap.push(candidate);
+            return;
+        }
+        let Some(worst) = heap.peek() else {
+            return;
+        };
+        let is_better = match candidate.score.total_cmp(&worst.score) {
+            CmpOrdering::Greater => true,
+            CmpOrdering::Less => false,
+            CmpOrdering::Equal => candidate.key < worst.key,
+        };
+        if is_better {
+            heap.pop();
+            heap.push(candidate);
+        }
+    }
+
+    fn scan_vector_chunk(
+        keys: &[String],
+        vectors: &HashMap<String, VectorRecord>,
+        vector_values: &HashMap<String, Vec<f64>>,
+        query: &[f64],
+        query_norm: f64,
+        threshold: Option<f64>,
+        top_k: usize,
+    ) -> BinaryHeap<ScoredVector> {
+        let mut heap = BinaryHeap::with_capacity(top_k.min(keys.len()));
+        for key in keys {
+            let Some(record) = vectors.get(key) else {
+                continue;
+            };
+            let canonical_key = Self::key(&record.corpus_id, &record.id);
+            let score = vector_values
+                .get(&canonical_key)
+                .map(|vector| Self::cosine_with_query_norm(query, query_norm, vector))
+                .unwrap_or(0.0);
+            if !threshold.is_none_or(|minimum| score >= minimum) {
+                continue;
+            }
+            Self::retain_top_k(
+                &mut heap,
+                ScoredVector {
+                    key: key.clone(),
+                    score,
+                },
+                top_k,
+            );
+        }
+        heap
+    }
+
+    fn vector_search_candidates(
+        keys: &[String],
+        vectors: &HashMap<String, VectorRecord>,
+        vector_values: &HashMap<String, Vec<f64>>,
+        query: &[f64],
+        threshold: Option<f64>,
+        top_k: usize,
+    ) -> Result<Vec<ScoredVector>, AppError> {
+        if keys.is_empty() || top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let query_norm = Self::safe_norm(query).unwrap_or(0.0);
+        let available = thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1);
+        let worker_count = keys.len().min(available.min(MAX_VECTOR_SEARCH_WORKERS));
+        let chunk_size = keys.len().div_ceil(worker_count);
+        let partials = thread::scope(|scope| {
+            let handles = keys
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        Self::scan_vector_chunk(
+                            chunk,
+                            vectors,
+                            vector_values,
+                            query,
+                            query_norm,
+                            threshold,
+                            top_k,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().map_err(|_| {
+                        Self::execution_io_error(
+                            "vector search worker terminated unexpectedly".to_string(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+
+        let mut heap = BinaryHeap::with_capacity(top_k.min(keys.len()));
+        for partial in partials {
+            for candidate in partial {
+                Self::retain_top_k(&mut heap, candidate, top_k);
+            }
+        }
+        let mut results = heap.into_vec();
+        results.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        Ok(results)
     }
 
     fn token_score(text: &str, tokens: &[String]) -> f64 {
@@ -2193,9 +2411,23 @@ impl Server {
             "vector_upsert" => {
                 if let Some(items) = Self::optional_array(params, "records")? {
                     for item in items {
-                        serde_json::from_value::<VectorRecord>(item.clone()).map_err(|err| {
-                            Self::execution_client_error(format!("invalid vector record: {err}"))
-                        })?;
+                        let record = serde_json::from_value::<VectorRecord>(item.clone()).map_err(
+                            |err| {
+                                Self::execution_client_error(format!(
+                                    "invalid vector record: {err}"
+                                ))
+                            },
+                        )?;
+                        if record.values.len() > MAX_VECTOR_DIMENSIONS {
+                            return Err(Self::execution_client_error(format!(
+                                "vector dimensions must not exceed {MAX_VECTOR_DIMENSIONS}"
+                            )));
+                        }
+                        if record.values.iter().any(|value| !value.is_finite()) {
+                            return Err(Self::execution_client_error(
+                                "vector values must be finite numbers".to_string(),
+                            ));
+                        }
                     }
                 }
             }
@@ -2524,6 +2756,12 @@ impl Server {
                                 "recordCount": record_count,
                             })),
                             _ => None,
+                        },
+                        "limits": {
+                            "vector": {
+                                "maxDimensions": MAX_VECTOR_DIMENSIONS,
+                                "maxSearchTopK": MAX_VECTOR_SEARCH_TOP_K,
+                            }
                         },
                         "methods": methods,
                     }))
@@ -2903,49 +3141,77 @@ impl Server {
                         .get("namespace")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    let top_k =
-                        req.params.get("topK").and_then(Value::as_u64).unwrap_or(10) as usize;
+                    let top_k_u64 = match req.params.get("topK") {
+                        None => 10,
+                        Some(value) => value.as_u64().ok_or_else(|| {
+                            Self::execution_client_error(
+                                "topK must be a positive integer".to_string(),
+                            )
+                        })?,
+                    };
+                    let top_k = usize::try_from(top_k_u64).map_err(|_| {
+                        Self::execution_client_error(format!(
+                            "topK must not exceed {MAX_VECTOR_SEARCH_TOP_K}"
+                        ))
+                    })?;
+                    if top_k == 0 || top_k > MAX_VECTOR_SEARCH_TOP_K {
+                        return Err(Self::execution_client_error(format!(
+                            "topK must be in [1, {MAX_VECTOR_SEARCH_TOP_K}]"
+                        )));
+                    }
                     let threshold = req.params.get("threshold").and_then(Value::as_f64);
-                    let query_vec = req
+                    let query_values = req
                         .params
                         .get("queryVector")
                         .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default()
+                        .ok_or_else(|| {
+                            Self::execution_client_error("queryVector must be an array".to_string())
+                        })?;
+                    if query_values.is_empty() || query_values.len() > MAX_VECTOR_DIMENSIONS {
+                        return Err(Self::execution_client_error(format!(
+                            "queryVector dimensions must be in [1, {MAX_VECTOR_DIMENSIONS}]"
+                        )));
+                    }
+                    let query_vec = query_values
                         .iter()
-                        .filter_map(Value::as_f64)
-                        .collect::<Vec<_>>();
+                        .map(|value| {
+                            value
+                                .as_f64()
+                                .filter(|number| number.is_finite())
+                                .ok_or_else(|| {
+                                    Self::execution_client_error(
+                                        "queryVector must contain only finite numbers".to_string(),
+                                    )
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                     self.ensure_cache();
                     let corpus_namespace_key = Self::corpus_namespace_key(corpus_id, namespace);
-                    let mut out: Vec<Value> = self
+                    let keys = self
                         .vector_keys_by_corpus_namespace
                         .get(&corpus_namespace_key)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let hits = Self::vector_search_candidates(
+                        keys,
+                        &self.state.vectors,
+                        &self.vector_values,
+                        &query_vec,
+                        threshold,
+                        top_k,
+                    )?;
+                    let out = hits
                         .into_iter()
-                        .flat_map(|keys| keys.iter())
-                        .filter_map(|key| self.state.vectors.get(key))
-                        .map(|v| {
-                            let key = Self::key(&v.corpus_id, &v.id);
-                            let values = self.vector_values.get(&key);
-                            let score = values
-                                .map(|vector| Self::cosine(&query_vec, vector))
-                                .unwrap_or(0.0);
-                            (v, score)
-                        })
-                        .filter(|(_, score)| threshold.is_none_or(|th| *score >= th))
-                        .map(|(v, score)| {
-                            json!({
-                                "id": v.id,
-                                "score": score,
-                                "metadata": v.metadata
+                        .filter_map(|hit| {
+                            self.state.vectors.get(&hit.key).map(|vector| {
+                                json!({
+                                    "id": vector.id,
+                                    "score": hit.score,
+                                    "metadata": vector.metadata
+                                })
                             })
                         })
-                        .collect();
-                    out.sort_by(|a, b| {
-                        let sa = a.get("score").and_then(Value::as_f64).unwrap_or(0.0);
-                        let sb = b.get("score").and_then(Value::as_f64).unwrap_or(0.0);
-                        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    out.truncate(top_k);
+                        .collect::<Vec<_>>();
                     Ok(json!(out))
                 }
                 "vector_delete_by_document" => {
@@ -3546,6 +3812,192 @@ mod tests {
         }
     }
 
+    fn vector_record(id: &str, corpus_id: &str, namespace: &str) -> VectorRecord {
+        VectorRecord {
+            id: id.to_string(),
+            corpus_id: corpus_id.to_string(),
+            namespace: namespace.to_string(),
+            values: Vec::new(),
+            blob_ref: None,
+            metadata: json!({"id": id}),
+        }
+    }
+
+    fn reference_cosine(query: &[f64], vector: &[f64]) -> f64 {
+        let mut dot = 0.0;
+        let mut query_norm = 0.0;
+        let mut vector_norm = 0.0;
+        for index in 0..query.len() {
+            dot += query[index] * vector[index];
+            query_norm += query[index] * query[index];
+            vector_norm += vector[index] * vector[index];
+        }
+        dot / (query_norm.sqrt() * vector_norm.sqrt())
+    }
+
+    #[test]
+    fn exact_vector_search_preserves_finite_scores_and_deterministic_ties() {
+        let query = [1.0, 0.0];
+        let records = [
+            ("tie-b", vec![0.8, 0.6]),
+            ("low", vec![0.1, 0.995]),
+            ("tie-a", vec![0.8, 0.6]),
+            ("high", vec![1.0, 0.0]),
+            ("zero", vec![0.0, 0.0]),
+            ("huge", vec![1e308, 1e308]),
+        ];
+        let mut vectors = HashMap::new();
+        let mut vector_values = HashMap::new();
+        let mut keys = Vec::new();
+        for (id, values) in records {
+            let key = Server::key("corpus", id);
+            keys.push(key.clone());
+            vectors.insert(key.clone(), vector_record(id, "corpus", "default"));
+            vector_values.insert(key, values);
+        }
+
+        let hits = Server::vector_search_candidates(
+            &keys,
+            &vectors,
+            &vector_values,
+            &query,
+            Some(-1.0),
+            10,
+        )
+        .expect("exact scan succeeds");
+        assert!(hits.iter().all(|hit| hit.score.is_finite()));
+        assert_eq!(
+            hits.iter()
+                .take(3)
+                .map(|hit| hit.key.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Server::key("corpus", "high"),
+                Server::key("corpus", "tie-a"),
+                Server::key("corpus", "tie-b"),
+            ]
+        );
+        let huge_score = hits
+            .iter()
+            .find(|hit| hit.key.ends_with(":huge"))
+            .expect("huge vector is retained")
+            .score;
+        assert!(huge_score.is_finite());
+        let tie_scores = hits
+            .iter()
+            .filter(|hit| hit.key.ends_with(":tie-a") || hit.key.ends_with(":tie-b"))
+            .map(|hit| hit.score.to_bits())
+            .collect::<Vec<_>>();
+        assert_eq!(tie_scores.len(), 2);
+        assert_eq!(tie_scores[0], tie_scores[1]);
+        let huge_self_score = Server::stable_cosine(&[1e308, 1e308], &[1e308, 1e308]);
+        assert!(huge_self_score.is_finite());
+        assert!(huge_self_score > 0.999999);
+        for hit in &hits {
+            if let Some(values) = vector_values.get(&hit.key) {
+                if values.iter().all(|value| value.abs() < 1e300)
+                    && values.iter().any(|value| *value != 0.0)
+                {
+                    assert_eq!(
+                        hit.score.to_bits(),
+                        reference_cosine(&query, values).to_bits(),
+                        "finite score changed for {}",
+                        hit.key
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_vector_search_handles_negative_threshold_and_top_k_zero() {
+        let keys = ["a", "b", "c"]
+            .into_iter()
+            .map(|id| Server::key("corpus", id))
+            .collect::<Vec<_>>();
+        let vectors = keys
+            .iter()
+            .map(|key| {
+                (
+                    key.clone(),
+                    vector_record(key.rsplit(':').next().unwrap(), "corpus", "default"),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let vector_values = [
+            (keys[0].clone(), vec![1.0, 0.0]),
+            (keys[1].clone(), vec![-1.0, 0.0]),
+            (keys[2].clone(), vec![0.0, 0.0]),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let negative = Server::vector_search_candidates(
+            &keys,
+            &vectors,
+            &vector_values,
+            &[1.0, 0.0],
+            Some(-1.0),
+            10,
+        )
+        .expect("negative threshold succeeds");
+        assert_eq!(negative.len(), 3);
+        assert!(negative.iter().all(|hit| hit.score.is_finite()));
+        assert!(
+            Server::vector_search_candidates(
+                &keys,
+                &vectors,
+                &vector_values,
+                &[1.0, 0.0],
+                Some(-1.0),
+                0
+            )
+            .expect("topK zero succeeds")
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn production_shaped_exact_scan_is_bounded_to_top_k() {
+        let dimensions = 1024;
+        let candidate_count = 8192;
+        let query = (0..dimensions)
+            .map(|index| if index == 0 { 1.0 } else { 0.001 })
+            .collect::<Vec<_>>();
+        let mut keys = Vec::with_capacity(candidate_count);
+        let mut vectors = HashMap::with_capacity(candidate_count);
+        let mut vector_values = HashMap::with_capacity(candidate_count);
+        for index in 0..candidate_count {
+            let id = format!("passage-{index:05}");
+            let key = Server::key("libfull", &id);
+            let values = (0..dimensions)
+                .map(|dimension| {
+                    if dimension == index % dimensions {
+                        1.0
+                    } else {
+                        0.001
+                    }
+                })
+                .collect::<Vec<_>>();
+            keys.push(key.clone());
+            vectors.insert(key.clone(), vector_record(&id, "libfull", "passage"));
+            vector_values.insert(key, values);
+        }
+        let started = std::time::Instant::now();
+        let hits =
+            Server::vector_search_candidates(&keys, &vectors, &vector_values, &query, None, 25)
+                .expect("production-shaped scan succeeds");
+        assert_eq!(hits.len(), 25);
+        assert!(hits.windows(2).all(|pair| {
+            pair[0].score > pair[1].score
+                || (pair[0].score == pair[1].score && pair[0].key < pair[1].key)
+        }));
+        eprintln!(
+            "production-shaped vector_search candidates={candidate_count} dimensions={dimensions} topK=25 elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn no_replace_rename_preserves_an_existing_destination() {
@@ -3591,6 +4043,116 @@ mod tests {
             params: json!({}),
         });
         assert!(response.ok, "batch_commit failed: {response:?}");
+    }
+
+    #[test]
+    fn vector_rpc_limits_are_advertised_and_fail_closed_before_work() {
+        let path = temp_path("agdb-native-vector-limits");
+        let mut server = Server::open(path.clone()).expect("open server");
+
+        let protocol = server.handle(RpcRequest {
+            id: 1,
+            method: "protocol_info".to_string(),
+            params: json!({}),
+        });
+        assert!(protocol.ok);
+        assert_eq!(
+            protocol.result.as_ref().unwrap()["limits"]["vector"]["maxDimensions"],
+            json!(MAX_VECTOR_DIMENSIONS)
+        );
+        assert_eq!(
+            protocol.result.as_ref().unwrap()["limits"]["vector"]["maxSearchTopK"],
+            json!(MAX_VECTOR_SEARCH_TOP_K)
+        );
+
+        let boundary = server.handle(RpcRequest {
+            id: 2,
+            method: "vector_search".to_string(),
+            params: json!({
+                "corpusId": "c1",
+                "namespace": "default",
+                "queryVector": vec![0.0; MAX_VECTOR_DIMENSIONS],
+                "topK": MAX_VECTOR_SEARCH_TOP_K,
+            }),
+        });
+        assert!(boundary.ok, "declared vector limits must be accepted");
+
+        for (id, params) in [
+            (
+                3,
+                json!({
+                    "corpusId": "c1",
+                    "namespace": "default",
+                    "queryVector": vec![0.0; MAX_VECTOR_DIMENSIONS + 1],
+                    "topK": 1,
+                }),
+            ),
+            (
+                4,
+                json!({
+                    "corpusId": "c1",
+                    "namespace": "default",
+                    "queryVector": [1.0],
+                    "topK": MAX_VECTOR_SEARCH_TOP_K + 1,
+                }),
+            ),
+            (
+                5,
+                json!({
+                    "corpusId": "c1",
+                    "namespace": "default",
+                    "queryVector": [1.0],
+                    "topK": 0,
+                }),
+            ),
+            (
+                6,
+                json!({
+                    "corpusId": "c1",
+                    "namespace": "default",
+                    "queryVector": [1.0, "not-a-number"],
+                    "topK": 1,
+                }),
+            ),
+        ] {
+            let response = server.handle(RpcRequest {
+                id,
+                method: "vector_search".to_string(),
+                params,
+            });
+            assert!(!response.ok, "out-of-contract vector search must fail");
+            let error = response.error.expect("structured client error");
+            assert_eq!(error.code, "REQUEST_EXECUTION_FAILED");
+            assert_eq!(error.failure_class.as_deref(), Some("CLIENT_INPUT"));
+        }
+
+        begin_batch(&mut server);
+        let oversized_upsert = server.handle(RpcRequest {
+            id: 7,
+            method: "vector_upsert".to_string(),
+            params: json!({
+                "records": [{
+                    "id": "too-wide",
+                    "corpusId": "c1",
+                    "namespace": "default",
+                    "values": vec![0.0; MAX_VECTOR_DIMENSIONS + 1],
+                    "metadata": {"documentId": "d1"},
+                }]
+            }),
+        });
+        assert!(!oversized_upsert.ok);
+        let error = oversized_upsert.error.expect("structured upsert error");
+        assert_eq!(error.failure_class.as_deref(), Some("CLIENT_INPUT"));
+        assert!(server.state.vectors.is_empty());
+        assert!(matches!(
+            server.transaction,
+            TransactionState::Active {
+                mutation_seen: false,
+                ..
+            }
+        ));
+
+        cleanup(&path);
     }
 
     #[test]

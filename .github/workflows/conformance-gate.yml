@@ -19,6 +19,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+
+      - name: Run vector benchmark harness tests
+        run: |
+          node --check scripts/native-build-manifest.mjs
+          node --check scripts/native-vector-search-benchmark.mjs
+          node --test scripts/native-vector-search-benchmark.test.mjs
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
