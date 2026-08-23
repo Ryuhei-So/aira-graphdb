@@ -588,13 +588,17 @@ minted, Hub opens and validates the copied canonical, owner-manifest, and blob
 files as held `O_RDONLY | O_NOFOLLOW` descriptors, streams bounded hashes while
 retaining their identities and sizes without materializing whole-file copies,
 and launches the sealed GraphDB native as the fourth direct child.  A dedicated
-descriptor-only read mode receives those descriptors at spawn; it receives no
-DB pathname or parent-directory descriptor, never opens a WAL/audit/cache,
+descriptor-only read mode receives only the GraphDB-owned canonical and blob
+descriptors plus Hub's already-validated `expectedGeneration` at spawn; the Hub-
+owned owner-manifest descriptor or bytes never cross into native.  Native
+receives no DB pathname or parent-directory descriptor, never opens a WAL/audit/cache,
 never performs recovery or persistence, and exposes only the exact pinned read-
 method inventory.  Every mutation, transaction, commit, recovery, import, and
 save method is rejected by native dispatch before work.  Native first proves
 its process/executable/build/protocol authority, then validates and acknowledges
-the exact copied generation from the inherited descriptors.  Only after that
+the expected generation and descriptor-selected blob digest from the inherited
+GraphDB descriptors.  Hub independently binds that acknowledgement to its held
+owner-manifest generation/hash.  Only after that
 second acknowledgement does Hub broker evaluator/runner operation frames over
 its directly-owned anonymous pipes.  Hub passes no process handle or file
 descriptor after spawn.  On completion the checker requires byte-identical
@@ -701,7 +705,8 @@ copied-generation manifest hash, fixture hash, evaluator commit/build digest,
 both runner handshakes, and the parent-observed copied-native PID/channel
 authority, sealed native hash, GraphDB commit/build-manifest hash,
 `protocol_info` inventory digest, descriptor-only mode, and validated exact
-generation.  The private checker reparses the raw transcript,
+generation/blob digest together with Hub's owner-manifest hash.  The private
+checker reparses the raw transcript,
 recomputes every event hash, call count, comparison, required case, aggregate,
 transcript digest, and verdict, and rejects missing, duplicate, reordered,
 role-changed, authority-changed, or extra events.  Public projection includes
