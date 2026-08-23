@@ -10,6 +10,8 @@ const CONTRACT_DIR: &str = "spec/contracts/bounded-domain";
 const PIN_FILE: &str = "bounded-domain-pin.json";
 const EXPECTED_PIN_VERSION: &str = "aira-graphdb-bounded-domain-pin@1";
 const EXPECTED_SOURCE_REPOSITORY: &str = "https://github.com/Ryuhei-So/aira-synapse";
+const MAX_ARTIFACT_BYTES: u64 = 128 * 1024;
+const MAX_TOTAL_ARTIFACT_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -29,11 +31,23 @@ struct PinnedArtifact {
     sha256: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FixtureManifest {
+    manifest_version: String,
+    contract_version: String,
+    contract_file: String,
+    fixture_version: String,
+    fixture_file: String,
+    contract_sha256: String,
+    fixture_sha256: String,
+}
+
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn read_regular_file(path: &Path) -> Result<Vec<u8>, String> {
+fn regular_file_size(path: &Path) -> Result<u64, String> {
     let metadata =
         fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
@@ -42,6 +56,15 @@ fn read_regular_file(path: &Path) -> Result<Vec<u8>, String> {
             path.display()
         ));
     }
+    let length = metadata.len();
+    if length > MAX_ARTIFACT_BYTES {
+        return Err(format!("{} exceeds per-file byte cap", path.display()));
+    }
+    Ok(length)
+}
+
+fn read_regular_file(path: &Path) -> Result<Vec<u8>, String> {
+    regular_file_size(path)?;
     fs::read(path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
@@ -63,6 +86,20 @@ fn expected_source_paths() -> BTreeMap<&'static str, &'static str> {
 }
 
 fn verify_contract_dir(root: &Path) -> Result<(), String> {
+    let mut expected_files: BTreeSet<&str> = [PIN_FILE].into_iter().collect();
+    expected_files.extend(expected_source_paths().keys().copied());
+    let actual_files: BTreeSet<String> = fs::read_dir(root)
+        .map_err(|error| format!("read contract directory: {error}"))?
+        .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("read contract directory entry: {error}"))?;
+    if actual_files.len() != expected_files.len()
+        || actual_files
+            .iter()
+            .any(|file| !expected_files.contains(file.as_str()))
+    {
+        return Err("bounded domain directory file set mismatch".into());
+    }
     let pin_bytes = read_regular_file(&root.join(PIN_FILE))?;
     let pin: ContractPin = serde_json::from_slice(&pin_bytes)
         .map_err(|error| format!("invalid bounded domain pin: {error}"))?;
@@ -87,6 +124,7 @@ fn verify_contract_dir(root: &Path) -> Result<(), String> {
     let expected_paths = expected_source_paths();
     let mut seen = BTreeSet::new();
     let mut hashes = BTreeMap::new();
+    let mut total_bytes = 0_u64;
     for artifact in &pin.artifacts {
         let local_path = Path::new(&artifact.local_file);
         if local_path.components().count() != 1
@@ -103,6 +141,13 @@ fn verify_contract_dir(root: &Path) -> Result<(), String> {
         if !seen.insert(artifact.local_file.as_str()) {
             return Err(format!("duplicate artifact {}", artifact.local_file));
         }
+        let actual_bytes = regular_file_size(&root.join(&artifact.local_file))?;
+        total_bytes = total_bytes
+            .checked_add(actual_bytes)
+            .ok_or_else(|| "bounded domain aggregate byte count overflow".to_string())?;
+        if total_bytes > MAX_TOTAL_ARTIFACT_BYTES {
+            return Err("bounded domain aggregate byte cap exceeded".into());
+        }
         let bytes = read_regular_file(&root.join(&artifact.local_file))?;
         if bytes.len() as u64 != artifact.bytes {
             return Err(format!("byte length mismatch for {}", artifact.local_file));
@@ -117,29 +162,23 @@ fn verify_contract_dir(root: &Path) -> Result<(), String> {
         return Err("bounded domain artifact set is incomplete".into());
     }
 
-    let manifest: Value = serde_json::from_slice(&read_regular_file(
+    let manifest: FixtureManifest = serde_json::from_slice(&read_regular_file(
         &root.join("bounded-domain-fixture.manifest.json"),
     )?)
     .map_err(|error| format!("invalid bounded domain manifest: {error}"))?;
-    let exact_manifest_values = [
-        ("manifestVersion", "aira-synapse-bounded-domain-manifest@1"),
-        ("contractVersion", "aira-synapse-domain-contract@1"),
-        ("contractFile", "bounded-domain-contract.json"),
-        ("fixtureVersion", "aira-synapse-bounded-domain-fixture@1"),
-        ("fixtureFile", "bounded-domain-fixture.json"),
-    ];
-    for (field, expected) in exact_manifest_values {
-        if manifest.get(field).and_then(Value::as_str) != Some(expected) {
-            return Err(format!("manifest {field} mismatch"));
-        }
+    if manifest.manifest_version != "aira-synapse-bounded-domain-manifest@1"
+        || manifest.contract_version != "aira-synapse-domain-contract@1"
+        || manifest.contract_file != "bounded-domain-contract.json"
+        || manifest.fixture_version != "aira-synapse-bounded-domain-fixture@1"
+        || manifest.fixture_file != "bounded-domain-fixture.json"
+    {
+        return Err("manifest fixed field mismatch".into());
     }
-    for (field, file) in [
-        ("contractSha256", "bounded-domain-contract.json"),
-        ("fixtureSha256", "bounded-domain-fixture.json"),
-    ] {
-        if manifest.get(field).and_then(Value::as_str) != hashes.get(file).map(String::as_str) {
-            return Err(format!("manifest {field} does not match pinned artifact"));
-        }
+    if manifest.contract_sha256 != hashes["bounded-domain-contract.json"] {
+        return Err("manifest contractSha256 does not match pinned artifact".into());
+    }
+    if manifest.fixture_sha256 != hashes["bounded-domain-fixture.json"] {
+        return Err("manifest fixtureSha256 does not match pinned artifact".into());
     }
 
     let contract: Value = serde_json::from_slice(&read_regular_file(
@@ -188,6 +227,25 @@ impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+fn update_pin_artifact(root: &Path, local_file: &str, bytes: &[u8]) {
+    let pin_path = root.join(PIN_FILE);
+    let mut pin: Value =
+        serde_json::from_slice(&fs::read(&pin_path).expect("read pin")).expect("parse pin");
+    let artifact = pin["artifacts"]
+        .as_array_mut()
+        .expect("pin artifacts array")
+        .iter_mut()
+        .find(|artifact| artifact["localFile"] == local_file)
+        .expect("artifact in pin");
+    artifact["bytes"] = Value::from(bytes.len() as u64);
+    artifact["sha256"] = Value::String(sha256(bytes));
+    fs::write(
+        &pin_path,
+        serde_json::to_vec_pretty(&pin).expect("serialize pin"),
+    )
+    .expect("write pin");
 }
 
 #[test]
@@ -241,5 +299,108 @@ fn unknown_version_or_partial_manifest_fails_closed() {
         b"{\"manifestVersion\":\"aira-synapse-bounded-domain-manifest@1\"}\n",
     )
     .expect("write partial manifest");
+    update_pin_artifact(
+        &partial.0,
+        "bounded-domain-fixture.manifest.json",
+        b"{\"manifestVersion\":\"aira-synapse-bounded-domain-manifest@1\"}\n",
+    );
     assert!(verify_contract_dir(&partial.0).is_err());
+}
+
+#[test]
+fn intended_file_set_and_bounded_allocation_negatives_fail_closed() {
+    let source = Path::new(CONTRACT_DIR);
+
+    let extra = TestDir::copy_from(source);
+    fs::write(extra.0.join("unexpected.json"), b"{}").expect("write extra artifact");
+    assert!(
+        verify_contract_dir(&extra.0)
+            .unwrap_err()
+            .contains("file set")
+    );
+
+    let oversized = TestDir::copy_from(source);
+    let bytes = vec![b'x'; (MAX_ARTIFACT_BYTES + 1) as usize];
+    let path = oversized.0.join("bounded-domain-contract.json");
+    fs::write(&path, &bytes).expect("write oversized artifact");
+    update_pin_artifact(&oversized.0, "bounded-domain-contract.json", &bytes);
+    assert!(
+        verify_contract_dir(&oversized.0)
+            .unwrap_err()
+            .contains("per-file byte cap")
+    );
+}
+
+#[test]
+fn typed_manifest_and_path_shape_negatives_fail_closed() {
+    let source = Path::new(CONTRACT_DIR);
+
+    let unknown_manifest = TestDir::copy_from(source);
+    let manifest_path = unknown_manifest
+        .0
+        .join("bounded-domain-fixture.manifest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+            .expect("parse manifest");
+    manifest["unexpected"] = Value::String("reject me".into());
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("serialize manifest");
+    fs::write(&manifest_path, &manifest_bytes).expect("write manifest");
+    update_pin_artifact(
+        &unknown_manifest.0,
+        "bounded-domain-fixture.manifest.json",
+        &manifest_bytes,
+    );
+    assert!(verify_contract_dir(&unknown_manifest.0).is_err());
+
+    let traversal = TestDir::copy_from(source);
+    let pin_path = traversal.0.join(PIN_FILE);
+    let mut pin: Value =
+        serde_json::from_slice(&fs::read(&pin_path).expect("read pin")).expect("parse pin");
+    pin["artifacts"][0]["localFile"] = Value::String("../escape.json".into());
+    fs::write(
+        &pin_path,
+        serde_json::to_vec_pretty(&pin).expect("serialize pin"),
+    )
+    .expect("write pin");
+    assert!(verify_contract_dir(&traversal.0).is_err());
+
+    let mismatch = TestDir::copy_from(source);
+    let pin_path = mismatch.0.join(PIN_FILE);
+    let mut pin: Value =
+        serde_json::from_slice(&fs::read(&pin_path).expect("read pin")).expect("parse pin");
+    pin["artifacts"][0]["sourcePath"] = Value::String("wrong/path.json".into());
+    fs::write(
+        &pin_path,
+        serde_json::to_vec_pretty(&pin).expect("serialize pin"),
+    )
+    .expect("write pin");
+    assert!(verify_contract_dir(&mismatch.0).is_err());
+
+    let duplicate = TestDir::copy_from(source);
+    let pin_path = duplicate.0.join(PIN_FILE);
+    let mut pin: Value =
+        serde_json::from_slice(&fs::read(&pin_path).expect("read pin")).expect("parse pin");
+    let first = pin["artifacts"][0].clone();
+    pin["artifacts"]
+        .as_array_mut()
+        .expect("artifacts")
+        .push(first);
+    fs::write(
+        &pin_path,
+        serde_json::to_vec_pretty(&pin).expect("serialize pin"),
+    )
+    .expect("write pin");
+    assert!(verify_contract_dir(&duplicate.0).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_artifact_fails_closed() {
+    use std::os::unix::fs::symlink;
+
+    let linked = TestDir::copy_from(Path::new(CONTRACT_DIR));
+    let path = linked.0.join("bounded-domain-contract.json");
+    fs::remove_file(&path).expect("remove copied artifact");
+    symlink("bounded-domain-fixture.json", &path).expect("create artifact symlink");
+    assert!(verify_contract_dir(&linked.0).is_err());
 }
