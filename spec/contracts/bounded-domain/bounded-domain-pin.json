@@ -1,0 +1,25 @@
+{
+  "artifacts": [
+    {
+      "bytes": 6211,
+      "localFile": "bounded-domain-contract.json",
+      "sha256": "2d05969a93037c6c22f46b77e068d5d5d2fa5f85988eb923e7f7d7d78ab46ef1",
+      "sourcePath": "packages/memgraphrag/tests/fixtures/bounded-domain-contract.json"
+    },
+    {
+      "bytes": 7235,
+      "localFile": "bounded-domain-fixture.json",
+      "sha256": "8c3f0ca56dacc718e387ccfcbdcd5376b47b3a68a09e329461ed1c1e26c11601",
+      "sourcePath": "packages/memgraphrag/tests/fixtures/bounded-domain-fixture.json"
+    },
+    {
+      "bytes": 455,
+      "localFile": "bounded-domain-fixture.manifest.json",
+      "sha256": "b50a00b5a87f91305b41d97b6f91cd19741e4bbc8ea1b4e4e976c83f40b4e821",
+      "sourcePath": "packages/memgraphrag/tests/fixtures/bounded-domain-fixture.manifest.json"
+    }
+  ],
+  "pinVersion": "aira-graphdb-bounded-domain-pin@1",
+  "sourceCommit": "c989dc46149c2562603c16a91eb5abeca5a5c17a",
+  "sourceRepository": "https://github.com/Ryuhei-So/aira-synapse"
+}

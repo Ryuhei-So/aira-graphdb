@@ -1,0 +1,287 @@
+{
+  "contractVersion": "aira-synapse-domain-contract@1",
+  "contracts": {
+    "fact": {
+      "fields": {
+        "confidence": {
+          "kind": "number"
+        },
+        "corpusId": {
+          "kind": "string"
+        },
+        "createdAt": {
+          "kind": "string"
+        },
+        "factId": {
+          "kind": "string"
+        },
+        "granularityParentFactId": {
+          "kind": "optional",
+          "value": {
+            "kind": "string"
+          }
+        },
+        "headEntity": {
+          "kind": "string"
+        },
+        "headType": {
+          "kind": "string"
+        },
+        "passageIds": {
+          "items": {
+            "kind": "string"
+          },
+          "kind": "array"
+        },
+        "relation": {
+          "kind": "string"
+        },
+        "schemaId": {
+          "kind": "string"
+        },
+        "sourceDocumentIds": {
+          "items": {
+            "kind": "string"
+          },
+          "kind": "array"
+        },
+        "state": {
+          "kind": "literal",
+          "values": [
+            "active",
+            "inactive"
+          ]
+        },
+        "tailEntity": {
+          "kind": "string"
+        },
+        "tailType": {
+          "kind": "string"
+        },
+        "temporalScope": {
+          "kind": "optional",
+          "value": {
+            "kind": "string"
+          }
+        },
+        "updatedAt": {
+          "kind": "string"
+        }
+      },
+      "kind": "object"
+    },
+    "passage": {
+      "fields": {
+        "corpusId": {
+          "kind": "string"
+        },
+        "createdAt": {
+          "kind": "string"
+        },
+        "entityMentions": {
+          "items": {
+            "kind": "string"
+          },
+          "kind": "array"
+        },
+        "factIds": {
+          "items": {
+            "kind": "string"
+          },
+          "kind": "array"
+        },
+        "metadata": {
+          "fields": {
+            "chunkId": {
+              "kind": "string"
+            },
+            "chunkIndex": {
+              "kind": "number"
+            },
+            "convertedAt": {
+              "kind": "optional",
+              "value": {
+                "kind": "string"
+              }
+            },
+            "documentId": {
+              "kind": "string"
+            },
+            "doi": {
+              "kind": "optional",
+              "value": {
+                "kind": "string"
+              }
+            },
+            "language": {
+              "kind": "literal",
+              "values": [
+                "en",
+                "ja",
+                "mixed",
+                "unknown"
+              ]
+            },
+            "offsetEnd": {
+              "kind": "number"
+            },
+            "offsetStart": {
+              "kind": "number"
+            },
+            "sectionPath": {
+              "items": {
+                "kind": "string"
+              },
+              "kind": "array"
+            },
+            "sourceDb": {
+              "kind": "optional",
+              "value": {
+                "kind": "string"
+              }
+            },
+            "sourceType": {
+              "kind": "optional",
+              "value": {
+                "kind": "literal",
+                "values": [
+                  "pdf",
+                  "html",
+                  "docx",
+                  "pptx",
+                  "md"
+                ]
+              }
+            },
+            "sourceUrl": {
+              "kind": "string"
+            },
+            "title": {
+              "kind": "string"
+            }
+          },
+          "kind": "object"
+        },
+        "normalizedText": {
+          "kind": "string"
+        },
+        "passageId": {
+          "kind": "string"
+        },
+        "qualityFlags": {
+          "items": {
+            "kind": "string"
+          },
+          "kind": "array"
+        },
+        "qualityScore": {
+          "kind": "optional",
+          "value": {
+            "kind": "number"
+          }
+        },
+        "text": {
+          "kind": "string"
+        },
+        "updatedAt": {
+          "kind": "string"
+        }
+      },
+      "kind": "object"
+    },
+    "schema": {
+      "fields": {
+        "aliases": {
+          "items": {
+            "fields": {
+              "confidence": {
+                "kind": "number"
+              },
+              "isCanonical": {
+                "kind": "boolean"
+              },
+              "label": {
+                "kind": "string"
+              },
+              "language": {
+                "kind": "literal",
+                "values": [
+                  "en",
+                  "ja",
+                  "mixed",
+                  "unknown"
+                ]
+              },
+              "source": {
+                "kind": "literal",
+                "values": [
+                  "llm",
+                  "nlp",
+                  "dictionary",
+                  "thesaurus",
+                  "manual",
+                  "import"
+                ]
+              }
+            },
+            "kind": "object"
+          },
+          "kind": "array"
+        },
+        "canonicalKey": {
+          "kind": "string"
+        },
+        "corpusId": {
+          "kind": "string"
+        },
+        "createdAt": {
+          "kind": "string"
+        },
+        "factIds": {
+          "items": {
+            "kind": "string"
+          },
+          "kind": "array"
+        },
+        "frequency": {
+          "kind": "number"
+        },
+        "headType": {
+          "kind": "string"
+        },
+        "relation": {
+          "kind": "string"
+        },
+        "schemaId": {
+          "kind": "string"
+        },
+        "sourceDocumentIds": {
+          "items": {
+            "kind": "string"
+          },
+          "kind": "array"
+        },
+        "stabilizationThreshold": {
+          "kind": "number"
+        },
+        "state": {
+          "kind": "literal",
+          "values": [
+            "pending",
+            "stable"
+          ]
+        },
+        "tailType": {
+          "kind": "string"
+        },
+        "updatedAt": {
+          "kind": "string"
+        },
+        "version": {
+          "kind": "number"
+        }
+      },
+      "kind": "object"
+    }
+  }
+}

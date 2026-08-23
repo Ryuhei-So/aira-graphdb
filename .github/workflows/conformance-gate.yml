@@ -19,6 +19,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Read pinned Aira Synapse commit
+        id: synapse-pin
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+          pin = json.loads(Path("spec/contracts/bounded-domain/bounded-domain-pin.json").read_text())
+          print(f"sha={pin['sourceCommit']}")
+          PY
+
+      - name: Checkout pinned Aira Synapse domain authority
+        uses: actions/checkout@v4
+        with:
+          repository: Ryuhei-So/aira-synapse
+          ref: ${{ steps.synapse-pin.outputs.sha }}
+          path: .cross-repo/aira-synapse
+
+      - name: Verify byte-identical bounded domain authority
+        run: |
+          test "$(git -C .cross-repo/aira-synapse rev-parse HEAD)" = "${{ steps.synapse-pin.outputs.sha }}"
+          cmp .cross-repo/aira-synapse/packages/memgraphrag/tests/fixtures/bounded-domain-contract.json spec/contracts/bounded-domain/bounded-domain-contract.json
+          cmp .cross-repo/aira-synapse/packages/memgraphrag/tests/fixtures/bounded-domain-fixture.json spec/contracts/bounded-domain/bounded-domain-fixture.json
+          cmp .cross-repo/aira-synapse/packages/memgraphrag/tests/fixtures/bounded-domain-fixture.manifest.json spec/contracts/bounded-domain/bounded-domain-fixture.manifest.json
+
       - name: Setup Node 24
         uses: actions/setup-node@v4
         with:
