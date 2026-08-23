@@ -205,19 +205,25 @@ Unicode 16.0.0 UCD `UnicodeData.txt` SHA-256
 and `DerivedCoreProperties.txt` SHA-256
 `39d35161f2954497f69e08bdb9e701493f476a3d30222de20028feda36c1dabd`.
 
-One generator owned by Synapse emits both the native lookup artifact and a
-manifested conformance fixture from those exact files.  The fixture exhausts
+One generator owned by Synapse emits the JavaScript lookup helper, the native
+lookup artifact, and a manifested conformance fixture from those exact files.
+Neither JavaScript `String.prototype.toLowerCase()` nor Rust's host Unicode
+tables are semantic authorities for this profile.  The fixture exhausts
 every Unicode scalar's default lowercase mapping and every non-locale
 conditional `SpecialCasing` context, including all generated Final_Sigma
 Cased/Case_Ignorable boundary cases; it also covers invalid-scalar rejection
-at the JSON/string boundary.  Synapse's supported Node runtime must prove its
-full-string `String.prototype.toLowerCase()` output equals that fixture, and
-native must use the generated table rather than its host library's ambient
-Unicode version.  Both repositories pin the byte-identical generator input,
-fixture, lookup artifact, and manifest SHA.  Any UCD, generator, supported
-runtime, or output change requires a new digest and plan version.  Unknown
-digests fail in Synapse before the owner/native call and fail again in native
-as defense in depth.
+at the JSON/string boundary.  Every supported Node runtime must prove the
+generated JavaScript helper equals the complete fixture; native must use the
+generated Rust table and prove the same.  Ambient runtime lowercasing is only
+a diagnostic comparison and may differ without becoming authority.  Both
+repositories pin the byte-identical generator inputs, fixture, native lookup
+artifact, and manifest SHA; Synapse additionally pins its generated JavaScript
+helper SHA.  Any UCD, generator, supported runtime, or generated output change
+requires a reviewed digest and plan-version decision.  Unknown digests fail in
+Synapse before the owner/native call and fail again in native as defense in
+depth.  This issue changes only the v15 entity-comparison helper; unrelated
+indexing keys, lexical text, answer normalization, and other lowercase uses
+are outside this contract and are not migrated implicitly.
 
 ### PPR and materialization
 
@@ -373,6 +379,23 @@ Before typed operation implementation:
 - test the exclusive `GenerationSession`: renewal ordering, lease loss,
   `finally` release, queued writer, and two simultaneous HTTP requests where
   only one session is active.
+
+Synapse owns the versioned `V15CopiedProductionParityArtifact@1` schema and
+its generate/check tooling.  Literature Hub's private repository owns the
+detailed copied-production artifact when it contains production identifiers.
+Synapse and GraphDB pin a redacted attestation containing the detailed
+artifact SHA and the public fixture/normalization manifest SHAs; the redacted
+attestation must not be sufficient to reconstruct private identifiers.  The
+schema requires the exact generation and canonical/owner-manifest/vector-blob
+hashes; Synapse base/candidate and GraphDB SHAs; domain and normalization
+manifest SHAs; Node/V8/ICU/Unicode/OS/architecture; tool SHA and normalized
+arguments; before/after candidate, expansion, PPR, and id-association ids,
+ranks, and scores; maximum absolute score and rank deltas; missing-object
+audit; absent-seed, signed-sum `S <= 0`, dangling-loss, hub-damping, and
+convergence cases; accepted semantic changes; and a final pass/fail verdict.
+Generation consumes a read-only copied-state manifest and never opens the live
+canonical path.  CI `--check` verifies the exact final source SHAs, artifact
+and fixture hashes, and required cases without regenerating production data.
 
 Before native algorithm wiring:
 
