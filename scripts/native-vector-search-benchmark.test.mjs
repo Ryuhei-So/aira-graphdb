@@ -80,7 +80,7 @@ test('build manifest generator owns fixed clean build and rejects dirty/wrong/co
   await exec('git', ['-C', repo, 'add', '.']);
   await exec('git', ['-C', repo, 'commit', '-qm', 'fixture']);
   const sha = (await exec('git', ['-C', repo, 'rev-parse', 'HEAD'])).stdout.trim();
-  const destination = join(repo, 'private-output'); await mkdir(destination); await chmod(destination, 0o700);
+  const destination = await mkdtemp(join(tmpdir(), 'aira-private-output-')); await chmod(destination, 0o700);
   const generated = await runManifest(['--repo', repo, '--source-sha', sha, '--destination-dir', destination]);
   assert.equal(generated.code, 0);
   assert.notEqual((await runManifest(['--repo', repo, '--source-sha', sha, '--destination-dir', destination])).code, 0);

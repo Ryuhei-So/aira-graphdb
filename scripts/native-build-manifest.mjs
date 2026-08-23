@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { chmod, lstat, open } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, open, readdir, rename, rm } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { basename, join, resolve } from 'node:path';
 
@@ -27,15 +27,24 @@ const head = spawnSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'ut
 if (head.status !== 0 || head.stdout.trim() !== input.source_sha) fail('repo HEAD does not match --source-sha');
 const dirty = spawnSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8' });
 if (dirty.status !== 0 || dirty.stdout !== '') fail('repository is not clean');
-const build = spawnSync('cargo', ['build', '--release', '--locked', '--bin', 'aira-graphdb-native'], { cwd: repo, encoding: 'utf8', stdio: 'pipe' });
+const freshTarget = await mkdtemp(join(destination, '.cargo-target-'));
+await chmod(freshTarget, 0o700);
+let published = false;
+try {
+const build = spawnSync('cargo', ['build', '--release', '--locked', '--bin', 'aira-graphdb-native'], { cwd: repo, env: { ...process.env, CARGO_TARGET_DIR: freshTarget }, encoding: 'utf8', stdio: 'pipe' });
 if (build.status !== 0) fail(`fixed native build failed: ${build.stderr || build.stdout}`);
-const built = resolve(repo, 'target/release/aira-graphdb-native');
+const postHead = spawnSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' });
+const postDirty = spawnSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8' });
+if (postHead.stdout.trim() !== input.source_sha || postDirty.stdout !== '') fail(`source checkout changed during build: ${postDirty.stdout}`);
+const built = resolve(freshTarget, 'release/aira-graphdb-native');
 const metadata = await lstat(built);
 if (metadata.isSymbolicLink() || !metadata.isFile()) fail('fixed build did not produce a regular native binary');
 const source = await open(built, constants.O_RDONLY | constants.O_NOFOLLOW);
 const held = await source.stat();
 if (held.dev !== metadata.dev || held.ino !== metadata.ino || !held.isFile()) fail('built binary changed during validation');
-const target = join(destination, basename(built));
+const staging = join(destination, `.staging-${randomUUID()}`);
+await mkdir(staging, { mode: 0o700 });
+const target = join(staging, basename(built));
 const output = await open(target, 'wx', 0o700);
 const digest = createHash('sha256');
 try {
@@ -52,4 +61,13 @@ try { await manifestHandle.writeFile(`${JSON.stringify(manifest, null, 2)}\n`, '
 finally { await manifestHandle.close(); }
 const dirHandle = await open(destination, constants.O_RDONLY | constants.O_DIRECTORY);
 await dirHandle.sync(); await dirHandle.close();
-console.log(JSON.stringify({ binary: basename(target), manifest }));
+const finalDir = join(destination, `build-${input.source_sha}`);
+await rename(staging, finalDir);
+published = true;
+console.log(JSON.stringify({ binary: join(finalDir, basename(target)), manifest }));
+} finally {
+  await rm(freshTarget, { recursive: true, force: true });
+  if (!published) {
+    for (const entry of await readdir(destination)) if (entry.startsWith('.staging-')) await rm(join(destination, entry), { recursive: true, force: true });
+  }
+}

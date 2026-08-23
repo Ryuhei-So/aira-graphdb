@@ -20,6 +20,11 @@ node scripts/native-build-manifest.mjs \
   --source-sha "$(git -C /path/to/aira-graphdb rev-parse HEAD)"
 ```
 
+The generator builds in a fresh private `CARGO_TARGET_DIR`, rechecks the
+checkout after the build, and atomically publishes a binary-plus-manifest pair
+under a new `build-<sourceSha>` directory. Existing destination pairs are
+never overwritten; failed or interrupted staging is removed.
+
 SIGINT/SIGTERM kills active native process groups, removes the owned temporary
 workspace in `finally`, and exits `128+signal`. SIGKILL cannot run cleanup. A
 stale workspace is safe to remove only after confirming it is a directory named
