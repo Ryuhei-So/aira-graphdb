@@ -181,6 +181,128 @@ struct WalWriteEvidence<W> {
     wal_hasher: Option<Sha256>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Passed to the semantic WAL visitor in the next checkpoint.
+struct WalRecordReadEvidence {
+    bytes: u64,
+    digest: [u8; 32],
+}
+
+#[allow(dead_code)] // Wired only after the semantic WAL visitor checkpoint.
+struct StrictLfRecordReader<'a, R: BufRead> {
+    inner: &'a mut R,
+    limit: u64,
+    bytes: u64,
+    payload_bytes: u64,
+    record_hasher: Sha256,
+    wal_hasher: &'a mut Sha256,
+    finished: bool,
+}
+
+#[allow(dead_code)] // Wired only after the semantic WAL visitor checkpoint.
+impl<'a, R: BufRead> StrictLfRecordReader<'a, R> {
+    fn new(inner: &'a mut R, limit: u64, wal_hasher: &'a mut Sha256) -> Self {
+        Self {
+            inner,
+            limit,
+            bytes: 0,
+            payload_bytes: 0,
+            record_hasher: Sha256::new(),
+            wal_hasher,
+            finished: false,
+        }
+    }
+
+    fn account(&mut self, bytes: &[u8], payload: bool) -> io::Result<()> {
+        let added = u64::try_from(bytes.len())
+            .map_err(|_| io::Error::other("WAL read length does not fit u64"))?;
+        let next = self
+            .bytes
+            .checked_add(added)
+            .ok_or_else(|| io::Error::other("WAL record byte count overflow"))?;
+        if next > self.limit {
+            return Err(io::Error::other(format!(
+                "WAL record exceeds {} bytes",
+                self.limit
+            )));
+        }
+        self.record_hasher.update(bytes);
+        self.wal_hasher.update(bytes);
+        self.bytes = next;
+        if payload {
+            self.payload_bytes = self
+                .payload_bytes
+                .checked_add(added)
+                .ok_or_else(|| io::Error::other("WAL payload byte count overflow"))?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> io::Result<WalRecordReadEvidence> {
+        if !self.finished {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "WAL final record is missing LF",
+            ));
+        }
+        if self.payload_bytes == 0 {
+            return Err(io::Error::other("WAL contains a blank record"));
+        }
+        Ok(WalRecordReadEvidence {
+            bytes: self.bytes,
+            digest: self.record_hasher.finalize().into(),
+        })
+    }
+}
+
+impl<R: BufRead> Read for StrictLfRecordReader<'_, R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() || self.finished {
+            return Ok(0);
+        }
+        let available = self.inner.fill_buf()?;
+        if available.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "WAL final record is missing LF",
+            ));
+        }
+        let before_lf = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(available.len());
+        if before_lf == 0 {
+            self.account(b"\n", false)?;
+            self.inner.consume(1);
+            self.finished = true;
+            return Ok(0);
+        }
+        let consumed = before_lf.min(output.len());
+        output[..consumed].copy_from_slice(&available[..consumed]);
+        let added = u64::try_from(consumed)
+            .map_err(|_| io::Error::other("WAL read length does not fit u64"))?;
+        let next = self
+            .bytes
+            .checked_add(added)
+            .ok_or_else(|| io::Error::other("WAL record byte count overflow"))?;
+        if next > self.limit {
+            return Err(io::Error::other(format!(
+                "WAL record exceeds {} bytes",
+                self.limit
+            )));
+        }
+        self.record_hasher.update(&available[..consumed]);
+        self.wal_hasher.update(&available[..consumed]);
+        self.bytes = next;
+        self.payload_bytes = self
+            .payload_bytes
+            .checked_add(added)
+            .ok_or_else(|| io::Error::other("WAL payload byte count overflow"))?;
+        self.inner.consume(consumed);
+        Ok(consumed)
+    }
+}
+
 #[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
 impl<W> LimitedHashWriter<W> {
     fn new(inner: W, limit: u64, wal_hasher: Option<Sha256>) -> Self {
@@ -4593,6 +4715,7 @@ fn main() -> io::Result<()> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::io::BufReader;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(prefix: &str) -> PathBuf {
@@ -4747,6 +4870,55 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn strict_lf_framer_hashes_exact_frames_without_confusing_escaped_lf() {
+        let raw = b"{\"value\":\"line\\ninside\"}\n{\"value\":2}\n";
+        let expected = [
+            b"{\"value\":\"line\\ninside\"}".as_slice(),
+            b"{\"value\":2}".as_slice(),
+        ];
+        let mut source = BufReader::new(raw.as_slice());
+        let mut wal_hasher = Sha256::new();
+        let mut total = 0_u64;
+        for expected_payload in expected {
+            let mut record = StrictLfRecordReader::new(&mut source, 128, &mut wal_hasher);
+            let mut payload = Vec::new();
+            record.read_to_end(&mut payload).unwrap();
+            let evidence = record.finish().unwrap();
+            assert_eq!(payload, expected_payload);
+            let mut framed = expected_payload.to_vec();
+            framed.push(b'\n');
+            assert_eq!(evidence.bytes, framed.len() as u64);
+            assert_eq!(evidence.digest, Server::digest_bytes(&framed));
+            total += evidence.bytes;
+        }
+        assert!(source.fill_buf().unwrap().is_empty());
+        assert_eq!(total, raw.len() as u64);
+        assert_eq!(
+            wal_hasher.finalize().as_slice(),
+            Sha256::digest(raw).as_slice()
+        );
+    }
+
+    #[test]
+    fn strict_lf_framer_rejects_partial_blank_and_record_limit_plus_one() {
+        fn frame(raw: &[u8], limit: u64) -> io::Result<(Vec<u8>, WalRecordReadEvidence)> {
+            let mut source = BufReader::new(raw);
+            let mut wal_hasher = Sha256::new();
+            let mut record = StrictLfRecordReader::new(&mut source, limit, &mut wal_hasher);
+            let mut payload = Vec::new();
+            record.read_to_end(&mut payload)?;
+            Ok((payload, record.finish()?))
+        }
+
+        let (payload, evidence) = frame(b"{}\n", 3).unwrap();
+        assert_eq!(payload, b"{}");
+        assert_eq!(evidence.bytes, 3);
+        assert!(frame(b"{}\n", 2).is_err(), "record max+1");
+        assert!(frame(b"{}", 3).is_err(), "missing final LF");
+        assert!(frame(b"\n", 1).is_err(), "blank record");
     }
 
     fn reference_cosine(query: &[f64], vector: &[f64]) -> f64 {
