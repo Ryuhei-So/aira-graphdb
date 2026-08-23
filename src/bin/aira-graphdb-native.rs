@@ -100,6 +100,8 @@ struct State {
 }
 
 const MAX_VECTOR_SEARCH_WORKERS: usize = 8;
+const MAX_VECTOR_DIMENSIONS: usize = 4_096;
+const MAX_VECTOR_SEARCH_TOP_K: usize = 10_000;
 
 #[derive(Debug)]
 struct ScoredVector {
@@ -2409,9 +2411,23 @@ impl Server {
             "vector_upsert" => {
                 if let Some(items) = Self::optional_array(params, "records")? {
                     for item in items {
-                        serde_json::from_value::<VectorRecord>(item.clone()).map_err(|err| {
-                            Self::execution_client_error(format!("invalid vector record: {err}"))
-                        })?;
+                        let record = serde_json::from_value::<VectorRecord>(item.clone()).map_err(
+                            |err| {
+                                Self::execution_client_error(format!(
+                                    "invalid vector record: {err}"
+                                ))
+                            },
+                        )?;
+                        if record.values.len() > MAX_VECTOR_DIMENSIONS {
+                            return Err(Self::execution_client_error(format!(
+                                "vector dimensions must not exceed {MAX_VECTOR_DIMENSIONS}"
+                            )));
+                        }
+                        if record.values.iter().any(|value| !value.is_finite()) {
+                            return Err(Self::execution_client_error(
+                                "vector values must be finite numbers".to_string(),
+                            ));
+                        }
                     }
                 }
             }
@@ -2740,6 +2756,12 @@ impl Server {
                                 "recordCount": record_count,
                             })),
                             _ => None,
+                        },
+                        "limits": {
+                            "vector": {
+                                "maxDimensions": MAX_VECTOR_DIMENSIONS,
+                                "maxSearchTopK": MAX_VECTOR_SEARCH_TOP_K,
+                            }
                         },
                         "methods": methods,
                     }))
@@ -3119,18 +3141,50 @@ impl Server {
                         .get("namespace")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    let top_k =
-                        req.params.get("topK").and_then(Value::as_u64).unwrap_or(10) as usize;
+                    let top_k_u64 = match req.params.get("topK") {
+                        None => 10,
+                        Some(value) => value.as_u64().ok_or_else(|| {
+                            Self::execution_client_error(
+                                "topK must be a positive integer".to_string(),
+                            )
+                        })?,
+                    };
+                    let top_k = usize::try_from(top_k_u64).map_err(|_| {
+                        Self::execution_client_error(format!(
+                            "topK must not exceed {MAX_VECTOR_SEARCH_TOP_K}"
+                        ))
+                    })?;
+                    if top_k == 0 || top_k > MAX_VECTOR_SEARCH_TOP_K {
+                        return Err(Self::execution_client_error(format!(
+                            "topK must be in [1, {MAX_VECTOR_SEARCH_TOP_K}]"
+                        )));
+                    }
                     let threshold = req.params.get("threshold").and_then(Value::as_f64);
-                    let query_vec = req
+                    let query_values = req
                         .params
                         .get("queryVector")
                         .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default()
+                        .ok_or_else(|| {
+                            Self::execution_client_error("queryVector must be an array".to_string())
+                        })?;
+                    if query_values.is_empty() || query_values.len() > MAX_VECTOR_DIMENSIONS {
+                        return Err(Self::execution_client_error(format!(
+                            "queryVector dimensions must be in [1, {MAX_VECTOR_DIMENSIONS}]"
+                        )));
+                    }
+                    let query_vec = query_values
                         .iter()
-                        .filter_map(Value::as_f64)
-                        .collect::<Vec<_>>();
+                        .map(|value| {
+                            value
+                                .as_f64()
+                                .filter(|number| number.is_finite())
+                                .ok_or_else(|| {
+                                    Self::execution_client_error(
+                                        "queryVector must contain only finite numbers".to_string(),
+                                    )
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                     self.ensure_cache();
                     let corpus_namespace_key = Self::corpus_namespace_key(corpus_id, namespace);
                     let keys = self
@@ -3989,6 +4043,116 @@ mod tests {
             params: json!({}),
         });
         assert!(response.ok, "batch_commit failed: {response:?}");
+    }
+
+    #[test]
+    fn vector_rpc_limits_are_advertised_and_fail_closed_before_work() {
+        let path = temp_path("agdb-native-vector-limits");
+        let mut server = Server::open(path.clone()).expect("open server");
+
+        let protocol = server.handle(RpcRequest {
+            id: 1,
+            method: "protocol_info".to_string(),
+            params: json!({}),
+        });
+        assert!(protocol.ok);
+        assert_eq!(
+            protocol.result.as_ref().unwrap()["limits"]["vector"]["maxDimensions"],
+            json!(MAX_VECTOR_DIMENSIONS)
+        );
+        assert_eq!(
+            protocol.result.as_ref().unwrap()["limits"]["vector"]["maxSearchTopK"],
+            json!(MAX_VECTOR_SEARCH_TOP_K)
+        );
+
+        let boundary = server.handle(RpcRequest {
+            id: 2,
+            method: "vector_search".to_string(),
+            params: json!({
+                "corpusId": "c1",
+                "namespace": "default",
+                "queryVector": vec![0.0; MAX_VECTOR_DIMENSIONS],
+                "topK": MAX_VECTOR_SEARCH_TOP_K,
+            }),
+        });
+        assert!(boundary.ok, "declared vector limits must be accepted");
+
+        for (id, params) in [
+            (
+                3,
+                json!({
+                    "corpusId": "c1",
+                    "namespace": "default",
+                    "queryVector": vec![0.0; MAX_VECTOR_DIMENSIONS + 1],
+                    "topK": 1,
+                }),
+            ),
+            (
+                4,
+                json!({
+                    "corpusId": "c1",
+                    "namespace": "default",
+                    "queryVector": [1.0],
+                    "topK": MAX_VECTOR_SEARCH_TOP_K + 1,
+                }),
+            ),
+            (
+                5,
+                json!({
+                    "corpusId": "c1",
+                    "namespace": "default",
+                    "queryVector": [1.0],
+                    "topK": 0,
+                }),
+            ),
+            (
+                6,
+                json!({
+                    "corpusId": "c1",
+                    "namespace": "default",
+                    "queryVector": [1.0, "not-a-number"],
+                    "topK": 1,
+                }),
+            ),
+        ] {
+            let response = server.handle(RpcRequest {
+                id,
+                method: "vector_search".to_string(),
+                params,
+            });
+            assert!(!response.ok, "out-of-contract vector search must fail");
+            let error = response.error.expect("structured client error");
+            assert_eq!(error.code, "REQUEST_EXECUTION_FAILED");
+            assert_eq!(error.failure_class.as_deref(), Some("CLIENT_INPUT"));
+        }
+
+        begin_batch(&mut server);
+        let oversized_upsert = server.handle(RpcRequest {
+            id: 7,
+            method: "vector_upsert".to_string(),
+            params: json!({
+                "records": [{
+                    "id": "too-wide",
+                    "corpusId": "c1",
+                    "namespace": "default",
+                    "values": vec![0.0; MAX_VECTOR_DIMENSIONS + 1],
+                    "metadata": {"documentId": "d1"},
+                }]
+            }),
+        });
+        assert!(!oversized_upsert.ok);
+        let error = oversized_upsert.error.expect("structured upsert error");
+        assert_eq!(error.failure_class.as_deref(), Some("CLIENT_INPUT"));
+        assert!(server.state.vectors.is_empty());
+        assert!(matches!(
+            server.transaction,
+            TransactionState::Active {
+                mutation_seen: false,
+                ..
+            }
+        ));
+
+        cleanup(&path);
     }
 
     #[test]
