@@ -68,7 +68,7 @@ test('requires explicit blob, pinned SHAs, even repetitions, and has no output-p
   assert.notEqual((await run(argsFor(f, ['--repetitions', '3'])).code), 0);
 });
 
-test('build manifest generator owns fixed clean build and rejects dirty/wrong/collision inputs', async () => {
+test('build manifest generator owns clean builds and isolates repeated or foreign outputs', async () => {
   const repo = await mkdtemp(join(tmpdir(), 'aira-build-repo-'));
   await mkdir(join(repo, 'src'));
   await writeFile(join(repo, 'Cargo.toml'), '[package]\nname="aira-graphdb"\nversion="0.1.0"\nedition="2021"\n[[bin]]\nname="aira-graphdb-native"\npath="src/main.rs"\n');
