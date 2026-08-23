@@ -421,6 +421,22 @@ records that evaluated Synapse authority in the artifact.  The checker emits
 stable error classes only and never logs private values.  Public repositories
 pin only the generated public schema and exact public-attestation bytes.
 
+The source fields and CI inputs are named by lifecycle, not by an ambiguous
+`toolSha`.  The detailed private artifact records
+`evaluatedSynapseBaseCommit/treeDigest`,
+`evaluatedSynapseCandidateCommit/treeDigest`,
+`evaluatedGraphDbCommit/treeDigest`, and the private-only
+`evaluatedHubDriverCommit/treeDigest`.  Its `synapseCheckerCommit` is required
+to equal `evaluatedSynapseCandidateCommit`; normalized arguments are recorded
+separately.  Base is a strict ancestor of candidate.  The later public
+attestation contains only the evaluated Synapse and GraphDB authorities, never
+the private Hub driver authority.  A public CI run obtains
+`synapseAttestationPinCommit` or `graphDbAttestationPinCommit` from its own
+checked-out `HEAD` rather than artifact JSON, requires the corresponding
+evaluated commit to be a strict ancestor, and recomputes the declared
+behavior-path tree digest from the evaluated commit.  Pin commits are never
+fields inside the attestation they add, so no self-addressed hash is possible.
+
 Hashes bind bytes rather than caller assertions.  The copy-manifest hash is
 computed by the checker from the exact held manifest bytes; the fixture hash
 is computed from the exact held fixture bytes; and the public detailed-artifact
@@ -436,16 +452,36 @@ self-hash field and a second ad-hoc canonical-JSON implementation.
 Comparison evidence is derived, not declared.  Each result list has unique
 IDs, ranks exactly `1..N`, array order equal to rank order, finite scores, and
 the operation-specific deterministic ID tie order.  The checker associates
-before/after rows by ID, rejects unexplained additions/removals, recomputes
-counts, maximum absolute score delta, and maximum rank delta, and compares the
-recomputed values with the serialized summary.  Candidate, expansion, and PPR
-IDs/ranks must be identical and their scores must satisfy the versioned V15
-parity tolerance owned by Synapse.  The only V1 accepted semantic-change enum
-is the already-reviewed ID-keyed context-association correction; adding an
-enum value is a plan-version and parity-review change, not a free-form string.
-Missing object references may be nonzero in production, but their exact
-before/after skip behavior and counts must agree and the `missing-object`
-required case must pass.
+before/after rows by ID and recomputes per-operation `beforeCount`,
+`afterCount`, `matchedCount`, `changedRankCount`, maximum absolute score delta,
+and maximum rank delta.  Empty result pairs have both maxima `0`.  V1 never
+permits an added or removed candidate, expansion, or PPR ID, so the matched
+population is the complete identical ID set rather than an intersection that
+can hide a removal.  Candidate IDs, ranks, and scores must satisfy exact V15
+parity.  Expansion and PPR keep the same ID set and scores within the
+versioned Synapse-owned tolerance; rank changes are permitted only within an
+equal-score tie group and only when the matching hardening enum is present.
+The after-list must then be score descending and ID ascending, and the checker
+derives every changed rank from those two lists.
+
+The closed V1 accepted-change enum is exactly
+`semantic-expansion-tie-order`, `semantic-ppr-tie-order`, and
+`semantic-id-keyed-context-association`.  The first two authorize only their
+operation's equal-score rank changes.  The third applies to a separately typed
+association comparison whose row key is the ranked result ID: before and after
+row-key sets remain identical, and every changed passage/fact association must
+equal the output of the shared ID-keyed context helper.  It does not authorize
+candidate additions, removals, or score changes.  Adding an enum or changing
+its allowed difference is a plan-version and parity-review change.
+
+The production missing-object audit records its measured count even when it
+blocks rollout.  The negative fixture case `missing-object-fail-closed` proves
+the hardened path rejects a missing domain object; the production case
+`production-missing-object-zero` passes only when the copied generation audit
+finds exactly zero missing references.  A nonzero production count therefore
+produces a valid, inspectable artifact with verdict `fail`, never a passing
+artifact.  This preserves the ledger rule that the hardening and rollout may
+proceed only after the audit proves zero.
 
 The builder derives the final verdict.  `pass` is valid only when every
 required case passes, every comparison and missing-object invariant above
@@ -460,10 +496,15 @@ commit, so adding the attestation cannot change what was claimed to have been
 evaluated.
 
 Generation consumes a user-supplied read-only copied-state root and never
-opens the live canonical path.  Before reading, the tool rejects the live path,
-symlinks, non-regular files, unexpected hard links, and any copy manifest whose
-resolved files escape that root; it revalidates held-file identity and hashes
-after measurement.  Logs and public artifacts redact copy roots, absolute
+opens the live canonical path.  The copy manifest contains exactly three
+entries in canonical order (`canonical`, `ownerManifest`, `vectorBlob`), with
+normalized unique relative paths and descriptor fields tied to the named
+vector entry.  Before reading, the tool rejects the live path, symlinks,
+non-regular files, unexpected hard links, any repeated held `(dev, ino)`, and
+any copy manifest whose resolved files escape that root; it revalidates held
+file identity and hashes after measurement.  Thus no two roles can alias the
+same copied inode and no copied role can alias the live canonical generation.
+Logs and public artifacts redact copy roots, absolute
 paths, production identifiers, query text, and raw errors.  Private `--check`
 verifies the evaluated source authorities, detailed artifact and fixture
 hashes, required cases, and redacted projection without regenerating
