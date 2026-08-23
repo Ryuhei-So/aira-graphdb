@@ -383,19 +383,43 @@ Before typed operation implementation:
 Synapse owns the versioned `V15CopiedProductionParityArtifact@1` schema and
 its generate/check tooling.  Literature Hub's private repository owns the
 detailed copied-production artifact when it contains production identifiers.
-Synapse and GraphDB pin a redacted attestation containing the detailed
-artifact SHA and the public fixture/normalization manifest SHAs; the redacted
-attestation must not be sufficient to reconstruct private identifiers.  The
-schema requires the exact generation and canonical/owner-manifest/vector-blob
-hashes; Synapse base/candidate and GraphDB SHAs; domain and normalization
-manifest SHAs; Node/V8/ICU/Unicode/OS/architecture; tool SHA and normalized
-arguments; before/after candidate, expansion, PPR, and id-association ids,
-ranks, and scores; maximum absolute score and rank deltas; missing-object
-audit; absent-seed, signed-sum `S <= 0`, dangling-loss, hub-damping, and
-convergence cases; accepted semantic changes; and a final pass/fail verdict.
-Generation consumes a read-only copied-state manifest and never opens the live
-canonical path.  CI `--check` verifies the exact final source SHAs, artifact
-and fixture hashes, and required cases without regenerating production data.
+The detailed schema requires the exact generation and
+canonical/owner-manifest/vector-blob hashes; the *evaluated* Synapse base and
+candidate commits/tree digests and GraphDB commit/tree digest; domain and
+normalization manifest SHAs; Node/V8/ICU/Unicode/OS/architecture; tool SHA and
+normalized arguments; before/after candidate, expansion, PPR, and
+id-association ids, ranks, and scores; maximum absolute score and rank deltas;
+missing-object audit; absent-seed, signed-sum `S <= 0`, dangling-loss,
+hub-damping, and convergence cases; accepted semantic changes; and a final
+pass/fail verdict.  The evaluated source authorities are frozen before any
+later commit that pins their attestation, avoiding a self-referential commit
+hash cycle.  CI verifies the behavior-bearing paths and tree digests of those
+evaluated commits, not the later attestation-pin commit as if it had been the
+evaluated implementation.
+
+Synapse and GraphDB separately pin byte-identical
+`V15CopiedProductionParityAttestation@1` JSON.  Its public schema contains only
+the detailed artifact SHA, evaluated source authorities, public domain and
+normalization manifest SHAs, required-case names with pass/fail booleans,
+aggregate count/delta bounds, accepted semantic-change identifiers, and the
+final verdict.  It contains no production ids, paths, query text, scores that
+can identify a document, or canonical artifact hashes.  Public CI validates
+the exact attestation bytes/schema, public hashes, evaluated source ancestry
+and behavior-path tree digests; it does not claim to reconstruct or validate
+private evidence from a hash alone.  Literature Hub CI is the authority that
+validates the detailed artifact, read-only copy manifest, required cases, and
+the equality between its redacted projection and the public attestation.
+
+Generation consumes a user-supplied read-only copied-state root and never
+opens the live canonical path.  Before reading, the tool rejects the live path,
+symlinks, non-regular files, unexpected hard links, and any copy manifest whose
+resolved files escape that root; it revalidates held-file identity and hashes
+after measurement.  Logs and public artifacts redact copy roots, absolute
+paths, production identifiers, query text, and raw errors.  Private `--check`
+verifies the evaluated source authorities, detailed artifact and fixture
+hashes, required cases, and redacted projection without regenerating
+production data; public `--check` verifies only the independently checkable
+attestation contract described above.
 
 Before native algorithm wiring:
 
