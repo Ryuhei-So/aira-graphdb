@@ -116,9 +116,9 @@ fn verify_contract_dir(root: &Path) -> Result<(), String> {
         || !pin
             .source_commit
             .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err("sourceCommit must be an exact 40-character Git SHA".into());
+        return Err("sourceCommit must be an exact lowercase 40-character Git SHA".into());
     }
 
     let expected_paths = expected_source_paths();
@@ -257,15 +257,14 @@ fn copied_synapse_contract_is_exactly_pinned() {
 fn modified_or_missing_artifact_fails_closed() {
     let source = Path::new(CONTRACT_DIR);
     let modified = TestDir::copy_from(source);
-    fs::write(
-        modified.0.join("bounded-domain-contract.json"),
-        b"{\"contractVersion\":\"aira-synapse-domain-contract@1\"}\n",
-    )
-    .expect("modify copied contract");
+    let modified_path = modified.0.join("bounded-domain-contract.json");
+    let mut modified_bytes = fs::read(&modified_path).expect("read copied contract");
+    modified_bytes[0] ^= 1;
+    fs::write(&modified_path, modified_bytes).expect("modify copied contract in place");
     assert!(
         verify_contract_dir(&modified.0)
             .unwrap_err()
-            .contains("mismatch")
+            .contains("SHA-256 mismatch")
     );
 
     let missing = TestDir::copy_from(source);
@@ -292,6 +291,22 @@ fn unknown_version_or_partial_manifest_fails_closed() {
             .contains("unsupported pinVersion")
     );
 
+    let uppercase = TestDir::copy_from(source);
+    let pin_path = uppercase.0.join(PIN_FILE);
+    let mut pin: Value = serde_json::from_slice(&fs::read(&pin_path).expect("read copied pin"))
+        .expect("parse copied pin");
+    pin["sourceCommit"] = Value::String("ABCDEF0123456789ABCDEF0123456789ABCDEF01".into());
+    fs::write(
+        &pin_path,
+        serde_json::to_vec_pretty(&pin).expect("serialize pin"),
+    )
+    .expect("write uppercase pin");
+    assert!(
+        verify_contract_dir(&uppercase.0)
+            .unwrap_err()
+            .contains("lowercase")
+    );
+
     let partial = TestDir::copy_from(source);
     let manifest_path = partial.0.join("bounded-domain-fixture.manifest.json");
     fs::write(
@@ -304,7 +319,11 @@ fn unknown_version_or_partial_manifest_fails_closed() {
         "bounded-domain-fixture.manifest.json",
         b"{\"manifestVersion\":\"aira-synapse-bounded-domain-manifest@1\"}\n",
     );
-    assert!(verify_contract_dir(&partial.0).is_err());
+    assert!(
+        verify_contract_dir(&partial.0)
+            .unwrap_err()
+            .contains("missing field")
+    );
 }
 
 #[test]
@@ -329,6 +348,22 @@ fn intended_file_set_and_bounded_allocation_negatives_fail_closed() {
             .unwrap_err()
             .contains("per-file byte cap")
     );
+
+    let aggregate = TestDir::copy_from(source);
+    for local_file in [
+        "bounded-domain-contract.json",
+        "bounded-domain-fixture.json",
+        "bounded-domain-fixture.manifest.json",
+    ] {
+        let bytes = vec![b'x'; 100 * 1024];
+        fs::write(aggregate.0.join(local_file), &bytes).expect("write aggregate artifact");
+        update_pin_artifact(&aggregate.0, local_file, &bytes);
+    }
+    assert!(
+        verify_contract_dir(&aggregate.0)
+            .unwrap_err()
+            .contains("aggregate byte cap")
+    );
 }
 
 #[test]
@@ -350,7 +385,11 @@ fn typed_manifest_and_path_shape_negatives_fail_closed() {
         "bounded-domain-fixture.manifest.json",
         &manifest_bytes,
     );
-    assert!(verify_contract_dir(&unknown_manifest.0).is_err());
+    assert!(
+        verify_contract_dir(&unknown_manifest.0)
+            .unwrap_err()
+            .contains("unknown field")
+    );
 
     let traversal = TestDir::copy_from(source);
     let pin_path = traversal.0.join(PIN_FILE);

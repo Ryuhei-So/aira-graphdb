@@ -48,7 +48,7 @@ jobs:
           set -euo pipefail
           sha='${{ steps.synapse-pin.outputs.sha }}'
           test "$(git -C .cross-repo/aira-synapse rev-parse HEAD)" = "$sha"
-          git merge-base --is-ancestor "$sha" origin/main
+          git -C .cross-repo/aira-synapse merge-base --is-ancestor "$sha" origin/main
           while IFS=$'\t' read -r source_path local_path; do
             [ -n "$source_path" ]
             [ "$(git -C .cross-repo/aira-synapse ls-tree -r "$sha" -- "$source_path" | wc -l)" -eq 1 ]
