@@ -604,6 +604,68 @@ fn canonical_db_and_referenced_blob_aliases_fail_closed() {
     assert_ne!(native.finish().code(), Some(0));
 }
 
+#[cfg(unix)]
+#[test]
+fn idle_mutation_rejects_wal_aliases_and_replacement_without_touching_payload() {
+    for kind in ["symlink", "hardlink", "replacement"] {
+        let db = TempDb::new(&format!("idle-wal-{kind}"));
+        seed_vector(&db.path);
+        let canonical_before = std::fs::read(&db.path).expect("canonical state before WAL attack");
+        let wal_path = db.path.with_extension("agdb.wal");
+        let sentinel = db.dir.join("sentinel.wal");
+        let sentinel_bytes = format!("sentinel-payload-{kind}\n").into_bytes();
+        std::fs::write(&sentinel, &sentinel_bytes).expect("write sentinel payload");
+
+        let mut native = NativeProcess::spawn(&db.path, &[]);
+        let info = native.send(json!({"id":1,"method":"protocol_info","params":{}}));
+        assert_eq!(info["result"]["state"], json!("idle"));
+        assert_eq!(info["result"]["generation"], json!(1));
+        assert_eq!(native.send(batch_begin(2))["ok"], json!(true));
+
+        match kind {
+            "symlink" => symlink(&sentinel, &wal_path).expect("install WAL symlink attack"),
+            "hardlink" => hard_link(&sentinel, &wal_path).expect("install WAL hardlink attack"),
+            "replacement" => {
+                std::fs::write(&wal_path, &sentinel_bytes).expect("install WAL replacement inode")
+            }
+            _ => unreachable!(),
+        }
+
+        let response = native.send(vector_upsert_for_document(
+            3,
+            &format!("attack-v-{kind}"),
+            &format!("attack-document-{kind}"),
+            [0.0, 1.0],
+            "attack",
+        ));
+        assert_eq!(
+            response["ok"],
+            json!(false),
+            "WAL {kind} attack was accepted"
+        );
+        assert!(response.get("result").is_none());
+        assert_ne!(
+            native.finish().code(),
+            Some(0),
+            "WAL {kind} attack was not fatal"
+        );
+
+        assert_eq!(
+            std::fs::read(&sentinel).expect("read sentinel payload after attack"),
+            sentinel_bytes
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read WAL payload after attack"),
+            sentinel_bytes
+        );
+        assert_eq!(
+            std::fs::read(&db.path).expect("canonical state after attack"),
+            canonical_before
+        );
+        assert_eq!(generation(&db.path), 1, "WAL {kind} advanced generation");
+    }
+}
+
 #[test]
 fn startup_removes_only_recognized_nonce_temps() {
     let db = TempDb::new("temp-cleanup");
