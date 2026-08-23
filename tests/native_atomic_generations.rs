@@ -790,6 +790,8 @@ fn wal_path_swap_after_sync_fails_closed_before_identity_validation() {
         let wal_path = db.path.with_extension("agdb.wal");
         let original_path = db.dir.join(format!("{label}-original.wal"));
         let replacement_path = db.dir.join(format!("{label}-replacement.wal"));
+        let pause_marker = db.dir.join(format!("{label}-post-sync.marker"));
+        let pause_marker_value = pause_marker.to_string_lossy().into_owned();
         let sentinel = format!("sentinel-{label}\n").into_bytes();
         std::fs::write(&replacement_path, &sentinel).expect("write WAL replacement sentinel");
 
@@ -801,6 +803,7 @@ fn wal_path_swap_after_sync_fails_closed_before_identity_validation() {
                     "after_wal_sync_before_identity_check",
                 ),
                 ("AGDB_NATIVE_TEST_PAUSE_MS", "1000"),
+                ("AGDB_NATIVE_TEST_PAUSE_MARKER", pause_marker_value.as_str()),
             ],
         );
         assert_eq!(native.send(batch_begin(1))["ok"], json!(true));
@@ -813,11 +816,12 @@ fn wal_path_swap_after_sync_fails_closed_before_identity_validation() {
                 "existing-first",
             );
             assert_eq!(native.send(first)["ok"], json!(true));
-            let length = std::fs::metadata(&wal_path)
-                .expect("existing WAL after first mutation")
-                .len();
+            std::fs::remove_file(&pause_marker)
+                .expect("clear the first mutation's post-sync marker");
             (
-                length,
+                std::fs::metadata(&wal_path)
+                    .expect("existing WAL metadata")
+                    .len(),
                 vector_upsert_for_document(
                     3,
                     "existing-second-v",
@@ -840,15 +844,13 @@ fn wal_path_swap_after_sync_fails_closed_before_identity_validation() {
         };
 
         let swap_wal = wal_path.clone();
+        let swap_marker = pause_marker.clone();
         let move_original = original_path.clone();
         let move_replacement = replacement_path.clone();
         let swapper = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
-                let ready = std::fs::metadata(&swap_wal)
-                    .map(|metadata| metadata.len() > baseline_len)
-                    .unwrap_or(false);
-                if ready {
+                if swap_marker.exists() {
                     break;
                 }
                 assert!(
@@ -1209,6 +1211,8 @@ fn recovery_discard_rejects_wal_replacement_and_append_without_quarantine() {
 fn recovery_discard_rejects_same_inode_append_during_quarantine() {
     let db = TempDb::new("recovery-wal-concurrent-append");
     let request = vector_upsert_for_document(1, "race-v", "race-document", [1.0, 0.0], "race");
+    let pause_marker = db.dir.join("recovery-quarantine.marker");
+    let pause_marker_value = pause_marker.to_string_lossy().into_owned();
     let (mut native, original, digest) = open_recovery_pending_with_env(
         &db.path,
         &request,
@@ -1218,6 +1222,7 @@ fn recovery_discard_rejects_same_inode_append_during_quarantine() {
                 "before_recovery_quarantine_rename",
             ),
             ("AGDB_NATIVE_TEST_PAUSE_MS", "250"),
+            ("AGDB_NATIVE_TEST_PAUSE_MARKER", pause_marker_value.as_str()),
         ],
     );
     let appended_record = encoded_wal_record(
@@ -1226,9 +1231,17 @@ fn recovery_discard_rejects_same_inode_append_during_quarantine() {
     );
     let wal_path = db.path.with_extension("agdb.wal");
     let append_path = wal_path.clone();
+    let append_marker = pause_marker.clone();
     let append_bytes = appended_record.clone();
     let appender = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !append_marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native did not reach recovery quarantine pausepoint"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&append_path)

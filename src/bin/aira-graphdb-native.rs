@@ -788,9 +788,19 @@ impl Server {
         Ok(())
     }
 
-    fn durability_pausepoint(stage: &str) {
+    fn durability_pausepoint(stage: &str) -> io::Result<()> {
         if !Self::failpoint_matches("AGDB_NATIVE_TEST_PAUSE_POINT", stage) {
-            return;
+            return Ok(());
+        }
+        if let Ok(marker) = std::env::var("AGDB_NATIVE_TEST_PAUSE_MARKER") {
+            let marker = PathBuf::from(marker);
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)?;
+            file.write_all(stage.as_bytes())?;
+            file.sync_all()?;
+            Self::sync_parent_dir(&Self::parent_dir(&marker))?;
         }
         let milliseconds = std::env::var("AGDB_NATIVE_TEST_PAUSE_MS")
             .ok()
@@ -798,6 +808,7 @@ impl Server {
             .unwrap_or(100)
             .min(5_000);
         std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+        Ok(())
     }
 
     fn write_durable_temp(target: &Path, bytes: &[u8], sync_stage: &str) -> io::Result<PathBuf> {
@@ -989,7 +1000,7 @@ impl Server {
         let next_generation = current_generation
             .checked_add(1)
             .ok_or_else(|| io::Error::other("generation overflow"))?;
-        let wal_records = self.read_wal_records()?;
+        let (wal_records, wal_identity, wal_raw) = self.read_wal_records_with_identity()?;
         if wal_records
             .iter()
             .any(|record| record.base_generation != current_generation)
@@ -1003,6 +1014,8 @@ impl Server {
                 "cannot publish a generation without a durable WAL mutation",
             ));
         }
+        let wal_identity = wal_identity
+            .ok_or_else(|| io::Error::other("durable WAL disappeared before publication"))?;
 
         let parent = Self::parent_dir(&self.db_path);
         fs::create_dir_all(&parent)
@@ -1083,11 +1096,9 @@ impl Server {
         Self::sync_parent_dir(&parent)?;
         Self::durability_failpoint("after_json_dir_fsync")?;
 
-        if self.wal_path.exists() {
-            Self::durability_failpoint("before_wal_retire")?;
-            fs::remove_file(&self.wal_path)
-                .map_err(|err| io::Error::other(format!("retire WAL failed: {err}")))?;
-        }
+        Self::durability_failpoint("before_wal_retire")?;
+        self.retire_wal_exact(wal_identity, &wal_raw)
+            .map_err(|err| io::Error::other(format!("retire WAL failed: {err}")))?;
         Self::durability_failpoint("after_wal_retire")?;
         Self::durability_failpoint("before_final_dir_fsync")?;
         Self::sync_parent_dir(&parent)?;
@@ -1207,22 +1218,46 @@ impl Server {
         Ok((records, Some(identity), raw))
     }
 
-    fn read_wal_records(&self) -> io::Result<Vec<WalRecord>> {
-        self.read_wal_records_with_identity()
-            .map(|(records, _, _)| records)
+    fn retire_wal_exact(
+        &self,
+        expected_identity: (u64, u64),
+        expected_raw: &[u8],
+    ) -> io::Result<()> {
+        let parent = Self::parent_dir(&self.wal_path);
+        let mut held_wal = Self::open_regular_nofollow(&self.wal_path)?;
+        if Self::metadata_identity(&held_wal.metadata()?) != expected_identity {
+            return Err(io::Error::other("WAL identity changed before retirement"));
+        }
+        let mut held_before = Vec::new();
+        held_wal.read_to_end(&mut held_before)?;
+        if held_before != expected_raw {
+            return Err(io::Error::other("WAL content changed before retirement"));
+        }
+        let nonce = Self::crypto_nonce()?;
+        let file_name = self
+            .wal_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("aira-graphdb.agdb.wal");
+        let retired = parent.join(format!(".{file_name}.retired-{nonce}"));
+        fs::rename(&self.wal_path, &retired)?;
+        Self::validate_regular_path_identity(&retired, expected_identity)?;
+        held_wal.seek(SeekFrom::Start(0))?;
+        let mut held_after = Vec::new();
+        held_wal.read_to_end(&mut held_after)?;
+        if held_after != expected_raw {
+            return Err(io::Error::other("WAL content changed during retirement"));
+        }
+        Self::sync_parent_dir(&parent)?;
+        fs::remove_file(&retired)?;
+        Self::sync_parent_dir(&parent)
     }
 
     fn rewrite_wal_records(&self, records: &[WalRecord]) -> io::Result<()> {
         if records.is_empty() {
-            if self.wal_path.exists() {
-                Self::durability_failpoint("before_wal_rewrite_retire")?;
-                fs::remove_file(&self.wal_path)?;
-                Self::durability_failpoint("after_wal_rewrite_retire")?;
-                Self::durability_failpoint("before_wal_rewrite_dir_fsync")?;
-                Self::sync_parent_dir(&Self::parent_dir(&self.wal_path))?;
-                Self::durability_failpoint("after_wal_rewrite_dir_fsync")?;
-            }
-            return Ok(());
+            return Err(io::Error::other(
+                "empty WAL rewrite requires exact retirement identity",
+            ));
         }
         let mut bytes = Vec::new();
         for record in records {
@@ -1338,7 +1373,7 @@ impl Server {
             Self::sync_parent_dir(&parent)?;
             Self::durability_failpoint("after_wal_dir_fsync")?;
         }
-        Self::durability_pausepoint("after_wal_sync_before_identity_check");
+        Self::durability_pausepoint("after_wal_sync_before_identity_check")?;
         Self::validate_regular_path_identity(&self.wal_path, wal_identity)?;
         self.wal_identity = Some(wal_identity);
         self.wal_bytes += encoded.len() as u64 + 1;
@@ -1346,7 +1381,7 @@ impl Server {
     }
 
     fn replay_wal(&mut self) -> io::Result<usize> {
-        let (records, mut wal_identity, _) = self.read_wal_records_with_identity()?;
+        let (records, mut wal_identity, mut wal_raw) = self.read_wal_records_with_identity()?;
         let generation = self.state.generation;
         let mut replayable = Vec::new();
         let mut skipped = 0usize;
@@ -1362,13 +1397,11 @@ impl Server {
                 }
             }
         }
-        if skipped > 0 {
-            self.rewrite_wal_records(&replayable)?;
-            wal_identity = self.read_wal_records_with_identity()?.1;
-        }
         if replayable.is_empty() {
-            if wal_identity.is_some() {
-                self.rewrite_wal_records(&[])?;
+            if let Some(identity) = wal_identity {
+                Self::durability_failpoint("before_wal_rewrite_retire")?;
+                self.retire_wal_exact(identity, &wal_raw)?;
+                Self::durability_failpoint("after_wal_rewrite_retire")?;
             }
             self.wal_bytes = 0;
             self.wal_identity = None;
@@ -1376,7 +1409,13 @@ impl Server {
             eprintln!("[wal] recoveryPending=false skipped={skipped} bytes=0");
             return Ok(0);
         }
-        self.wal_bytes = fs::metadata(&self.wal_path).map(|m| m.len()).unwrap_or(0);
+        if skipped > 0 {
+            self.rewrite_wal_records(&replayable)?;
+            let snapshot = self.read_wal_records_with_identity()?;
+            wal_identity = snapshot.1;
+            wal_raw = snapshot.2;
+        }
+        self.wal_bytes = wal_raw.len() as u64;
         let encoded = Self::encoded_wal_records(&replayable)?;
         let digest = Self::digest_bytes(&encoded);
         let (wal_device, wal_inode) = wal_identity.ok_or_else(|| {
@@ -1485,7 +1524,9 @@ impl Server {
         let quarantine = parent.join(format!(
             ".{file_name}.recovery-{actual_digest}-{nonce}.quarantine"
         ));
-        Self::durability_pausepoint("before_recovery_quarantine_rename");
+        Self::durability_pausepoint("before_recovery_quarantine_rename").map_err(|err| {
+            Self::execution_io_error(format!("pause recovery quarantine failed: {err}"))
+        })?;
         Self::durability_failpoint("before_recovery_quarantine_rename").map_err(|err| {
             Self::execution_io_error(format!("quarantine recovery WAL failed: {err}"))
         })?;
