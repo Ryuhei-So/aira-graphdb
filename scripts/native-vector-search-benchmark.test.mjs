@@ -28,15 +28,10 @@ async function fixture({ descriptor = true, descriptorSize, descriptorSha, gener
   const native = slow ? '#!/bin/sh\nwhile IFS= read -r line; do sleep 30; printf \'{"ok":true,"result":[]}\\n\'; done\n' : '#!/bin/sh\nwhile IFS= read -r line; do printf \'{"ok":true,"result":[]}\\n\'; done\n';
   await writeFile(old, native); await writeFile(newer, `${native}# distinct build\n`);
   await chmod(old, 0o700); await chmod(newer, 0o700);
-  for (const repo of [oldDir, newDir]) {
-    await exec('git', ['init', '-q', repo]);
-    await exec('git', ['-C', repo, 'config', 'user.email', 'test@example.invalid']);
-    await exec('git', ['-C', repo, 'config', 'user.name', 'test']);
-    await exec('git', ['-C', repo, 'add', '.']);
-    await exec('git', ['-C', repo, 'commit', '-qm', 'fixture']);
-  }
-  const oldSha = (await exec('git', ['-C', oldDir, 'rev-parse', 'HEAD'])).stdout.trim();
-  const newSha = (await exec('git', ['-C', newDir, 'rev-parse', 'HEAD'])).stdout.trim();
+  // Published build capabilities intentionally live outside a Git checkout;
+  // their adjacent manifests are the source-SHA and binary-hash authority.
+  const oldSha = '1'.repeat(40);
+  const newSha = '2'.repeat(40);
   const oldHash = createHash('sha256').update(await readFile(old)).digest('hex');
   const newHash = createHash('sha256').update(await readFile(newer)).digest('hex');
   await writeFile(`${old}.manifest.json`, JSON.stringify({ schema: 'aira.native-build-manifest.v1', sourceSha: oldSha, binarySha256: oldHash, cargoProfile: 'release', rustcVersion: 'rustc test', buildCommand: 'cargo build --release' }));

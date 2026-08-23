@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { chmod, lstat, mkdtemp, open, readdir, realpath, rm } from 'node:fs/promises';
 import { constants, existsSync, readFileSync } from 'node:fs';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { basename, dirname, join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 
@@ -427,11 +427,6 @@ async function runCounterbalanced(binaries, request, repetitions, timeoutMs, pre
   return { old: combineRuns(runs.old), new: combineRuns(runs.new), executionOrder };
 }
 
-function gitSha(path) {
-  const result = spawnSync('git', ['-C', dirname(path), 'rev-parse', 'HEAD'], { encoding: 'utf8' });
-  return result.status === 0 ? result.stdout.trim() : null;
-}
-
 async function readBuildManifest(binary, suppliedSha, binaryHash) {
   const manifestPath = `${binary}.manifest.json`;
   const source = await openPrivateSource(manifestPath, 'binary build manifest');
@@ -468,8 +463,6 @@ async function main() {
     if (recoveryEntries.length > 0) usage(`refusing source recovery artifacts: ${recoveryEntries.join(', ')}`);
     const oldSource = await openPrivateSource(args.old, 'old binary', { singleLink: false }); checkDeadline();
     const newSource = await openPrivateSource(args.new, 'new binary', { singleLink: false }); checkDeadline();
-    if (gitSha(args.old) !== args.old_sha) usage(`old binary SHA mismatch: supplied ${args.old_sha}`);
-    if (gitSha(args.new) !== args.new_sha) usage(`new binary SHA mismatch: supplied ${args.new_sha}`);
     workspace = await mkdtemp(join(tmpdir(), 'aira-vector-benchmark-'));
     await chmod(workspace, 0o700);
     const db = join(workspace, basename(sourceDb));
