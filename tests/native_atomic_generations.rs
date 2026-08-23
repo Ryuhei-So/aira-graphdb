@@ -715,6 +715,176 @@ fn wal_sync_failure_returns_failure_and_stops_request_service() {
 }
 
 #[test]
+fn empty_wal_after_before_write_failure_is_retired_before_fresh_commit() {
+    for (label, variable, expect_kill) in [
+        ("kill", "AGDB_NATIVE_KILL_POINT", true),
+        ("failure", "AGDB_NATIVE_FAIL_POINT", false),
+    ] {
+        let db = TempDb::new(&format!("empty-wal-before-write-{label}"));
+        let wal_path = db.path.with_extension("agdb.wal");
+        let mut native = NativeProcess::spawn(&db.path, &[(variable, "before_wal_write")]);
+        assert_eq!(native.send(batch_begin(1))["ok"], json!(true));
+        let mutation = vector_upsert_for_document(
+            2,
+            &format!("fresh-v-{label}"),
+            &format!("fresh-document-{label}"),
+            [0.0, 1.0],
+            "fresh",
+        );
+        if expect_kill {
+            native.send_without_read(mutation.clone());
+            assert_native_killed(native.finish(), "before_wal_write");
+        } else {
+            let response = native.send(mutation.clone());
+            assert_eq!(response["ok"], json!(false));
+            assert!(response.get("result").is_none());
+            assert_ne!(native.finish().code(), Some(0));
+        }
+        assert!(wal_path.exists(), "{label} must leave the create-new WAL");
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+        assert!(!db.path.exists(), "{label} published canonical state");
+
+        let mut recovery = NativeProcess::spawn(&db.path, &[]);
+        let info = recovery.send(json!({"id":3,"method":"protocol_info","params":{}}));
+        assert_eq!(info["ok"], json!(true), "{label} restart health");
+        assert_eq!(
+            info["result"]["state"],
+            json!("idle"),
+            "{label} restart state"
+        );
+        assert_eq!(info["result"]["generation"], json!(0));
+        assert!(!wal_path.exists(), "{label} restart must retire empty WAL");
+        assert_eq!(recovery.finish().code(), Some(0));
+
+        let mut fresh = NativeProcess::spawn(&db.path, &[]);
+        assert_eq!(fresh.send(batch_begin(4))["ok"], json!(true));
+        assert_eq!(fresh.send(mutation)["ok"], json!(true));
+        let commit = fresh.send(batch_commit(5));
+        assert_eq!(commit["ok"], json!(true), "{label} fresh commit: {commit}");
+        assert_eq!(commit["result"]["generation"], json!(1));
+        assert_eq!(fresh.finish().code(), Some(0));
+        assert!(
+            !wal_path.exists(),
+            "{label} successful commit must retire WAL"
+        );
+
+        let mut reader = NativeProcess::spawn(&db.path, &[]);
+        let search = reader.send(vector_search(6, [0.0, 1.0]));
+        assert_eq!(search["ok"], json!(true), "{label} fresh read");
+        assert_eq!(search["result"].as_array().unwrap().len(), 1);
+        assert_eq!(search["result"][0]["id"], json!(format!("fresh-v-{label}")));
+        assert_eq!(reader.finish().code(), Some(0));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn wal_path_swap_after_sync_fails_closed_before_identity_validation() {
+    for (label, seed_existing_wal) in [("initial", false), ("existing", true)] {
+        let db = TempDb::new(&format!("wal-path-swap-{label}"));
+        if seed_existing_wal {
+            seed_vector(&db.path);
+        }
+        let canonical_before = std::fs::read(&db.path).ok();
+        let generation_before = generation(&db.path);
+        let wal_path = db.path.with_extension("agdb.wal");
+        let original_path = db.dir.join(format!("{label}-original.wal"));
+        let replacement_path = db.dir.join(format!("{label}-replacement.wal"));
+        let sentinel = format!("sentinel-{label}\n").into_bytes();
+        std::fs::write(&replacement_path, &sentinel).expect("write WAL replacement sentinel");
+
+        let mut native = NativeProcess::spawn(
+            &db.path,
+            &[
+                (
+                    "AGDB_NATIVE_TEST_PAUSE_POINT",
+                    "after_wal_sync_before_identity_check",
+                ),
+                ("AGDB_NATIVE_TEST_PAUSE_MS", "1000"),
+            ],
+        );
+        assert_eq!(native.send(batch_begin(1))["ok"], json!(true));
+        let (baseline_len, mutation) = if seed_existing_wal {
+            let first = vector_upsert_for_document(
+                2,
+                "existing-first-v",
+                "existing-first-document",
+                [1.0, 0.0],
+                "existing-first",
+            );
+            assert_eq!(native.send(first)["ok"], json!(true));
+            let length = std::fs::metadata(&wal_path)
+                .expect("existing WAL after first mutation")
+                .len();
+            (
+                length,
+                vector_upsert_for_document(
+                    3,
+                    "existing-second-v",
+                    "existing-second-document",
+                    [0.0, 1.0],
+                    "existing-second",
+                ),
+            )
+        } else {
+            (
+                0,
+                vector_upsert_for_document(
+                    2,
+                    "initial-v",
+                    "initial-document",
+                    [0.0, 1.0],
+                    "initial",
+                ),
+            )
+        };
+
+        let swap_wal = wal_path.clone();
+        let move_original = original_path.clone();
+        let move_replacement = replacement_path.clone();
+        let swapper = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let ready = std::fs::metadata(&swap_wal)
+                    .map(|metadata| metadata.len() > baseline_len)
+                    .unwrap_or(false);
+                if ready {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "native did not reach the post-WAL-sync pausepoint"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            std::fs::rename(&swap_wal, &move_original).expect("move original WAL inode");
+            std::fs::rename(&move_replacement, &swap_wal).expect("install replacement WAL inode");
+        });
+        let response = native.send(mutation);
+        swapper.join().expect("WAL swapper exits");
+        assert_eq!(response["ok"], json!(false), "{label}: {response}");
+        assert!(response.get("result").is_none(), "{label}: {response}");
+        assert_ne!(native.finish().code(), Some(0), "{label} must fail closed");
+
+        assert_eq!(std::fs::read(&wal_path).unwrap(), sentinel);
+        assert!(
+            std::fs::metadata(&wal_path)
+                .expect("replacement WAL metadata")
+                .is_file()
+        );
+        assert!(original_path.exists(), "{label} original inode was moved");
+        assert!(
+            std::fs::metadata(&original_path)
+                .expect("original WAL metadata")
+                .len()
+                > baseline_len
+        );
+        assert_eq!(std::fs::read(&db.path).ok(), canonical_before);
+        assert_eq!(generation(&db.path), generation_before);
+    }
+}
+
+#[test]
 fn valid_base_wal_enters_recovery_pending_without_exposing_or_replaying_data() {
     let db = TempDb::new("wal-recovery-pending");
     let request = vector_upsert_for_document(7, "old-v", "old-document", [1.0, 0.0], "old");
