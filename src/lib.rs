@@ -7,6 +7,7 @@ pub mod errors;
 pub mod graph;
 pub mod lock;
 pub mod native_bench;
+pub mod native_persistence_contract;
 pub mod protocol;
 pub mod query;
 pub mod runtime;

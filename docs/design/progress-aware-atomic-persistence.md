@@ -96,7 +96,8 @@ method: "batch_commit"
 phases: closed ordered phase[]
 initialFrameDeadlineMs: positive safe integer
 inactivityDeadlineMs: positive safe integer
-phaseHardDeadlineMs: { phase: positive safe integer }[]
+phaseHardDeadlineMs: strict ordered {phase, deadlineMs}[]; `phase` follows the
+  closed phase inventory and `deadlineMs` is a positive safe integer
 absoluteDeadlineMs: positive safe integer
 minFrameIntervalMs: positive safe integer
 heartbeatIntervalMs: positive safe integer

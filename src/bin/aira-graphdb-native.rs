@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use aira_graphdb::graph::{InMemoryGraphStore, Properties, Value as GraphValue};
+use aira_graphdb::native_persistence_contract::JSON_SAFE_INTEGER_MAX;
 use aira_graphdb::query::{CypherDialect, execute_query_with_dialect};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -261,7 +262,6 @@ const ACCESS_MODE_DESCRIPTOR_READ_ONLY: &str = "descriptor-read-only";
 const DESCRIPTOR_READ_ONLY_METHOD_CODE: &str = "DESCRIPTOR_READ_ONLY_METHOD";
 const DESCRIPTOR_READ_ONLY_METHOD_MESSAGE: &str =
     "method is unavailable in descriptor read-only mode";
-const MAX_SAFE_GENERATION: u64 = 9_007_199_254_740_991;
 // The descriptor protocol must never turn an inherited file into an
 // unbounded allocation. These caps are intentionally independent from the
 // normal --db persistence path and are checked from fstat before reading.
@@ -1538,7 +1538,7 @@ impl Server {
         let vector_blob_sha256 = Self::sha256_hex(&blob_raw);
         let state: State = serde_json::from_slice(&canonical_raw)
             .map_err(|err| io::Error::other(format!("parse canonical descriptor failed: {err}")))?;
-        if state.generation > MAX_SAFE_GENERATION {
+        if state.generation > JSON_SAFE_INTEGER_MAX {
             return Err(io::Error::other(
                 "canonical generation exceeds MAX_SAFE_INTEGER",
             ));
@@ -4070,7 +4070,7 @@ fn parse_descriptor_generation(value: Option<&String>) -> io::Result<u64> {
     let generation = value
         .parse::<u64>()
         .map_err(|_| io::Error::other("--expected-generation must be an unsigned integer"))?;
-    if generation > MAX_SAFE_GENERATION {
+    if generation > JSON_SAFE_INTEGER_MAX {
         return Err(io::Error::other(
             "--expected-generation exceeds MAX_SAFE_INTEGER",
         ));
