@@ -38,7 +38,12 @@ Rejected alternatives:
 ## Authorities
 
 - Canonical JSON and its referenced vector blob are the committed GraphDB data
-  authority.  The adjacent owner generation manifest records owner admission
+  authority.  The sole scoped legacy exception is the owner-minted
+  `LegacyGeneration0Binding@1`, which is only the canonical/blob association
+  authority for a clean descriptor-less generation zero; it never replaces
+  the canonical publication pointer, and a copy manifest remains subordinate
+  evidence.  The binding is ignored and forbidden once a descriptor generation
+  exists.  The adjacent owner generation manifest records owner admission
   state; it does not replace the canonical JSON publication pointer.  WAL is
   unpublished recovery input and is never reader-visible.
 - The owner alone reaches native stdio and owns roles, writer exclusion, reader
@@ -596,8 +601,17 @@ never performs recovery or persistence, and exposes only the exact pinned read-
 method inventory.  Every mutation, transaction, commit, recovery, import, and
 save method is rejected by native dispatch before work.  Native first proves
 its process/executable/build/protocol authority, then validates and acknowledges
-the expected generation and descriptor-selected blob digest from the inherited
-GraphDB descriptors.  Hub independently binds that acknowledgement to its held
+the expected generation and blob digest from the inherited GraphDB descriptors.
+For generation greater than zero, the canonical descriptor is mandatory and
+its size/hash must match the blob FD.  For the current legacy generation zero,
+Hub must explicitly request `legacyGeneration0` and supply the hash of the
+owner-minted `LegacyGeneration0Binding@1` described below; native requires the
+canonical state to lack a blob descriptor, never searches an adjacent pathname,
+hashes the supplied blob FD, and returns that measured digest.  Any other
+legacy/descriptor/generation combination fails closed.  Hub requires the copy
+manifest to equal the binding's exact generation-zero canonical/blob authority,
+or for later generations to equal the canonical descriptor, and independently
+binds the acknowledgement to its held
 owner-manifest generation/hash.  Only after that
 second acknowledgement does Hub broker evaluator/runner operation frames over
 its directly-owned anonymous pipes.  Hub passes no process handle or file
@@ -705,8 +719,10 @@ copied-generation manifest hash, fixture hash, evaluator commit/build digest,
 both runner handshakes, and the parent-observed copied-native PID/channel
 authority, sealed native hash, GraphDB commit/build-manifest hash,
 `protocol_info` inventory digest, descriptor-only mode, and validated exact
-generation/blob digest together with Hub's owner-manifest hash.  The private
-checker reparses the raw transcript,
+generation/blob digest together with Hub's owner-manifest hash.  A generation-
+zero transcript additionally binds the exact `LegacyGeneration0Binding@1`
+bytes/hash, `legacyGeneration0` admission, and canonical descriptor-absence
+proof.  The private checker reparses the raw transcript,
 recomputes every event hash, call count, comparison, required case, aggregate,
 transcript digest, and verdict, and rejects missing, duplicate, reordered,
 role-changed, authority-changed, or extra events.  Public projection includes
@@ -759,8 +775,56 @@ behavior-path tree digests remain distinct from any later attestation-pin
 commit, so adding the attestation cannot change what was claimed to have been
 evaluated.
 
-Generation consumes a user-supplied read-only copied-state root and never
-opens the live canonical path.  The copy manifest contains exactly three
+Before the current descriptor-less generation zero can be copied, the
+configured live owner must atomically mint one Hub-owned
+`LegacyGeneration0Binding@1`.  While holding the sole owner lock it requires a
+clean committed owner manifest at generation zero, native `idle` at generation
+zero, no WAL/recovery/dirty state, and no existing mismatched binding.  It opens
+the configured canonical and the existing V1 deterministic legacy-blob path as
+held no-follow regular single-link files, proves the canonical has no blob
+descriptor, streams their hashes, and revalidates identity/size/metadata after
+hashing.  The binding records version/generation, canonical hash and live
+`(dev, ino, mount-id)`, exact raw owner-manifest hash, blob format/size/hash and
+live identity, and the legacy naming-rule version.  Publication creates a
+mode-0600 temporary file with `O_CREAT | O_EXCL | O_NOFOLLOW`, performs a
+bounded complete write, `fdatasync`/`fsync`, re-reads and verifies its exact
+bytes/hash from the held FD, uses `renameat2(RENAME_NOREPLACE)`, and fsyncs the
+parent directory.  Any unsupported primitive or incomplete cleanup fails
+closed; an existing binding is idempotent only for byte-identical authority.
+Binding creation never writes canonical/blob and is
+disabled once a descriptor generation exists.  The copy is made from those
+same held descriptors before the owner lock is released and must reproduce the
+binding hashes.  Missing, rewritten, wrong-blob, dirty, descriptor-present, or
+generation-greater-than-zero legacy binding attempts fail closed.
+
+Binding crash recovery runs only under the same sole owner lock and recognizes
+one fixed same-directory mode-0600 temporary name.  An exact final binding is
+idempotent and the parent directory is re-synced.  When final is absent and the
+single temp is a current-user regular single-link file, owner reopens it no-
+follow, holds its identity, and freshly derives the expected binding from the
+still-held canonical/blob/manifest authority.  Exact complete bytes are file-
+synced and resume `RENAME_NOREPLACE` plus directory fsync.  A trusted partial
+or mismatched temp is first claimed by identity-preserving no-replace rename to
+a second fixed same-directory cleanup name, revalidated against the held FD,
+unlinked, directory-synced, and recreated.  Startup always reconciles final,
+then the fixed cleanup name, then the fixed temp name.  A cleanup entry is
+removable only when a held no-follow FD proves the reserved exact pathname is a
+current-user mode-0600 regular single-link file within the binding byte cap;
+it is identity-rechecked after a no-replace claim before unlink.  Because both
+reserved names are fixed, crash repetition cannot create an unbounded family
+of retired artifacts.  Any extra candidate, symlink, hard link, foreign owner,
+unexpected mode/type/identity, or failed claim is never deleted and requires
+operator intervention.  Startup and fault-injection tests kill after create,
+partial/full write, file sync, rename, and directory sync; each restart either
+publishes the one exact binding or safely resumes without an unbounded temp or
+payload leak.  The matrix also kills after temp-to-cleanup claim rename and
+after cleanup unlink, then proves restart converges with at most one reserved
+temp/cleanup artifact.
+
+Generation consumes a read-only copied-state root whose authority is the live
+descriptor generation or that owner-minted legacy binding; the user-supplied
+copy manifest never becomes the source of truth.  It never opens the live
+canonical path.  The copy manifest contains exactly three
 entries in canonical order (`canonical`, `ownerManifest`, `vectorBlob`), with
 normalized unique relative paths and descriptor fields tied to the named
 vector entry.  Before reading, the tool rejects the live path, symlinks,
@@ -768,8 +832,8 @@ non-regular files, unexpected hard links, any repeated held `(dev, ino)`, and
 any copy manifest whose resolved files escape that root; it revalidates held
 file identity and hashes after measurement.  Thus no two roles can alias the
 same copied inode and no copied role can alias the live canonical generation.
-The Hub driver obtains the exact live canonical, owner-manifest, and
-descriptor-selected vector-blob identities from the configured owner boundary,
+The Hub driver obtains the exact live canonical, owner-manifest, and either
+descriptor-selected or legacy-binding-selected vector-blob identities from the configured owner boundary,
 opens those three roles metadata-only with no-follow authority, and holds their
 `(dev, ino, mount-id)` capabilities until copied-root validation finishes.
 Every held copied role is compared against every held live role, not merely
