@@ -109,11 +109,13 @@ async function openPrivateSource(path, label, { singleLink = true } = {}) {
   return { path: absolute, realpath: resolvedPath, handle, device: held.dev, inode: held.ino, bytes: held.size, mtimeNs: held.mtimeNs };
 }
 
-async function copyPrivate(source, target, mode) {
+async function copyPrivate(source, target, mode, deadline) {
   const output = await open(target, 'wx', mode);
   const digest = createHash('sha256');
   try {
     for await (const chunk of source.handle.createReadStream({ autoClose: false })) {
+      if (terminationSignal) throw Object.assign(new Error(`terminated by ${terminationSignal}`), { code: 'TERMINATED' });
+      if (Date.now() >= deadline) throw Object.assign(new Error('overall benchmark deadline exceeded'), { code: 'OVERALL_DEADLINE' });
       digest.update(chunk);
       await output.write(chunk);
     }
@@ -409,20 +411,27 @@ async function main() {
   let workspace;
   try {
     const args = parseArgs(process.argv.slice(2));
+    const overallTimeoutMs = boundedInteger(args.overall_timeout_ms ?? DEFAULT_OVERALL_TIMEOUT_MS, 'overall-timeout-ms', { min: 1, max: MAX_OVERALL_TIMEOUT_MS });
+    const overallDeadline = Date.now() + overallTimeoutMs;
+    const checkDeadline = () => {
+      if (terminationSignal) throw Object.assign(new Error(`terminated by ${terminationSignal}`), { code: 'TERMINATED' });
+      if (Date.now() >= overallDeadline) throw Object.assign(new Error('overall benchmark deadline exceeded'), { code: 'OVERALL_DEADLINE' });
+    };
+    checkDeadline();
     const sourceDb = resolve(args.db);
     const sourceBlob = resolve(args.blob);
     const canonical = process.env.LITERATURE_HUB_CANONICAL_DB && resolve(process.env.LITERATURE_HUB_CANONICAL_DB);
     if (canonical && (sourceDb === canonical || sourceBlob === canonical)) usage('refusing configured canonical DB/blob');
     if (sourceDb.includes('/literature-hub/semantic/data/') || sourceBlob.includes('/literature-hub/semantic/data/')) usage('refusing Literature Hub live-data path; pass a copied snapshot');
     if (!existsSync(sourceDb) || !existsSync(sourceBlob)) usage('source DB and --blob must exist');
-    const dbSource = await openPrivateSource(sourceDb, 'source DB');
-    const blobSource = await openPrivateSource(sourceBlob, 'source blob');
+    const dbSource = await openPrivateSource(sourceDb, 'source DB'); checkDeadline();
+    const blobSource = await openPrivateSource(sourceBlob, 'source blob'); checkDeadline();
     const walPath = `${sourceDb.endsWith('.json') ? sourceDb.slice(0, -'.json'.length) : sourceDb}.agdb.wal`;
     if (existsSync(walPath)) usage('refusing source with WAL/recovery pending');
     const recoveryEntries = (await readdir(dirname(sourceDb))).filter((entry) => entry.includes('.recovery-') || entry.endsWith('.quarantine'));
     if (recoveryEntries.length > 0) usage(`refusing source recovery artifacts: ${recoveryEntries.join(', ')}`);
-    const oldSource = await openPrivateSource(args.old, 'old binary', { singleLink: false });
-    const newSource = await openPrivateSource(args.new, 'new binary', { singleLink: false });
+    const oldSource = await openPrivateSource(args.old, 'old binary', { singleLink: false }); checkDeadline();
+    const newSource = await openPrivateSource(args.new, 'new binary', { singleLink: false }); checkDeadline();
     if (gitSha(args.old) !== args.old_sha) usage(`old binary SHA mismatch: supplied ${args.old_sha}`);
     if (gitSha(args.new) !== args.new_sha) usage(`new binary SHA mismatch: supplied ${args.new_sha}`);
     workspace = await mkdtemp(join(tmpdir(), 'aira-vector-benchmark-'));
@@ -431,13 +440,13 @@ async function main() {
     const blob = join(workspace, basename(sourceBlob));
     const old = join(workspace, `old-${basename(args.old)}`);
     const newer = join(workspace, `new-${basename(args.new)}`);
-    const snapshotFiles = [await copyPrivate(dbSource, db, 0o600), await copyPrivate(blobSource, blob, 0o600)];
-    const binaryFiles = { old: await copyPrivate(oldSource, old, 0o700), new: await copyPrivate(newSource, newer, 0o700) };
+    const snapshotFiles = [await copyPrivate(dbSource, db, 0o600, overallDeadline), await copyPrivate(blobSource, blob, 0o600, overallDeadline)];
+    const binaryFiles = { old: await copyPrivate(oldSource, old, 0o700, overallDeadline), new: await copyPrivate(newSource, newer, 0o700, overallDeadline) };
     if ((oldSource.device === newSource.device && oldSource.inode === newSource.inode) || binaryFiles.old.sha256 === binaryFiles.new.sha256 || args.old_sha === args.new_sha) {
       usage('old and new binaries must differ by inode, binary hash, and source SHA');
     }
-    const oldManifest = await readBuildManifest(args.old, args.old_sha, binaryFiles.old.sha256);
-    const newManifest = await readBuildManifest(args.new, args.new_sha, binaryFiles.new.sha256);
+    const oldManifest = await readBuildManifest(args.old, args.old_sha, binaryFiles.old.sha256); checkDeadline();
+    const newManifest = await readBuildManifest(args.new, args.new_sha, binaryFiles.new.sha256); checkDeadline();
     const state = JSON.parse(await readFile(db, 'utf8'));
     const descriptorBlob = state.vectorBlob?.basename ? resolve(dirname(db), state.vectorBlob.basename) : null;
     if (descriptorBlob && dirname(descriptorBlob) !== dirname(db)) usage('vector blob descriptor must remain in private directory');
@@ -456,7 +465,6 @@ if (repetitions % 2 !== 0) usage('--repetitions must be even');
 const timeoutMs = boundedInteger(args.timeout_ms ?? REQUEST_TIMEOUT_MS, 'timeout-ms', { min: 1, max: MAX_TIMEOUT_MS });
 const startupTimeoutMs = boundedInteger(args.startup_timeout_ms ?? timeoutMs, 'startup-timeout-ms', { min: 1, max: MAX_TIMEOUT_MS });
 const sampleIntervalMs = boundedInteger(args.sample_interval_ms ?? DEFAULT_SAMPLE_INTERVAL_MS, 'sample-interval-ms', { min: 0, max: MAX_SAMPLE_INTERVAL_MS });
-const overallTimeoutMs = boundedInteger(args.overall_timeout_ms ?? DEFAULT_OVERALL_TIMEOUT_MS, 'overall-timeout-ms', { min: 1, max: MAX_OVERALL_TIMEOUT_MS });
 const topK = boundedInteger(args.top_k ?? 10, 'top-k', { min: 1, max: MAX_TOP_K });
 const queryVector = Array.from({ length: dimensions }, (_, index) => (index === 0 ? 1 : 0.001));
 const rpc = {
@@ -469,7 +477,6 @@ const rpc = {
   },
 };
 const request = { db, rpc };
-const overallDeadline = Date.now() + overallTimeoutMs;
 const unsampled = await runCounterbalanced({ old, new: newer }, request, repetitions, timeoutMs, true, startupTimeoutMs, 0, overallDeadline);
 const sampled = sampleIntervalMs === 0 ? unsampled : await runCounterbalanced({ old, new: newer }, request, repetitions, timeoutMs, true, startupTimeoutMs, sampleIntervalMs, overallDeadline);
 const oldResult = unsampled.old;
@@ -571,6 +578,8 @@ if (artifact.failures.length > 0 || parity.some((entry) => !entry.coldEqual || !
 
 main().catch((error) => {
   console.error(error.stack ?? error.message ?? String(error));
-  console.log(JSON.stringify({ schema: 'aira.native-vector-search-benchmark.v2', failures: [{ code: error.nativeError?.code ?? error.code ?? 'BENCHMARK_FAILED', message: error.nativeError?.message ?? error.message ?? String(error) }] }));
+  const code = error.nativeError?.code ?? error.code ?? 'BENCHMARK_FAILED';
+  const message = code === 'OVERALL_DEADLINE' ? 'overall benchmark deadline exceeded' : code === 'TERMINATED' ? 'benchmark terminated by signal' : code === 'NATIVE_RPC_FAILED' ? 'native RPC failed; see local stderr diagnostics' : 'benchmark failed; see local stderr diagnostics';
+  console.log(JSON.stringify({ schema: 'aira.native-vector-search-benchmark.v2', failures: [{ code, message }] }));
   process.exitCode = terminationSignal ? 128 + (terminationSignal === 'SIGINT' ? 2 : 15) : 1;
 });

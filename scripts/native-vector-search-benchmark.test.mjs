@@ -166,4 +166,5 @@ test('writes only stdout JSON, keeps sample-0 at zero, and reports paired failur
   const failed = await run(argsFor(f, ['--repetitions', '2', '--sample-interval-ms', '0', '--timeout-ms', '1000', '--startup-timeout-ms', '1000']));
   assert.notEqual(failed.code, 0);
   assert.ok(JSON.parse(failed.stdout).failures.length > 0);
+  assert.equal(failed.stdout.includes('/tmp/'), false);
 });
