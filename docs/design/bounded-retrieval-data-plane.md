@@ -106,7 +106,7 @@ The v15 parity ledger is explicit:
 | missing domain object for a vector hit | silently skipped | harden to integrity failure only after a copied-production audit proves zero; otherwise block rollout |
 | fact expansion population | all facts, including inactive | preserve |
 | entity normalization | ECMAScript `toLowerCase()` | move to one Synapse-owned helper with cross-language vectors; native operation implements that digest only |
-| expansion scoring | max matching seed-entity score times `0.3`, top 20 | preserve; all values explicit in the plan |
+| expansion scoring | `max(0, matching seed similarities)` times `0.3`, top 20 | preserve; the zero floor and all values are explicit in the plan |
 | expansion tie | snapshot-order stable sort | harden to fact id ascending after legacy JS adopts the same order |
 | seed score | any finite signed vector score | preserve; do not require nonnegative values |
 | PPR order and rank ties | incidental map/projection insertion order | harden to canonical order after legacy JS adopts it |
@@ -136,7 +136,7 @@ types, not an independently invented GraphDB shape.
 
 Synapse decides whether expansion applies and supplies:
 
-- normalized seed entity keys and their highest finite signed seed scores;
+- normalized seed entity keys and `max(0, matching finite seed similarities)`;
 - excluded seed fact ids;
 - explicit attenuation and result limit; and
 - the normalization-contract digest produced by the Synapse authority.
@@ -156,17 +156,22 @@ The shared reference and native use these canonical orders:
 
 - seed entries: node id ascending;
 - graph nodes: node id ascending;
-- outgoing edges: source id, target id, edge id ascending;
+- outgoing edges: source id, target id, then IEEE-754 weight total order;
 - floating-point accumulation: the above serial order with no parallel
   reduction or fused alternative;
 - ranked passages/entities: score descending, then node id ascending.
 
 Arithmetic follows current `SimplePPR`: only graph endpoint nodes exist; absent
-seeds are ignored; teleport is L1-normalized when its sum is positive and is
-uniform otherwise; non-dangling nodes distribute `(1-teleportProbability)` by
-normalized outgoing weight; dangling mass is dropped; schema targets above the
-degree threshold receive `1/log2(totalDegree+2)` damping; convergence uses L1
-delta after a complete iteration.
+seeds are ignored; the signed algebraic seed sum `S` is accumulated in node-id
+order, scores are divided by `S` when `S > 0`, and teleport is uniform when
+`S <= 0`; non-dangling nodes distribute `(1-teleportProbability)` by normalized
+outgoing weight; dangling mass is dropped; schema targets above the degree
+threshold receive `1/log2(totalDegree+2)` damping; convergence uses L1 delta
+after a complete iteration.  This is not absolute-value L1 normalization.
+`TransitionEntry` does not expose edge ids, so edge ids are deliberately absent
+from the canonical order.  Duplicate source/target/weight entries are
+arithmetically indistinguishable; no backend-specific insertion ordinal enters
+the contract.
 
 Cross-language golden tests require identical ids/ranks/iteration/convergence
 and finite scores within absolute `1e-12`; they do not claim bit identity across
@@ -184,9 +189,11 @@ generation and provide at least 2x count headroom while remaining below the
 owner cgroup headroom:
 
 - vector dimensions 4096; total vector comparisons 1,500,000;
+- at most 8 search slots; facts inspected 1,500,000;
 - graph nodes 1,500,000; graph edges 4,000,000; iterations 128;
 - search result limit 100 per slot; expansion results 64; seeds 512;
 - returned passages 100 and facts 100, combined objects 128;
+- complete input JSON-RPC line 256 KiB;
 - one encoded object 256 KiB; complete JSON-RPC line 2 MiB;
 - transient request memory 512 MiB; hard operation deadline 60 seconds.
 
@@ -203,14 +210,18 @@ adjacency.  This is part of steady-state PSS and is measured separately from
 per-request transient memory.  It must not duplicate domain text or vectors.
 
 Counters use checked integers.  Preflight counts reject a plan before work when
-the corpus cannot fit its requested/hard bound.  One unit is charged for each
-vector compared, fact inspected, node initialized per iteration, edge visited
-per iteration, and object considered for encoding.  Allocation checks cover
-both array capacity and bytes before allocation.  Response serialization uses
-borrowed typed objects and an upper-bounded writer; no full `serde_json::Value`
-result clone is allowed.  If one complete object cannot fit, the whole request
-fails with a response-limit error.  Bytes include the JSON-RPC envelope and
-newline.  No truncation or partial success is valid.
+the corpus cannot fit its requested/hard bound.  Aggregate work is exactly
+`vectorComparisons + factsInspected + iterations * (nodesInitialized +
+edgesVisited) + objectsConsideredForEncoding`; every multiplication and sum is
+checked before allocation/work.  `maxTransientBytes` is the checked sum of all
+request-owned vector/seed/result capacities, two PPR score arrays, heaps, and
+the response buffer; the immutable read catalog is steady-state memory and is
+reported separately.  Allocation checks cover both capacity and bytes before
+allocation.  Response serialization uses borrowed typed objects and an
+upper-bounded writer; no full `serde_json::Value` result clone is allowed.  If
+one complete object cannot fit, the whole request fails with a response-limit
+error.  Bytes include the JSON-RPC envelope and newline.  No truncation or
+partial success is valid.
 
 Version 1 promises a hard monotonic deadline, not immediate client
 cancellation.  Work checks the deadline at least every 1024 units and before
@@ -226,6 +237,11 @@ or a partial frame is synthesized by the owner/client from the existing native
 transport/death authority.  Every failure leaves canonical JSON, referenced
 blob, owner manifest generation, and WAL unchanged.
 
+The sole error-code authority is `AGDB-ERROR-CODES@1.0.0`.  The first contract
+change corrects its stale `INVALID_THRESHOLD` description to the exact vector
+primitive's finite `[-1,1]` domain and adds reviewed retry/failure metadata
+there, rather than defining operation-local codes.
+
 Central error behavior is:
 
 | Class | Retry policy |
@@ -237,10 +253,24 @@ Central error behavior is:
 | native death or OOM | open circuit immediately; owner fails closed; systemd start limit is the restart bound |
 
 Indexing infrastructure errors never consume the document-content failure
-budget, but that exemption is not an unlimited retry.  The worker records a
-separate durable infra-attempt timestamp/count, requeues the document once,
-exits, and relies on the bounded service start limit.  Repeated recovery/OOM
-opens an operator-visible circuit instead of a 30-second reload loop.
+budget, but that exemption is not an unlimited retry.  For v1, stale/lease loss
+gets one replay (2 total attempts) after 100 ms; deadline gets no replay.
+Recovery/durability opens an operator-reset circuit immediately.  Three
+owner/native death or OOM events in 10 minutes open a 10-minute circuit, and
+the tracked owner unit uses the same `StartLimitIntervalSec=10min` and
+`StartLimitBurst=3`.  A successful owner start plus 10 completed retrievals
+closes the timed circuit.  The worker records a separate durable infra event,
+requeues the document once, exits, and resets that document's infra state only
+after an exact generation commit.  It never increments the document-content
+failure counter.
+
+The bridge queue holds at most 8 requests, permits one active generation
+session, and gives a queued request 2 seconds to start.  Timeout returns 503.
+HTTP disconnect removes queued work before activation.  Once active, a
+disconnect is governed by the hard native/session deadline; v1 does not promise
+immediate cancellation.  Production session deadline is 8 seconds (below the
+10-second API caller budget); every bulk operation receives the remaining
+monotonic budget, never a fresh 8 seconds.
 
 ## Negative-test and rollout gates
 
@@ -250,6 +280,9 @@ Before typed operation implementation:
   error definitions so only this design remains authoritative;
 - land the Synapse `V15RetrievalPlan`/ordering helpers and cross-repository
   domain/parity fixtures without weakening its existing test gates;
+- replace the context-builder index zip with an id-keyed association shared by
+  legacy and bounded paths; treat this score/provenance correction as semantic
+  hardening and record copied-production rank/score changes before rollout;
 - test the exclusive `GenerationSession`: renewal ordering, lease loss,
   `finally` release, queued writer, and two simultaneous HTTP requests where
   only one session is active.
@@ -259,12 +292,17 @@ Before native algorithm wiring:
 - executable validator tests cover every type, unknown field, safe-generation
   boundary, signed/non-finite score, count/byte/allocation formula, operation
   digest, and limit at/above the boundary;
+- generation `MAX_SAFE-1 -> MAX_SAFE` commits once, while the next write is
+  rejected before manifest dirtying, WAL append, or native mutation; canonical
+  JSON, referenced blob, owner manifest, WAL, lock, and audit authority remain
+  byte-identical on rejection;
 - real `protocol_info` advertises each operation as read/WAL-free with the exact
   schema/limit digest;
 - real-native tests cover nonzero generation, stale generation,
   RecoveryPending, writer waiting across all three operations, deadline via
   fake monotonic clock, allocation failpoints, response budget, partial frame,
-  kill/OOM classification, and byte-invariant canonical/manifest/blob state.
+  kill/OOM classification, and byte-invariant canonical/manifest/blob/WAL
+  state.
 
 CI uses deterministic clock/counter/allocation seams.  A separate copied-state
 cgroup run measures actual PSS/RSS/VmSwap, p50/p95 latency, work counters,
