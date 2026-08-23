@@ -113,6 +113,26 @@ impl NativeProcess {
         self.stdin.take();
         self.child.wait().expect("native exits")
     }
+
+    #[cfg(target_os = "linux")]
+    fn rss_bytes(&self) -> u64 {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", self.child.id()))
+            .expect("read native VmRSS");
+        status
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next() == Some("VmRSS:")).then(|| {
+                    fields
+                        .next()
+                        .expect("VmRSS value")
+                        .parse::<u64>()
+                        .expect("VmRSS is numeric")
+                        * 1024
+                })
+            })
+            .expect("native VmRSS entry")
+    }
 }
 
 impl Drop for NativeProcess {
@@ -159,6 +179,28 @@ fn vector_search(id: u64, query_vector: [f64; 2]) -> Value {
             "threshold": 0.9,
             "topK": 10
         }
+    })
+}
+
+fn bulk_vector_upsert(id: u64, count: usize) -> Value {
+    let records = (0..count)
+        .map(|index| {
+            json!({
+                "id": format!("bulk-v-{index}"),
+                "corpusId": "c1",
+                "namespace": "default",
+                "values": [1.0, 0.0],
+                "metadata": {
+                    "documentId": format!("bulk-document-{index}"),
+                    "generation": "representative"
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "id": id,
+        "method": "vector_upsert",
+        "params": {"records": records}
     })
 }
 
@@ -1386,5 +1428,80 @@ fn mutation_preflight_does_not_clone_the_server_or_dispatch_a_clone() {
     assert!(
         !source.contains("server.clone().handle_prepared"),
         "mutation preflight must validate through the live server without cloning it"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repeated_small_mutations_have_delta_bounded_peak_rss_after_representative_state() {
+    const REPRESENTATIVE_VECTOR_COUNT: usize = 80_000;
+    const BASELINE_READS: usize = 32;
+    const SMALL_MUTATIONS: usize = 128;
+
+    let db = TempDb::new("rss-delta-bound");
+    let mut seed = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(seed.send(batch_begin(0))["ok"], json!(true));
+    assert_eq!(
+        seed.send(bulk_vector_upsert(1, REPRESENTATIVE_VECTOR_COUNT))["ok"],
+        json!(true)
+    );
+    assert_eq!(seed.send(batch_commit(2))["ok"], json!(true));
+    assert_eq!(seed.finish().code(), Some(0));
+
+    let state_bytes = std::fs::metadata(&db.path)
+        .expect("representative canonical state")
+        .len()
+        + std::fs::read(&db.path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+            .and_then(|state| {
+                state["vectorBlob"]["basename"]
+                    .as_str()
+                    .map(|name| db.dir.join(name))
+            })
+            .and_then(|blob| std::fs::metadata(blob).ok().map(|metadata| metadata.len()))
+            .unwrap_or(0);
+    assert!(
+        state_bytes > 8 * 1024 * 1024,
+        "representative state was too small for an ownership-boundary RSS gate: {state_bytes}"
+    );
+
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    let mut baseline_peak = native.rss_bytes();
+    for id in 0..BASELINE_READS {
+        let response = native.send(vector_search(10 + id as u64, [1.0, 0.0]));
+        assert_eq!(response["ok"], json!(true));
+        baseline_peak = baseline_peak.max(native.rss_bytes());
+    }
+
+    assert_eq!(native.send(batch_begin(100))["ok"], json!(true));
+    let mut mutation_peak = baseline_peak.max(native.rss_bytes());
+    for index in 0..SMALL_MUTATIONS {
+        let response = native.send(vector_upsert_for_document(
+            200 + index as u64,
+            &format!("delta-v-{index}"),
+            &format!("delta-document-{index}"),
+            [0.0, 1.0],
+            "delta",
+        ));
+        assert_eq!(response["ok"], json!(true), "small mutation {index}");
+        mutation_peak = mutation_peak.max(native.rss_bytes());
+    }
+    assert_eq!(native.finish().code(), Some(0));
+
+    let growth = mutation_peak.saturating_sub(baseline_peak);
+    let sample_delta = serde_json::to_vec(&vector_upsert_for_document(
+        0,
+        "delta-v-sample",
+        "delta-document-sample",
+        [0.0, 1.0],
+        "delta",
+    ))
+    .expect("serialize representative mutation")
+    .len() as u64;
+    let delta_budget = 16 * 1024 * 1024 + sample_delta * SMALL_MUTATIONS as u64 * 16;
+    assert!(
+        growth <= delta_budget,
+        "peak RSS grew with representative state rather than request delta: stateBytes={state_bytes} baselinePeak={baseline_peak} mutationPeak={mutation_peak} growth={growth} deltaBudget={delta_budget}"
     );
 }
