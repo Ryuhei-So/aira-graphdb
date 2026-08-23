@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(target_os = "linux")]
+use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -742,9 +744,7 @@ impl Server {
                 continue;
             };
             if stage == "wal_retire" {
-                if target == wal_file_name
-                    && Self::retired_wal_is_removable(&entry.path(), current_generation)?
-                {
+                if target == wal_file_name {
                     retired_wals.push(entry.path());
                 }
                 continue;
@@ -763,8 +763,11 @@ impl Server {
             }
         }
         for retired in retired_wals {
-            if Self::retired_wal_is_removable(&retired, current_generation)? {
-                fs::remove_file(retired)?;
+            if Self::cleanup_retired_wal_exact(
+                &retired,
+                &parent.join(&wal_path),
+                current_generation,
+            )? {
                 removed = true;
             }
         }
@@ -774,12 +777,51 @@ impl Server {
         Ok(())
     }
 
-    fn retired_wal_is_removable(path: &Path, current_generation: u64) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+        let source = CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+        let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+        })?;
+        // SAFETY: both C strings remain alive for the duration of renameat2.
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "exact WAL retirement requires atomic no-replace rename support",
+        ))
+    }
+
+    fn cleanup_retired_wal_exact(
+        path: &Path,
+        wal_path: &Path,
+        current_generation: u64,
+    ) -> io::Result<bool> {
         let path_metadata = fs::symlink_metadata(path)?;
         if !path_metadata.file_type().is_file() || Self::metadata_link_count(&path_metadata) != 1 {
             return Ok(false);
         }
-        let (raw, identity) = Self::read_regular_nofollow_with_identity(path)?;
+        let mut held = Self::open_regular_nofollow(path)?;
+        let identity = Self::metadata_identity(&held.metadata()?);
+        let mut raw = Vec::new();
+        held.read_to_end(&mut raw)?;
         let records = Self::parse_wal_records(&raw, current_generation)?;
         if records
             .iter()
@@ -789,7 +831,23 @@ impl Server {
                 "retired WAL contains a current or future generation",
             ));
         }
-        Self::validate_regular_path_identity(path, identity)?;
+        let claimed = Self::temporary_path(wal_path, "wal_retire")?;
+        Self::durability_pausepoint("before_startup_wal_retire_claim")?;
+        Self::rename_noreplace(path, &claimed)?;
+        Self::durability_pausepoint("after_startup_wal_retire_claim")?;
+        Self::validate_regular_path_identity(&claimed, identity)?;
+        held.seek(SeekFrom::Start(0))?;
+        let mut claimed_raw = Vec::new();
+        held.read_to_end(&mut claimed_raw)?;
+        if claimed_raw != raw {
+            return Err(io::Error::other(
+                "retired WAL content changed during startup cleanup",
+            ));
+        }
+        let parent = Self::parent_dir(wal_path);
+        Self::sync_parent_dir(&parent)?;
+        fs::remove_file(&claimed)?;
+        Self::sync_parent_dir(&parent)?;
         Ok(true)
     }
 
@@ -1284,7 +1342,7 @@ impl Server {
             return Err(io::Error::other("WAL content changed before retirement"));
         }
         let retired = Self::temporary_path(&self.wal_path, "wal_retire")?;
-        fs::rename(&self.wal_path, &retired)?;
+        Self::rename_noreplace(&self.wal_path, &retired)?;
         Self::validate_regular_path_identity(&retired, expected_identity)?;
         held_wal.seek(SeekFrom::Start(0))?;
         let mut held_after = Vec::new();
@@ -1579,7 +1637,7 @@ impl Server {
         Self::durability_failpoint("before_recovery_quarantine_rename").map_err(|err| {
             Self::execution_io_error(format!("quarantine recovery WAL failed: {err}"))
         })?;
-        fs::rename(&self.wal_path, &quarantine).map_err(|err| {
+        Self::rename_noreplace(&self.wal_path, &quarantine).map_err(|err| {
             Self::execution_io_error(format!("quarantine recovery WAL failed: {err}"))
         })?;
         let quarantine_metadata = Self::open_regular_nofollow(&quarantine)
@@ -3247,6 +3305,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_replace_rename_preserves_an_existing_destination() {
+        let source = temp_path("agdb-native-rename-source");
+        let destination = temp_path("agdb-native-rename-destination");
+        fs::write(&source, b"source").expect("write rename source");
+        fs::write(&destination, b"destination").expect("write rename destination");
+
+        let error = Server::rename_noreplace(&source, &destination)
+            .expect_err("no-replace rename must reject a destination collision");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+        assert_eq!(fs::read(&destination).unwrap(), b"destination");
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_file(destination);
     }
 
     fn begin_batch(server: &mut Server) {

@@ -769,6 +769,123 @@ fn startup_does_not_touch_wal_retire_symlink_or_hardlink_aliases() {
 
 #[cfg(unix)]
 #[test]
+fn startup_wal_retire_claim_rejects_path_swap_without_unlinking_replacement() {
+    let db = TempDb::new("retired-claim-path-swap");
+    seed_vector(&db.path);
+    let old_request = vector_upsert_for_document(1, "old-v", "old-document", [1.0, 0.0], "old");
+    let retired = recognized_wal_retire_path(&db, 10);
+    let retired_raw = encoded_wal_record(0, &old_request);
+    std::fs::write(&retired, &retired_raw).expect("write retired WAL candidate");
+    let saved = db.dir.join("saved-retired-wal");
+    let replacement = db.dir.join("replacement-retired-wal");
+    let replacement_raw = b"replacement-must-survive\n".to_vec();
+    std::fs::write(&replacement, &replacement_raw).expect("write replacement sentinel");
+    let marker = db.dir.join("before-retired-claim.marker");
+    let marker_value = marker.to_string_lossy().into_owned();
+
+    let swap_path = retired.clone();
+    let swap_saved = saved.clone();
+    let swap_replacement = replacement.clone();
+    let swap_marker = marker.clone();
+    let swapper = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !swap_marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native did not reach the startup WAL claim pausepoint"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::fs::rename(&swap_path, &swap_saved).expect("save validated retired WAL");
+        std::fs::rename(&swap_replacement, &swap_path).expect("install replacement inode");
+    });
+    let native = NativeProcess::spawn(
+        &db.path,
+        &[
+            (
+                "AGDB_NATIVE_TEST_PAUSE_POINT",
+                "before_startup_wal_retire_claim",
+            ),
+            ("AGDB_NATIVE_TEST_PAUSE_MS", "250"),
+            ("AGDB_NATIVE_TEST_PAUSE_MARKER", marker_value.as_str()),
+        ],
+    );
+    swapper.join().expect("WAL claim swapper exits");
+    assert_ne!(native.finish().code(), Some(0));
+    assert_eq!(std::fs::read(&saved).unwrap(), retired_raw);
+    let claimed = recognized_wal_retire_paths(&db);
+    assert_eq!(claimed.len(), 1, "replacement claim must be preserved");
+    assert_eq!(std::fs::read(&claimed[0]).unwrap(), replacement_raw);
+    assert_eq!(generation(&db.path), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_wal_retire_claim_rejects_same_inode_append_without_unlinking_payload() {
+    let db = TempDb::new("retired-claim-concurrent-append");
+    seed_vector(&db.path);
+    let old_request = vector_upsert_for_document(1, "old-v", "old-document", [1.0, 0.0], "old");
+    let retired = recognized_wal_retire_path(&db, 11);
+    let old_raw = encoded_wal_record(0, &old_request);
+    std::fs::write(&retired, &old_raw).expect("write retired WAL candidate");
+    let current_request = vector_upsert_for_document(2, "new-v", "new-document", [0.0, 1.0], "new");
+    let appended_raw = encoded_wal_record(1, &current_request);
+    let marker = db.dir.join("after-retired-claim.marker");
+    let marker_value = marker.to_string_lossy().into_owned();
+
+    let append_db = db.dir.clone();
+    let append_marker = marker.clone();
+    let append_bytes = appended_raw.clone();
+    let appender = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !append_marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native did not reach the post-claim pausepoint"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let claimed = std::fs::read_dir(&append_db)
+            .expect("read claimed WAL directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".wal_retire.") && name.ends_with(".tmp"))
+            })
+            .expect("claimed retired WAL exists");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&claimed)
+            .expect("open claimed WAL for concurrent append");
+        file.write_all(&append_bytes)
+            .expect("append current-generation WAL record");
+        file.sync_all().expect("sync concurrent append");
+    });
+    let native = NativeProcess::spawn(
+        &db.path,
+        &[
+            (
+                "AGDB_NATIVE_TEST_PAUSE_POINT",
+                "after_startup_wal_retire_claim",
+            ),
+            ("AGDB_NATIVE_TEST_PAUSE_MS", "250"),
+            ("AGDB_NATIVE_TEST_PAUSE_MARKER", marker_value.as_str()),
+        ],
+    );
+    appender.join().expect("WAL claim appender exits");
+    assert_ne!(native.finish().code(), Some(0));
+    let claimed = recognized_wal_retire_paths(&db);
+    assert_eq!(claimed.len(), 1, "changed claimed WAL must be preserved");
+    let mut expected = old_raw;
+    expected.extend_from_slice(&appended_raw);
+    assert_eq!(std::fs::read(&claimed[0]).unwrap(), expected);
+    assert_eq!(generation(&db.path), 1);
+}
+
+#[cfg(unix)]
+#[test]
 fn canonical_db_and_referenced_blob_aliases_fail_closed() {
     let db = TempDb::new("db-symlink");
     let real = db.dir.join("real.json");
