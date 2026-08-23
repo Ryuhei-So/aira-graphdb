@@ -1,0 +1,95 @@
+{
+  "spec_id": "AGDB-RETRIEVE-BOUNDED@1.0.0",
+  "protocol_version": "retrieve-bounded@1.0.0",
+  "method": "retrieve_bounded",
+  "classification": "read",
+  "wal": false,
+  "authority": "native-owner-committed-generation",
+  "request": {
+    "required": [
+      "corpusId",
+      "namespace",
+      "queryVector",
+      "topK",
+      "topM",
+      "maxIterations",
+      "maxVisitedNodes",
+      "maxVisitedEdges",
+      "maxWorkUnits",
+      "deadlineMs",
+      "maxResponseBytes"
+    ],
+    "optional": ["threshold"],
+    "finiteNumbers": ["queryVector", "threshold"],
+    "threshold": {
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "limits": {
+      "dimensions": {"minimum": 1, "maximum": 4096},
+      "topK": {"minimum": 1, "maximum": 10000},
+      "topM": {"minimum": 1, "maximum": 10000},
+      "maxIterations": {"minimum": 1, "maximum": 512},
+      "maxVisitedNodes": {"minimum": 1, "maximum": 200000},
+      "maxVisitedEdges": {"minimum": 1, "maximum": 500000},
+      "maxWorkUnits": {"minimum": 1, "maximum": 2000000},
+      "deadlineMs": {"minimum": 1, "maximum": 10000},
+      "maxResponseBytes": {"minimum": 1, "maximum": 1048576}
+    },
+    "unknownValues": "fail_closed_before_allocation_or_work"
+  },
+  "response": {
+    "required": [
+      "protocolVersion",
+      "generation",
+      "candidates",
+      "passages",
+      "facts",
+      "work"
+    ],
+    "generation": "one exact committed generation pinned for the complete request",
+    "materialization": "only bounded candidates, passages, and facts; never a full memory snapshot or projection",
+    "candidateItemRequired": ["id", "score", "metadata"],
+    "passageItemRequired": ["passageId", "documentId", "score", "text", "metadata"],
+    "factItemRequired": ["factId", "documentId", "score", "value", "metadata"],
+    "workRequired": [
+      "iterations",
+      "visitedNodes",
+      "visitedEdges",
+      "workUnits",
+      "elapsedMs",
+      "responseBytes"
+    ],
+    "ranking": {
+      "scoreOrder": "descending",
+      "tieBreakers": [
+        {"field": "id", "order": "ascending"},
+        {"field": "passageId", "order": "ascending"},
+        {"field": "factId", "order": "ascending"}
+      ],
+      "nonFiniteScores": "fail_closed"
+    }
+  },
+  "failureSemantics": {
+    "partialResponse": "forbidden",
+    "canonicalMutation": "forbidden",
+    "generationAdvance": "forbidden",
+    "recoveryPendingOrPartialGeneration": "fail_closed",
+    "timeoutCancellationNativeDeathOrOom": "fail_closed"
+  },
+  "errors": [
+    "INVALID_RETRIEVE_BOUNDED_REQUEST",
+    "RETRIEVE_BOUNDED_CAP_EXCEEDED",
+    "RETRIEVE_BOUNDED_UNAVAILABLE",
+    "RECOVERY_PENDING",
+    "RETRIEVE_BOUNDED_TIMEOUT"
+  ],
+  "goldenRanking": {
+    "candidateScores": [
+      {"id": "candidate-a", "score": 0.75},
+      {"id": "candidate-b", "score": 0.75},
+      {"id": "candidate-c", "score": 0.5}
+    ],
+    "expectedIds": ["candidate-a", "candidate-b", "candidate-c"]
+  }
+}
