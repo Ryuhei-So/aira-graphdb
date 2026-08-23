@@ -422,34 +422,67 @@ stable error classes only and never logs private values.  Public repositories
 pin only the generated public schema and exact public-attestation bytes.
 
 The artifact builder is not a public boundary that accepts caller-assembled
-comparison rows, case booleans, or behavioral observations.  Synapse owns one
-`V15ParityEvaluator` which selects the versioned fixture cases, invokes the
-evaluated legacy and candidate operations through typed read-only ports, and
-derives candidate, expansion, PPR, association, missing-object, absent-seed,
-signed-sum, dangling-loss, hub-damping, convergence, and tie-order traces from
-those calls.  Only that evaluator can call the internal builder.  A Hub driver
-may provide copied-state and exact-runtime operation ports, source metadata,
-and held manifest bytes; it cannot provide a precomputed trace, required-case
-map, verdict, or public-manifest digest.  Tests use instrumented ports to prove
-the evaluator issued every required call and that omitted, reordered,
-short-circuited, or substituted calls cannot produce an artifact.  The Linux
-copied-production gate then uses real base/candidate ports and records the
-operation-transcript digest and per-case call counts in the private artifact.
+comparison rows, case booleans, behavioral observations, or generic operation
+ports.  Synapse owns one `V15ParityEvaluator` which selects the versioned
+fixture cases and mints two isolated operation-runner processes from the exact
+base and candidate build capabilities described below.  The evaluator, not
+the Hub driver, assigns runner roles and verifies that the two process IDs,
+implementation commits, trees, and build digests are distinct where required.
+It rejects swapped roles, two roles connected to one process/build, an
+unattested implementation root, or a runner response whose authority handshake
+does not match the execution manifest.  Hub supplies only held copied-state
+capabilities and source bytes after both runners are authoritative and ready;
+it cannot provide a runner callback, precomputed trace, required-case map,
+verdict, or public-manifest digest.
+
+The evaluator derives candidate, expansion, PPR, association, missing-object,
+absent-seed, signed-sum, dangling-loss, hub-damping, convergence, and tie-order
+evidence from the actual runner requests and responses.  Only it can call the
+internal builder.  Unit tests use deliberately swapped, shared, fabricated,
+short-circuited, and hanging runner processes and require failure.  The Linux
+copied-production gate uses the same process path and records the complete
+private operation transcript rather than accepting a test-only port path as
+production evidence.
 
 Execution authority is established outside the checker before any private
-path is disclosed.  The Hub-owned bootstrap receives only public repository
-locations and expected commits, creates or selects clean detached checkouts,
-verifies commit existence, strict ancestry, tracked cleanliness, and tree
-digests, force-builds the checker from the candidate checkout, and launches
-the absolute script inside that same checkout.  Only after those checks pass
-does it provide copied-root, artifact, manifest, or fixture paths to the child.
-The child also compares its `import.meta.url` real path with the expected
-checkout as defense in depth, but an already-loaded checker never treats a
-caller-provided decoy checkout as proof of its own identity.  Bootstrap tests
-execute a checker from checkout A while presenting clean checkout B and require
-rejection before B receives any private path.  A stale incremental build and a
-modified ignored `dist` tree are also rejected or overwritten by a forced
-fresh emit before launch.
+path is disclosed.  The Hub repository pins a strict
+`V15ParityExecutionManifest@1`; command-line expected commits never override
+it.  The manifest names the Synapse base/candidate and GraphDB commits and tree
+digests, repository identities, package-lock and public-manifest byte hashes,
+the candidate-owned evaluator/adapter source paths, the exact build command
+argv, the absolute Node and npm-cli paths with file hashes and versions, the
+environment allowlist, and build/operation/overall deadlines.  The evaluated
+Hub driver commit and manifest hash are private-artifact fields.
+
+The Hub-owned bootstrap creates unique mode-0700 roots, materializes each exact
+commit without reused ignored files, verifies the extracted tracked tree,
+performs a lockfile-clean install and forced build in isolated dependency and
+output roots, and computes a canonical build manifest over every evaluator,
+adapter, implementation, and dependency file that can be loaded.  It invokes
+absolute runtime and tool paths with `PATH`, `NODE_OPTIONS`, preload/import
+hooks, package-manager configuration, and unrelated environment removed;
+only the manifest allowlist plus private temporary HOME/cache values exist.
+Dependency lifecycle scripts, when the locked build requires them, run under
+the same sanitized environment and deadline and cannot select an ambient
+runtime.  Source, lockfile, runtime/tool identity, and the complete build
+manifest are revalidated immediately before process launch and again before
+private-path disclosure.  Each runner then handshakes with a bootstrap nonce,
+role, process ID, implementation commit/tree, adapter commit, build-manifest
+hash, runtime hash/version, and supported protocol version.  The evaluator
+mints the role-bound capability only after exact handshake validation.
+
+The candidate evaluator and version-specific adapters are Synapse-owned; an
+adapter loads the named operation implementation only from its attested base
+or candidate build root.  Thus an older base commit need not contain the new
+adapter, but the imported legacy implementation bytes remain bound to that
+base commit and build manifest.  After both capabilities are minted, private
+copied-state handles and fixture bytes are sent over the already-established
+bounded protocol, not exposed in the child argv or before authority readiness.
+The child also checks its executable/module real paths against its build
+manifest as defense in depth.  Bootstrap negatives execute checkout A while
+presenting clean checkout B, swap role handshakes, alias both roles to one
+process, modify `node_modules` or a build output, set `NODE_OPTIONS`, and mutate
+source after verification; each must fail before a private handle is sent.
 
 The source fields and CI inputs are named by lifecycle, not by an ambiguous
 `toolSha`.  The detailed private artifact records
@@ -479,12 +512,34 @@ checker reserializes a parsed manifest, detailed artifact, or public
 attestation and requires byte equality before hashing it.  This avoids both a
 self-hash field and a second ad-hoc canonical-JSON implementation.
 
-All Git/source-authority subprocesses have an explicit monotonic deadline,
-bounded stdout and stderr, and process-group termination and reap on timeout.
-A timeout is a stable fail-closed source-authority error and never a partial
-success.  Hosted CI runs the parity schema, evaluator, bootstrap, and CLI
-negative suites on both Node 22 and the supported production Node 24 runtime;
-Unicode-only Node 24 coverage is not sufficient for this boundary.
+Every Git, dependency-install, build, evaluator, adapter, and base/candidate
+operation subprocess has an explicit monotonic deadline, bounded stdin/stdout/
+stderr, and its own process group.  The execution manifest pins positive
+deadlines no greater than 30 seconds for source-authority commands, 15 minutes
+per install/build, 2 minutes per operation, and 45 minutes overall.  The
+overall deadline is never reset by a successful sub-operation.  Timeout or
+output overflow sends TERM then bounded KILL to the process group, waits for
+close/reap, and returns a stable fail-closed class; it never becomes a partial
+success.  Hang and forked-child tests prove no runner remains and no later
+artifact can be published.  Hosted CI runs the parity schema, evaluator,
+bootstrap, and CLI negative suites on both Node 22 and the supported production
+Node 24 runtime; Unicode-only Node 24 coverage is not sufficient for this
+boundary.
+
+The private artifact contains a canonical `V15ParityExecutionTranscript@1`,
+not only a caller-provided digest.  Each bounded event has consecutive
+`ordinal`, closed `caseId`, exact `role` (`base` or `candidate`), runner process
+and build authority, closed operation name, canonical request payload, and
+exactly one canonical success response or stable error class; it contains no
+timestamps or ambient paths.  Request/response byte hashes are derived from
+those payloads.  The transcript header binds the execution-manifest hash,
+copied-generation manifest hash, fixture hash, evaluator commit/build digest,
+and both runner handshakes.  The private checker reparses the raw transcript,
+recomputes every event hash, call count, comparison, required case, aggregate,
+transcript digest, and verdict, and rejects missing, duplicate, reordered,
+role-changed, authority-changed, or extra events.  Public projection includes
+only the detailed-artifact hash and already-defined redacted aggregate; it does
+not expose the private transcript.
 
 Comparison evidence is derived, not declared.  Each result list has unique
 IDs, ranks exactly `1..N`, array order equal to rank order, finite scores, and
