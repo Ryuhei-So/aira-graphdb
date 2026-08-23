@@ -5,19 +5,21 @@ import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import test from 'node:test';
+import { createHash } from 'node:crypto';
 
 const exec = promisify(execFile);
 const script = new URL('./native-vector-search-benchmark.mjs', import.meta.url).pathname;
 
-async function fixture({ descriptor = false } = {}) {
+async function fixture({ descriptor = true, descriptorSize, descriptorSha } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'aira-bench-test-'));
   const db = join(directory, 'snapshot.json');
   const blob = join(directory, 'snapshot.vblob');
   const old = join(directory, 'old-native');
   const newer = join(directory, 'new-native');
-  const state = descriptor ? { generation: 1, vectorBlob: { basename: 'snapshot.vblob', size: 7, sha256: 'x', format: 1 } } : { generation: 0, vectors: {} };
-  await writeFile(db, JSON.stringify(state));
   await writeFile(blob, 'vectors');
+  const blobSha = createHash('sha256').update('vectors').digest('hex');
+  const state = descriptor ? { generation: 1, vectorBlob: { basename: 'snapshot.vblob', size: descriptorSize ?? 7, sha256: descriptorSha ?? blobSha, format: 1 } } : { generation: 0, vectors: {} };
+  await writeFile(db, JSON.stringify(state));
   const native = '#!/bin/sh\nwhile IFS= read -r line; do printf \'{"ok":true,"result":[]}\\n\'; done\n';
   await writeFile(old, native); await writeFile(newer, native);
   await chmod(old, 0o700); await chmod(newer, 0o700);
@@ -62,11 +64,23 @@ test('rejects symlink/hardlink sources and WAL before native execution', async (
 });
 
 test('rejects descriptor/blob mismatch and SHA mismatch', async () => {
-  const f = await fixture({ descriptor: true });
-  const wrong = join(f.directory, 'wrong.vblob');
+  const sizeMismatch = await fixture({ descriptorSize: 6 });
+  assert.notEqual((await run(argsFor(sizeMismatch))).code, 0);
+  const hashMismatch = await fixture({ descriptorSha: '0'.repeat(64) });
+  assert.notEqual((await run(argsFor(hashMismatch))).code, 0);
+  const wrongName = await fixture();
+  const wrong = join(wrongName.directory, 'wrong.vblob');
   await writeFile(wrong, 'wrong');
-  assert.notEqual((await run(argsFor({ ...f, blob: wrong }))).code, 0);
-  assert.notEqual((await run(argsFor(f, ['--old-sha', 'wrong']))).code, 0);
+  assert.notEqual((await run(argsFor({ ...wrongName, blob: wrong }))).code, 0);
+  assert.notEqual((await run(argsFor(wrongName, ['--old-sha', 'wrong']))).code, 0);
+});
+
+test('rejects legacy generations and unbounded request parameters', async () => {
+  const legacy = await fixture({ descriptor: false });
+  assert.notEqual((await run(argsFor(legacy))).code, 0);
+  const f = await fixture();
+  assert.notEqual((await run(argsFor(f, ['--dimensions', '999999999999999999999']))).code, 0);
+  assert.notEqual((await run(argsFor(f, ['--top-k', '100000000']))).code, 0);
 });
 
 test('writes only stdout JSON, keeps sample-0 at zero, and reports paired failures nonzero', async () => {
@@ -76,8 +90,7 @@ test('writes only stdout JSON, keeps sample-0 at zero, and reports paired failur
   const artifact = JSON.parse(result.stdout);
   assert.equal(artifact.sampling.sampleCount.old, 0);
   assert.equal(artifact.sampling.sampleCount.new, 0);
-  assert.equal(artifact.sampling.sampleCount.unsampledOld, 0);
-  assert.equal(artifact.sampling.sampleCount.unsampledNew, 0);
+  assert.equal(artifact.sampledPhaseExecuted, false);
   assert.equal(Object.keys(artifact).includes('out'), false);
 
   const hardBinary = join(f.directory, 'old-hardlink-native');

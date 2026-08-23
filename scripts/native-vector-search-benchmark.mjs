@@ -11,6 +11,17 @@ const DEFAULT_DIMENSIONS = 1024;
 const DEFAULT_REPETITIONS = 4;
 const REQUEST_TIMEOUT_MS = 300_000;
 const DEFAULT_SAMPLE_INTERVAL_MS = 250;
+const MAX_DIMENSIONS = 4096;
+const MAX_TOP_K = 10_000;
+const MAX_TIMEOUT_MS = 3_600_000;
+const MAX_SAMPLE_INTERVAL_MS = 60_000;
+const MAX_REPETITIONS = 32;
+
+function boundedInteger(value, name, { min, max }) {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) usage(`${name} must be a safe integer in [${min}, ${max}]`);
+  return parsed;
+}
 
 function usage(message) {
   const details = [
@@ -384,20 +395,22 @@ async function main() {
     const snapshotFiles = [await copyPrivate(dbSource, db, 0o600), await copyPrivate(blobSource, blob, 0o600)];
     const binaryFiles = { old: await copyPrivate(oldSource, old, 0o700), new: await copyPrivate(newSource, newer, 0o700) };
     const state = JSON.parse(await readFile(db, 'utf8'));
-    const adjacentBlob = db.endsWith('.json') ? `${db.slice(0, -'.json'.length)}.vblob` : `${db}.vblob`;
     const descriptorBlob = state.vectorBlob?.basename ? resolve(dirname(db), state.vectorBlob.basename) : null;
     if (descriptorBlob && dirname(descriptorBlob) !== dirname(db)) usage('vector blob descriptor must remain in private directory');
-    if (descriptorBlob && descriptorBlob !== blob) usage(`--blob does not match generation descriptor: ${basename(descriptorBlob)}`);
-    if (!descriptorBlob && blob !== adjacentBlob) usage(`legacy --blob must be adjacent to private DB: ${basename(adjacentBlob)}`);
+    if (!descriptorBlob) usage('atomic-generation benchmark requires a vectorBlob descriptor; legacy snapshots are rejected');
+    if (descriptorBlob !== blob) usage(`--blob does not match generation descriptor: ${basename(descriptorBlob)}`);
+    if (state.vectorBlob.size !== snapshotFiles[1].bytes || state.vectorBlob.sha256 !== snapshotFiles[1].sha256) {
+      usage('private vectorBlob descriptor size/sha256 does not match copied blob');
+    }
     const snapshotHash = sha256Bytes(snapshotFiles.map((file) => `${basename(file.path)}:${file.sha256}\n`).join(''));
 
-const dimensions = Number(args.dimensions ?? DEFAULT_DIMENSIONS);
-const repetitions = Number(args.repetitions ?? DEFAULT_REPETITIONS);
-if (!Number.isInteger(repetitions) || repetitions < 2 || repetitions % 2 !== 0) usage('--repetitions must be an even integer >= 2');
-const timeoutMs = Number(args.timeout_ms ?? REQUEST_TIMEOUT_MS);
-const startupTimeoutMs = Number(args.startup_timeout_ms ?? timeoutMs);
-const sampleIntervalMs = Number(args.sample_interval_ms ?? DEFAULT_SAMPLE_INTERVAL_MS);
-if (!Number.isInteger(sampleIntervalMs) || sampleIntervalMs < 0) usage('--sample-interval-ms must be >= 0');
+const dimensions = boundedInteger(args.dimensions ?? DEFAULT_DIMENSIONS, 'dimensions', { min: 1, max: MAX_DIMENSIONS });
+const repetitions = boundedInteger(args.repetitions ?? DEFAULT_REPETITIONS, 'repetitions', { min: 2, max: MAX_REPETITIONS });
+if (repetitions % 2 !== 0) usage('--repetitions must be even');
+const timeoutMs = boundedInteger(args.timeout_ms ?? REQUEST_TIMEOUT_MS, 'timeout-ms', { min: 1, max: MAX_TIMEOUT_MS });
+const startupTimeoutMs = boundedInteger(args.startup_timeout_ms ?? timeoutMs, 'startup-timeout-ms', { min: 1, max: MAX_TIMEOUT_MS });
+const sampleIntervalMs = boundedInteger(args.sample_interval_ms ?? DEFAULT_SAMPLE_INTERVAL_MS, 'sample-interval-ms', { min: 0, max: MAX_SAMPLE_INTERVAL_MS });
+const topK = boundedInteger(args.top_k ?? 10, 'top-k', { min: 1, max: MAX_TOP_K });
 const queryVector = Array.from({ length: dimensions }, (_, index) => (index === 0 ? 1 : 0.001));
 const rpc = {
   method: 'vector_search',
@@ -405,14 +418,14 @@ const rpc = {
     corpusId: args.corpus ?? 'libfull',
     namespace: args.namespace ?? 'fact',
     queryVector,
-    topK: Number(args.top_k ?? 10),
+    topK,
   },
 };
 const request = { db, rpc };
-const sampled = await runCounterbalanced({ old, new: newer }, request, repetitions, timeoutMs, true, startupTimeoutMs, sampleIntervalMs);
 const unsampled = await runCounterbalanced({ old, new: newer }, request, repetitions, timeoutMs, true, startupTimeoutMs, 0);
-const oldResult = sampled.old;
-const newResult = sampled.new;
+const sampled = sampleIntervalMs === 0 ? unsampled : await runCounterbalanced({ old, new: newer }, request, repetitions, timeoutMs, true, startupTimeoutMs, sampleIntervalMs);
+const oldResult = unsampled.old;
+const newResult = unsampled.new;
 let snapshotStable = true;
 let snapshotRevalidationError = null;
 try {
@@ -450,16 +463,17 @@ const artifact = {
   snapshotStable,
   rpc,
   repetitions: { old: repetitions, new: repetitions },
-  executionOrder: sampled.executionOrder,
-  unsampledExecutionOrder: unsampled.executionOrder,
-  orderDefinition: 'counterbalanced by repetition: old,new then new,old; both binaries use the same copied snapshot and sampler settings',
+  executionOrder: unsampled.executionOrder,
+  sampledExecutionOrder: sampled.executionOrder,
+  orderDefinition: 'both phases are counterbalanced by repetition: old,new then new,old; unsampled is the primary latency phase and sampled is the memory phase',
   timeoutMs,
   startupTimeoutMs,
   sampleIntervalMs,
+  sampledPhaseExecuted: sampleIntervalMs !== 0,
   preload: true,
   timingDefinition: {
     preload: 'fresh native process ping; includes process startup and full snapshot load, elapsed from ping write until response line',
-    cold: 'process-preloaded first retrieval: elapsed from vector_search request write until response line after a completed ping; this is not a page-cache-cold claim',
+    cold: 'primary unsampled process-preloaded first retrieval; not a page-cache-cold claim',
     warm: 'same native process immediately after cold response; elapsed from vector_search request write until response line',
     p50: 'nearest-rank percentile over repetition wall-clock samples',
     p95: 'nearest-rank percentile over repetition wall-clock samples',
@@ -468,13 +482,11 @@ const artifact = {
   sampling: {
     intervalMs: sampleIntervalMs,
     sampleCount: {
-      old: oldResult.sampleCount,
-      new: newResult.sampleCount,
-      unsampledOld: unsampled.old.sampleCount,
-      unsampledNew: unsampled.new.sampleCount,
+      old: sampled.old.sampleCount,
+      new: sampled.new.sampleCount,
     },
-    noSamplingControl: sampleIntervalMs === 0,
-    overhead: 'sampling reads are included in the benchmark process and are deliberately disabled with --sample-interval-ms 0 for a counterfactual control; timings must be compared using the same setting',
+    noSamplingControl: true,
+    overhead: 'primary latency is measured in the unsampled phase; sampled memory results are a separate counterbalanced phase and must not be compared for cross-phase timing or page-cache order',
   },
   binaries: {
     source: {
@@ -484,10 +496,10 @@ const artifact = {
     old: { ...publicResult(oldResult), gitSha: args.old_sha },
     new: { ...publicResult(newResult), gitSha: args.new_sha },
   },
-  unsampled: { old: unsampled.old, new: unsampled.new },
+  sampled: { old: publicResult(sampled.old), new: publicResult(sampled.new) },
   parity,
   unsampledParity,
-  failures: [snapshotRevalidationError, ...[oldResult, newResult, unsampled.old, unsampled.new].flatMap((result, binaryIndex) => result.parity.flatMap((run, repetition) => {
+  failures: [snapshotRevalidationError, ...[oldResult, newResult, sampled.old, sampled.new].flatMap((result, binaryIndex) => result.parity.flatMap((run, repetition) => {
     const failures = [];
     for (const phase of ['preload', 'cold', 'warm']) {
       if (run[phase] && run[phase].ok === false) failures.push({ binary: binaryIndex % 2 === 0 ? 'old' : 'new', repetition: repetition + 1, phase, error: run[phase].error });
