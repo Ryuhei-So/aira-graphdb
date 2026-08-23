@@ -739,6 +739,95 @@ fn unsupported_noreplace_fails_before_loading_or_mutating_canonical_state() {
 }
 
 #[test]
+fn oversized_or_corrupt_probe_artifacts_fail_bounded_without_deletion() {
+    for label in ["oversized", "corrupt"] {
+        let db = TempDb::new(&format!("probe-bounded-{label}"));
+        seed_vector(&db.path);
+        let canonical_before = std::fs::read(&db.path).expect("canonical before bad probe");
+        let artifact = db.dir.join(format!(
+            ".state.json.rename_probe.0123456789abcdef0123456789abcdef.{}.tmp",
+            if label == "oversized" { 21 } else { 22 }
+        ));
+        if label == "oversized" {
+            let file = std::fs::File::create(&artifact).expect("create sparse probe artifact");
+            file.set_len(1_u64 << 40)
+                .expect("size sparse probe artifact");
+        } else {
+            std::fs::write(&artifact, b"not-a-probe").expect("write corrupt probe artifact");
+        }
+        let started = std::time::Instant::now();
+        let native = NativeProcess::spawn(&db.path, &[]);
+        assert_ne!(native.finish().code(), Some(0), "{label} startup succeeded");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{label} probe rejection was not bounded"
+        );
+        assert!(artifact.exists(), "{label} artifact was deleted");
+        if label == "oversized" {
+            assert_eq!(std::fs::metadata(&artifact).unwrap().len(), 1_u64 << 40);
+        } else {
+            assert_eq!(std::fs::read(&artifact).unwrap(), b"not-a-probe");
+        }
+        assert_eq!(std::fs::read(&db.path).unwrap(), canonical_before);
+        assert_eq!(generation(&db.path), 1);
+    }
+}
+
+#[test]
+fn normal_probe_cleanup_rejects_post_validation_path_swap_without_unlinking() {
+    let db = TempDb::new("probe-owned-cleanup-swap");
+    seed_vector(&db.path);
+    let canonical_before = std::fs::read(&db.path).expect("canonical before probe swap");
+    let marker = db.dir.join("before-probe-cleanup.marker");
+    let marker_value = marker.to_string_lossy().into_owned();
+    let replacement = db.dir.join("probe-cleanup-replacement");
+    let replacement_raw = b"replacement-must-survive".to_vec();
+    std::fs::write(&replacement, &replacement_raw).expect("write replacement sentinel");
+    let saved = db.dir.join("saved-owned-probe");
+    let swap_dir = db.dir.clone();
+    let swap_marker = marker.clone();
+    let swap_replacement = replacement.clone();
+    let swap_saved = saved.clone();
+    let (path_sender, path_receiver) = std::sync::mpsc::channel();
+    let swapper = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !swap_marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native did not reach normal probe cleanup pausepoint"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let owned = std::fs::read_dir(&swap_dir)
+            .expect("read probe directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| std::fs::read(path).is_ok_and(|raw| raw == b"collision-source"))
+            .expect("owned collision probe path");
+        std::fs::rename(&owned, &swap_saved).expect("save owned probe inode");
+        std::fs::rename(&swap_replacement, &owned).expect("install replacement probe inode");
+        path_sender.send(owned).expect("report swapped probe path");
+    });
+    let native = NativeProcess::spawn(
+        &db.path,
+        &[
+            (
+                "AGDB_NATIVE_TEST_PAUSE_POINT",
+                "before_noreplace_probe_cleanup",
+            ),
+            ("AGDB_NATIVE_TEST_PAUSE_MS", "250"),
+            ("AGDB_NATIVE_TEST_PAUSE_MARKER", marker_value.as_str()),
+        ],
+    );
+    swapper.join().expect("normal probe cleanup swapper exits");
+    let swapped = path_receiver.recv().expect("receive swapped probe path");
+    assert_ne!(native.finish().code(), Some(0));
+    assert_eq!(std::fs::read(&swapped).unwrap(), replacement_raw);
+    assert_eq!(std::fs::read(&saved).unwrap(), b"collision-source");
+    assert_eq!(std::fs::read(&db.path).unwrap(), canonical_before);
+}
+
+#[test]
 fn repeated_probe_kill_and_failure_seams_keep_artifacts_bounded_and_recover() {
     for stage in [
         "after_noreplace_probe_source_create",
@@ -797,7 +886,7 @@ fn repeated_probe_orphan_cleanup_kills_rename_without_growing_artifacts() {
         let orphan = db
             .dir
             .join(".state.json.rename_probe.0123456789abcdef0123456789abcdef.99.tmp");
-        std::fs::write(&orphan, b"partial-probe").expect("write probe orphan");
+        std::fs::write(&orphan, b"move-").expect("write partial probe orphan");
         let iterations = if stage == "after_rename_probe_cleanup_unlink" {
             1
         } else {

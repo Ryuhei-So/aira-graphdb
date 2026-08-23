@@ -674,6 +674,10 @@ impl Server {
         )
     }
 
+    const PROBE_MOVE_PAYLOAD: &'static [u8] = b"move-source";
+    const PROBE_COLLISION_PAYLOAD: &'static [u8] = b"collision-source";
+    const PROBE_MAX_PAYLOAD_LEN: u64 = 16;
+
     fn temporary_path(target: &Path, stage: &str) -> io::Result<PathBuf> {
         if !Self::is_durable_temp_stage(stage) {
             return Err(io::Error::other(format!(
@@ -822,19 +826,22 @@ impl Server {
         let parent = Self::parent_dir(db_path);
         let source = Self::temporary_path(db_path, "rename_probe")?;
         let destination = Self::temporary_path(db_path, "rename_probe")?;
-        let create_probe = |path: &Path, bytes: &[u8]| -> io::Result<()> {
+        let create_probe = |path: &Path, bytes: &[u8]| -> io::Result<(u64, u64)> {
             let mut options = fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
             let mut file = options.open(path)?;
             file.write_all(bytes)?;
-            file.sync_all()
+            file.sync_all()?;
+            Ok(Self::metadata_identity(&file.metadata()?))
         };
+        let mut source_authority: Option<((u64, u64), Vec<u8>)> = None;
+        let mut destination_authority: Option<((u64, u64), Vec<u8>)> = None;
         let result = (|| -> io::Result<()> {
-            create_probe(&source, b"move-source")?;
+            let source_identity = create_probe(&source, Self::PROBE_MOVE_PAYLOAD)?;
+            source_authority = Some((source_identity, Self::PROBE_MOVE_PAYLOAD.to_vec()));
             Self::durability_failpoint("after_noreplace_probe_source_create")?;
-            let source_identity = Self::metadata_identity(&fs::symlink_metadata(&source)?);
             Self::sync_parent_dir(&parent)?;
             Self::durability_failpoint("after_noreplace_probe_source_dir_fsync")?;
             let move_result =
@@ -855,17 +862,22 @@ impl Server {
                     ),
                 )
             })?;
+            source_authority = None;
+            destination_authority = Some((source_identity, Self::PROBE_MOVE_PAYLOAD.to_vec()));
             Self::durability_failpoint("after_noreplace_probe_move")?;
-            if source.exists()
-                || !fs::read(&destination).is_ok_and(|raw| raw == b"move-source")
-                || Self::metadata_identity(&fs::symlink_metadata(&destination)?) != source_identity
-            {
+            if source.exists() {
                 return Err(io::Error::other(
-                    "atomic no-replace move probe did not preserve source identity and content",
+                    "atomic no-replace move probe left the source path present",
                 ));
             }
+            Self::validate_owned_probe_path(
+                &destination,
+                source_identity,
+                Self::PROBE_MOVE_PAYLOAD,
+            )?;
 
-            create_probe(&source, b"collision-source")?;
+            let collision_identity = create_probe(&source, Self::PROBE_COLLISION_PAYLOAD)?;
+            source_authority = Some((collision_identity, Self::PROBE_COLLISION_PAYLOAD.to_vec()));
             Self::durability_failpoint("after_noreplace_probe_collision_source_create")?;
             Self::sync_parent_dir(&parent)?;
             Self::durability_failpoint("after_noreplace_probe_collision_dir_fsync")?;
@@ -878,30 +890,40 @@ impl Server {
                 }
                 Err(err) => return Err(err),
             }
-            if !fs::read(&source).is_ok_and(|raw| raw == b"collision-source")
-                || !fs::read(&destination).is_ok_and(|raw| raw == b"move-source")
-            {
-                return Err(io::Error::other(
-                    "atomic no-replace probe altered a collision target",
-                ));
-            }
+            Self::validate_owned_probe_path(
+                &source,
+                collision_identity,
+                Self::PROBE_COLLISION_PAYLOAD,
+            )?;
+            Self::validate_owned_probe_path(
+                &destination,
+                source_identity,
+                Self::PROBE_MOVE_PAYLOAD,
+            )?;
             Ok(())
         })();
-        let source_cleanup = match fs::remove_file(&source) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
-        };
-        let destination_cleanup = match fs::remove_file(&destination) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
-        };
+        Self::durability_pausepoint("before_noreplace_probe_cleanup")?;
+        let mut cleanup_error = None;
+        if let Some((identity, raw)) = source_authority {
+            if let Err(err) =
+                Self::cleanup_owned_rename_probe_exact(&source, db_path, identity, &raw)
+            {
+                cleanup_error = Some(err);
+            }
+        }
+        if let Some((identity, raw)) = destination_authority {
+            if let Err(err) =
+                Self::cleanup_owned_rename_probe_exact(&destination, db_path, identity, &raw)
+            {
+                cleanup_error.get_or_insert(err);
+            }
+        }
         Self::durability_failpoint("after_noreplace_probe_cleanup_unlink")?;
         Self::sync_parent_dir(&parent)?;
         Self::durability_failpoint("after_noreplace_probe_cleanup_dir_fsync")?;
-        source_cleanup?;
-        destination_cleanup?;
+        if let Some(err) = cleanup_error {
+            return Err(err);
+        }
         result
     }
 
@@ -929,23 +951,53 @@ impl Server {
         Ok(())
     }
 
-    fn cleanup_rename_probe_exact(path: &Path, db_path: &Path) -> io::Result<()> {
-        let metadata = fs::symlink_metadata(path)?;
-        if !metadata.file_type().is_file() || Self::metadata_link_count(&metadata) != 1 {
-            return Ok(());
+    fn read_bounded_probe_payload(file: &mut fs::File) -> io::Result<Vec<u8>> {
+        if file.metadata()?.len() > Self::PROBE_MAX_PAYLOAD_LEN {
+            return Err(io::Error::other("rename probe artifact exceeds size limit"));
         }
+        file.seek(SeekFrom::Start(0))?;
+        let mut raw = Vec::with_capacity(Self::PROBE_MAX_PAYLOAD_LEN as usize);
+        file.take(Self::PROBE_MAX_PAYLOAD_LEN + 1)
+            .read_to_end(&mut raw)?;
+        if raw.len() as u64 > Self::PROBE_MAX_PAYLOAD_LEN
+            || (!Self::PROBE_MOVE_PAYLOAD.starts_with(&raw)
+                && !Self::PROBE_COLLISION_PAYLOAD.starts_with(&raw))
+        {
+            return Err(io::Error::other(
+                "rename probe artifact has invalid bounded payload",
+            ));
+        }
+        Ok(raw)
+    }
+
+    fn validate_owned_probe_path(
+        path: &Path,
+        expected_identity: (u64, u64),
+        expected_raw: &[u8],
+    ) -> io::Result<()> {
         let mut held = Self::open_regular_nofollow(path)?;
-        let identity = Self::metadata_identity(&held.metadata()?);
-        let mut raw = Vec::new();
-        held.read_to_end(&mut raw)?;
+        if Self::metadata_identity(&held.metadata()?) != expected_identity
+            || Self::read_bounded_probe_payload(&mut held)? != expected_raw
+        {
+            return Err(io::Error::other(
+                "atomic no-replace probe changed an owned inode",
+            ));
+        }
+        Ok(())
+    }
+
+    fn claim_and_remove_probe_exact(
+        path: &Path,
+        db_path: &Path,
+        mut held: fs::File,
+        identity: (u64, u64),
+        raw: &[u8],
+    ) -> io::Result<()> {
         let claimed = Self::temporary_path(db_path, "rename_probe")?;
         Self::rename_noreplace(path, &claimed)?;
         Self::durability_failpoint("after_rename_probe_cleanup_claim")?;
         Self::validate_regular_path_identity(&claimed, identity)?;
-        held.seek(SeekFrom::Start(0))?;
-        let mut claimed_raw = Vec::new();
-        held.read_to_end(&mut claimed_raw)?;
-        if claimed_raw != raw {
+        if Self::read_bounded_probe_payload(&mut held)? != raw {
             return Err(io::Error::other(
                 "rename probe artifact changed during cleanup",
             ));
@@ -956,6 +1008,38 @@ impl Server {
         fs::remove_file(&claimed)?;
         Self::durability_failpoint("after_rename_probe_cleanup_unlink")?;
         Self::sync_parent_dir(&parent)
+    }
+
+    fn cleanup_owned_rename_probe_exact(
+        path: &Path,
+        db_path: &Path,
+        expected_identity: (u64, u64),
+        expected_raw: &[u8],
+    ) -> io::Result<()> {
+        let mut held = match Self::open_regular_nofollow(path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        if Self::metadata_identity(&held.metadata()?) != expected_identity
+            || Self::read_bounded_probe_payload(&mut held)? != expected_raw
+        {
+            return Err(io::Error::other(
+                "rename probe cleanup refused an unowned inode",
+            ));
+        }
+        Self::claim_and_remove_probe_exact(path, db_path, held, expected_identity, expected_raw)
+    }
+
+    fn cleanup_rename_probe_exact(path: &Path, db_path: &Path) -> io::Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() || Self::metadata_link_count(&metadata) != 1 {
+            return Ok(());
+        }
+        let mut held = Self::open_regular_nofollow(path)?;
+        let identity = Self::metadata_identity(&held.metadata()?);
+        let raw = Self::read_bounded_probe_payload(&mut held)?;
+        Self::claim_and_remove_probe_exact(path, db_path, held, identity, &raw)
     }
 
     fn cleanup_retired_wal_exact(
