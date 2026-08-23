@@ -16,6 +16,17 @@ const MAX_TOP_K = 10_000;
 const MAX_TIMEOUT_MS = 3_600_000;
 const MAX_SAMPLE_INTERVAL_MS = 60_000;
 const MAX_REPETITIONS = 32;
+const DEFAULT_OVERALL_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const MAX_OVERALL_TIMEOUT_MS = 4 * 60 * 60 * 1000;
+const activeChildren = new Set();
+let terminationSignal = null;
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, () => {
+    terminationSignal = signal;
+    for (const child of activeChildren) killGroup(child);
+  });
+}
 
 function boundedInteger(value, name, { min, max }) {
   const parsed = Number(value);
@@ -253,10 +264,12 @@ async function runBinary(binary, request, repetitions, timeoutMs, preload, start
   const warmMs = [];
   const parity = [];
   for (let repetition = 0; repetition < repetitions; repetition += 1) {
+    if (terminationSignal) throw Object.assign(new Error(`terminated by ${terminationSignal}`), { code: 'TERMINATED' });
     const child = spawn(binary, ['--db', request.db], {
       detached: true,
       stdio: ['pipe', 'pipe', 'ignore'],
     });
+    activeChildren.add(child);
     const initialMemory = sampleIntervalMs > 0 ? readMemory(child.pid) : null;
     if (initialMemory) { samples.push(initialMemory); sampleCount += 1; }
     const poll = sampleIntervalMs > 0 ? setInterval(() => {
@@ -305,6 +318,7 @@ async function runBinary(binary, request, repetitions, timeoutMs, preload, start
     } finally {
       if (poll) clearInterval(poll);
       killGroup(child);
+      activeChildren.delete(child);
     }
   }
   return {
@@ -348,14 +362,16 @@ function publicResult(result) {
   return publicFields;
 }
 
-async function runCounterbalanced(binaries, request, repetitions, timeoutMs, preload, startupTimeoutMs, sampleIntervalMs) {
+async function runCounterbalanced(binaries, request, repetitions, timeoutMs, preload, startupTimeoutMs, sampleIntervalMs, deadline) {
   const runs = { old: [], new: [] };
   const executionOrder = [];
   for (let repetition = 0; repetition < repetitions; repetition += 1) {
     const sequence = repetition % 2 === 0 ? ['old', 'new'] : ['new', 'old'];
     for (const label of sequence) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw Object.assign(new Error('overall benchmark deadline exceeded'), { code: 'OVERALL_DEADLINE' });
       executionOrder.push({ repetition: repetition + 1, binary: label });
-      runs[label].push(await runBinary(binaries[label], request, 1, timeoutMs, preload, startupTimeoutMs, sampleIntervalMs));
+      runs[label].push(await runBinary(binaries[label], request, 1, Math.min(timeoutMs, remaining), preload, Math.min(startupTimeoutMs, remaining), sampleIntervalMs));
     }
   }
   return { old: combineRuns(runs.old), new: combineRuns(runs.new), executionOrder };
@@ -364,6 +380,20 @@ async function runCounterbalanced(binaries, request, repetitions, timeoutMs, pre
 function gitSha(path) {
   const result = spawnSync('git', ['-C', dirname(path), 'rev-parse', 'HEAD'], { encoding: 'utf8' });
   return result.status === 0 ? result.stdout.trim() : null;
+}
+
+async function readBuildManifest(binary, suppliedSha, binaryHash) {
+  const manifestPath = `${binary}.manifest.json`;
+  const source = await openPrivateSource(manifestPath, 'binary build manifest');
+  const manifest = JSON.parse(await source.handle.readFile('utf8'));
+  await source.handle.close();
+  const required = ['schema', 'sourceSha', 'binarySha256', 'cargoProfile', 'rustcVersion', 'buildCommand'];
+  if (manifest.schema !== 'aira.native-build-manifest.v1' || required.some((key) => typeof manifest[key] !== 'string' || manifest[key].length === 0)) {
+    usage(`invalid build manifest for ${basename(binary)}`);
+  }
+  if (manifest.sourceSha !== suppliedSha) usage(`build manifest source SHA mismatch for ${basename(binary)}`);
+  if (manifest.binarySha256 !== binaryHash) usage(`build manifest binary hash mismatch for ${basename(binary)}`);
+  return manifest;
 }
 
 async function main() {
@@ -394,6 +424,11 @@ async function main() {
     const newer = join(workspace, `new-${basename(args.new)}`);
     const snapshotFiles = [await copyPrivate(dbSource, db, 0o600), await copyPrivate(blobSource, blob, 0o600)];
     const binaryFiles = { old: await copyPrivate(oldSource, old, 0o700), new: await copyPrivate(newSource, newer, 0o700) };
+    if ((oldSource.device === newSource.device && oldSource.inode === newSource.inode) || binaryFiles.old.sha256 === binaryFiles.new.sha256 || args.old_sha === args.new_sha) {
+      usage('old and new binaries must differ by inode, binary hash, and source SHA');
+    }
+    const oldManifest = await readBuildManifest(args.old, args.old_sha, binaryFiles.old.sha256);
+    const newManifest = await readBuildManifest(args.new, args.new_sha, binaryFiles.new.sha256);
     const state = JSON.parse(await readFile(db, 'utf8'));
     const descriptorBlob = state.vectorBlob?.basename ? resolve(dirname(db), state.vectorBlob.basename) : null;
     if (descriptorBlob && dirname(descriptorBlob) !== dirname(db)) usage('vector blob descriptor must remain in private directory');
@@ -402,6 +437,8 @@ async function main() {
     if (state.vectorBlob.size !== snapshotFiles[1].bytes || state.vectorBlob.sha256 !== snapshotFiles[1].sha256) {
       usage('private vectorBlob descriptor size/sha256 does not match copied blob');
     }
+    if (!Number.isSafeInteger(state.generation) || state.generation < 1) usage('generation must be a safe positive integer');
+    if (state.vectorBlob.format !== 1) usage('unsupported vector blob format');
     const snapshotHash = sha256Bytes(snapshotFiles.map((file) => `${basename(file.path)}:${file.sha256}\n`).join(''));
 
 const dimensions = boundedInteger(args.dimensions ?? DEFAULT_DIMENSIONS, 'dimensions', { min: 1, max: MAX_DIMENSIONS });
@@ -410,6 +447,7 @@ if (repetitions % 2 !== 0) usage('--repetitions must be even');
 const timeoutMs = boundedInteger(args.timeout_ms ?? REQUEST_TIMEOUT_MS, 'timeout-ms', { min: 1, max: MAX_TIMEOUT_MS });
 const startupTimeoutMs = boundedInteger(args.startup_timeout_ms ?? timeoutMs, 'startup-timeout-ms', { min: 1, max: MAX_TIMEOUT_MS });
 const sampleIntervalMs = boundedInteger(args.sample_interval_ms ?? DEFAULT_SAMPLE_INTERVAL_MS, 'sample-interval-ms', { min: 0, max: MAX_SAMPLE_INTERVAL_MS });
+const overallTimeoutMs = boundedInteger(args.overall_timeout_ms ?? DEFAULT_OVERALL_TIMEOUT_MS, 'overall-timeout-ms', { min: 1, max: MAX_OVERALL_TIMEOUT_MS });
 const topK = boundedInteger(args.top_k ?? 10, 'top-k', { min: 1, max: MAX_TOP_K });
 const queryVector = Array.from({ length: dimensions }, (_, index) => (index === 0 ? 1 : 0.001));
 const rpc = {
@@ -422,8 +460,9 @@ const rpc = {
   },
 };
 const request = { db, rpc };
-const unsampled = await runCounterbalanced({ old, new: newer }, request, repetitions, timeoutMs, true, startupTimeoutMs, 0);
-const sampled = sampleIntervalMs === 0 ? unsampled : await runCounterbalanced({ old, new: newer }, request, repetitions, timeoutMs, true, startupTimeoutMs, sampleIntervalMs);
+const overallDeadline = Date.now() + overallTimeoutMs;
+const unsampled = await runCounterbalanced({ old, new: newer }, request, repetitions, timeoutMs, true, startupTimeoutMs, 0, overallDeadline);
+const sampled = sampleIntervalMs === 0 ? unsampled : await runCounterbalanced({ old, new: newer }, request, repetitions, timeoutMs, true, startupTimeoutMs, sampleIntervalMs, overallDeadline);
 const oldResult = unsampled.old;
 const newResult = unsampled.new;
 let snapshotStable = true;
@@ -455,12 +494,14 @@ const artifact = {
   copiedSnapshotOnly: true,
   snapshot: {
     source: {
-      db: { path: dbSource.path, realpath: dbSource.realpath, device: dbSource.device, inode: dbSource.inode, bytes: dbSource.bytes, sha256: snapshotFiles[0].sha256 },
-      blob: { path: blobSource.path, realpath: blobSource.realpath, device: blobSource.device, inode: blobSource.inode, bytes: blobSource.bytes, sha256: snapshotFiles[1].sha256 },
+      db: { basename: basename(dbSource.path), bytes: snapshotFiles[0].bytes, sha256: snapshotFiles[0].sha256 },
+      blob: { basename: basename(blobSource.path), bytes: snapshotFiles[1].bytes, sha256: snapshotFiles[1].sha256 },
     },
     copied: { basenames: snapshotFiles.map((file) => basename(file.path)), snapshotHash, files: snapshotFiles.map((file) => ({ bytes: file.bytes, sha256: file.sha256 })) },
   },
   snapshotStable,
+  generation: state.generation,
+  vectorBlob: { format: state.vectorBlob.format, sha256: state.vectorBlob.sha256, size: state.vectorBlob.size },
   rpc,
   repetitions: { old: repetitions, new: repetitions },
   executionOrder: unsampled.executionOrder,
@@ -468,6 +509,7 @@ const artifact = {
   orderDefinition: 'both phases are counterbalanced by repetition: old,new then new,old; unsampled is the primary latency phase and sampled is the memory phase',
   timeoutMs,
   startupTimeoutMs,
+  overallTimeoutMs,
   sampleIntervalMs,
   sampledPhaseExecuted: sampleIntervalMs !== 0,
   preload: true,
@@ -490,8 +532,12 @@ const artifact = {
   },
   binaries: {
     source: {
-      old: { path: args.old, realpath: oldSource.realpath, device: oldSource.device, inode: oldSource.inode, bytes: oldSource.bytes, gitSha: args.old_sha, sha256: binaryFiles.old.sha256 },
-      new: { path: args.new, realpath: newSource.realpath, device: newSource.device, inode: newSource.inode, bytes: newSource.bytes, gitSha: args.new_sha, sha256: binaryFiles.new.sha256 },
+      old: { basename: basename(args.old), bytes: binaryFiles.old.bytes, gitSha: args.old_sha, sha256: binaryFiles.old.sha256 },
+      new: { basename: basename(args.new), bytes: binaryFiles.new.bytes, gitSha: args.new_sha, sha256: binaryFiles.new.sha256 },
+    },
+    build: {
+      old: { schema: oldManifest.schema, sourceSha: oldManifest.sourceSha, binarySha256: oldManifest.binarySha256, cargoProfile: oldManifest.cargoProfile, rustcVersion: oldManifest.rustcVersion, buildCommand: oldManifest.buildCommand },
+      new: { schema: newManifest.schema, sourceSha: newManifest.sourceSha, binarySha256: newManifest.binarySha256, cargoProfile: newManifest.cargoProfile, rustcVersion: newManifest.rustcVersion, buildCommand: newManifest.buildCommand },
     },
     old: { ...publicResult(oldResult), gitSha: args.old_sha },
     new: { ...publicResult(newResult), gitSha: args.new_sha },
@@ -517,5 +563,5 @@ if (artifact.failures.length > 0 || parity.some((entry) => !entry.coldEqual || !
 main().catch((error) => {
   console.error(error.stack ?? error.message ?? String(error));
   console.log(JSON.stringify({ schema: 'aira.native-vector-search-benchmark.v2', failures: [{ code: error.code ?? 'BENCHMARK_FAILED', message: error.message ?? String(error) }] }));
-  process.exitCode = 1;
+  process.exitCode = terminationSignal ? 128 + (terminationSignal === 'SIGINT' ? 2 : 15) : 1;
 });

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, link, mkdtemp, symlink, writeFile } from 'node:fs/promises';
+import { chmod, link, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
@@ -10,26 +10,36 @@ import { createHash } from 'node:crypto';
 const exec = promisify(execFile);
 const script = new URL('./native-vector-search-benchmark.mjs', import.meta.url).pathname;
 
-async function fixture({ descriptor = true, descriptorSize, descriptorSha } = {}) {
+async function fixture({ descriptor = true, descriptorSize, descriptorSha, generation = 1, format = 1 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'aira-bench-test-'));
   const db = join(directory, 'snapshot.json');
   const blob = join(directory, 'snapshot.vblob');
-  const old = join(directory, 'old-native');
-  const newer = join(directory, 'new-native');
+  const oldDir = join(directory, 'old-repo');
+  const newDir = join(directory, 'new-repo');
+  await mkdir(oldDir); await mkdir(newDir);
+  const old = join(oldDir, 'aira-graphdb-native');
+  const newer = join(newDir, 'aira-graphdb-native');
   await writeFile(blob, 'vectors');
   const blobSha = createHash('sha256').update('vectors').digest('hex');
-  const state = descriptor ? { generation: 1, vectorBlob: { basename: 'snapshot.vblob', size: descriptorSize ?? 7, sha256: descriptorSha ?? blobSha, format: 1 } } : { generation: 0, vectors: {} };
+  const state = descriptor ? { generation, vectorBlob: { basename: 'snapshot.vblob', size: descriptorSize ?? 7, sha256: descriptorSha ?? blobSha, format } } : { generation: 0, vectors: {} };
   await writeFile(db, JSON.stringify(state));
   const native = '#!/bin/sh\nwhile IFS= read -r line; do printf \'{"ok":true,"result":[]}\\n\'; done\n';
-  await writeFile(old, native); await writeFile(newer, native);
+  await writeFile(old, native); await writeFile(newer, `${native}# distinct build\n`);
   await chmod(old, 0o700); await chmod(newer, 0o700);
-  await exec('git', ['init', '-q', directory]);
-  await exec('git', ['-C', directory, 'config', 'user.email', 'test@example.invalid']);
-  await exec('git', ['-C', directory, 'config', 'user.name', 'test']);
-  await exec('git', ['-C', directory, 'add', '.']);
-  await exec('git', ['-C', directory, 'commit', '-qm', 'fixture']);
-  const sha = (await exec('git', ['-C', directory, 'rev-parse', 'HEAD'])).stdout.trim();
-  return { directory, db, blob, old, newer, sha };
+  for (const repo of [oldDir, newDir]) {
+    await exec('git', ['init', '-q', repo]);
+    await exec('git', ['-C', repo, 'config', 'user.email', 'test@example.invalid']);
+    await exec('git', ['-C', repo, 'config', 'user.name', 'test']);
+    await exec('git', ['-C', repo, 'add', '.']);
+    await exec('git', ['-C', repo, 'commit', '-qm', 'fixture']);
+  }
+  const oldSha = (await exec('git', ['-C', oldDir, 'rev-parse', 'HEAD'])).stdout.trim();
+  const newSha = (await exec('git', ['-C', newDir, 'rev-parse', 'HEAD'])).stdout.trim();
+  const oldHash = createHash('sha256').update(await readFile(old)).digest('hex');
+  const newHash = createHash('sha256').update(await readFile(newer)).digest('hex');
+  await writeFile(`${old}.manifest.json`, JSON.stringify({ schema: 'aira.native-build-manifest.v1', sourceSha: oldSha, binarySha256: oldHash, cargoProfile: 'release', rustcVersion: 'rustc test', buildCommand: 'cargo build --release' }));
+  await writeFile(`${newer}.manifest.json`, JSON.stringify({ schema: 'aira.native-build-manifest.v1', sourceSha: newSha, binarySha256: newHash, cargoProfile: 'release', rustcVersion: 'rustc test', buildCommand: 'cargo build --release' }));
+  return { directory, db, blob, old, newer, sha: oldSha, oldSha, newSha };
 }
 
 async function run(args) {
@@ -42,7 +52,7 @@ async function run(args) {
 }
 
 function argsFor(fixtureData, extra = []) {
-  return ['--db', fixtureData.db, '--blob', fixtureData.blob, '--old', fixtureData.old, '--new', fixtureData.newer, '--old-sha', fixtureData.sha, '--new-sha', fixtureData.sha, ...extra];
+  return ['--db', fixtureData.db, '--blob', fixtureData.blob, '--old', fixtureData.old, '--new', fixtureData.newer, '--old-sha', fixtureData.oldSha, '--new-sha', fixtureData.newSha, ...extra];
 }
 
 test('requires explicit blob, pinned SHAs, even repetitions, and has no output-path option', async () => {
@@ -81,6 +91,9 @@ test('rejects legacy generations and unbounded request parameters', async () => 
   const f = await fixture();
   assert.notEqual((await run(argsFor(f, ['--dimensions', '999999999999999999999']))).code, 0);
   assert.notEqual((await run(argsFor(f, ['--top-k', '100000000']))).code, 0);
+  assert.notEqual((await run(argsFor(f, ['--overall-timeout-ms', '1']))).code, 0);
+  assert.notEqual((await run(argsFor(await fixture({ generation: 0 }))).code), 0);
+  assert.notEqual((await run(argsFor(await fixture({ format: 2 }))).code), 0);
 });
 
 test('writes only stdout JSON, keeps sample-0 at zero, and reports paired failures nonzero', async () => {
@@ -93,8 +106,9 @@ test('writes only stdout JSON, keeps sample-0 at zero, and reports paired failur
   assert.equal(artifact.sampledPhaseExecuted, false);
   assert.equal(Object.keys(artifact).includes('out'), false);
 
-  const hardBinary = join(f.directory, 'old-hardlink-native');
+  const hardBinary = join(f.old.slice(0, f.old.lastIndexOf('/')), 'old-hardlink-native');
   await link(f.old, hardBinary);
+  await writeFile(`${hardBinary}.manifest.json`, await readFile(`${f.old}.manifest.json`));
   const hardBinaryRun = await run(argsFor({ ...f, old: hardBinary }, ['--repetitions', '2', '--sample-interval-ms', '0', '--timeout-ms', '1000', '--startup-timeout-ms', '1000']));
   assert.equal(hardBinaryRun.code, 0);
 
