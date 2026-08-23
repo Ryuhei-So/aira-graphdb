@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -176,6 +176,7 @@ struct Server {
     transaction: TransactionState,
     wal_path: PathBuf,
     wal_bytes: u64,
+    wal_identity: Option<(u64, u64)>,
     wal_replaying: bool,
     last_persist_bytes: u64,
     fatal: bool,
@@ -560,6 +561,7 @@ impl Server {
             wal_bytes: fs::metadata(db_path.with_extension("agdb.wal"))
                 .map(|metadata| metadata.len())
                 .unwrap_or(0),
+            wal_identity: None,
             wal_replaying: false,
             last_persist_bytes: fs::metadata(&db_path)
                 .map(|metadata| metadata.len())
@@ -765,6 +767,18 @@ impl Server {
             }
         }
         Ok(())
+    }
+
+    fn durability_pausepoint(stage: &str) {
+        if !Self::failpoint_matches("AGDB_NATIVE_TEST_PAUSE_POINT", stage) {
+            return;
+        }
+        let milliseconds = std::env::var("AGDB_NATIVE_TEST_PAUSE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(100)
+            .min(5_000);
+        std::thread::sleep(std::time::Duration::from_millis(milliseconds));
     }
 
     fn write_durable_temp(target: &Path, bytes: &[u8], sync_stage: &str) -> io::Result<PathBuf> {
@@ -1063,6 +1077,7 @@ impl Server {
         self.state = persisted_state;
         self.last_persist_bytes = raw.len() as u64;
         self.wal_bytes = 0;
+        self.wal_identity = None;
         let total_ms = start.elapsed().as_millis();
         eprintln!(
             "[persist] generation={} blobBytes={} blobSha256={} jsonBytes={} elapsedMs={total_ms}",
@@ -1094,10 +1109,14 @@ impl Server {
         Self::method_spec(method).is_some_and(|spec| spec.wal)
     }
 
-    fn read_wal_records_with_identity(&self) -> io::Result<(Vec<WalRecord>, Option<(u64, u64)>)> {
+    fn read_wal_records_with_identity(
+        &self,
+    ) -> io::Result<(Vec<WalRecord>, Option<(u64, u64)>, Vec<u8>)> {
         let (raw, identity) = match Self::read_regular_nofollow_with_identity(&self.wal_path) {
             Ok(result) => result,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), None)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), None, Vec::new()));
+            }
             Err(err) => return Err(io::Error::other(format!("read WAL failed: {err}"))),
         };
         let content = std::str::from_utf8(&raw)
@@ -1166,12 +1185,12 @@ impl Server {
             }
             records.push(record);
         }
-        Ok((records, Some(identity)))
+        Ok((records, Some(identity), raw))
     }
 
     fn read_wal_records(&self) -> io::Result<Vec<WalRecord>> {
         self.read_wal_records_with_identity()
-            .map(|(records, _)| records)
+            .map(|(records, _, _)| records)
     }
 
     fn rewrite_wal_records(&self, records: &[WalRecord]) -> io::Result<()> {
@@ -1224,6 +1243,58 @@ impl Server {
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    fn open_wal_for_append(&self) -> io::Result<(fs::File, bool, (u64, u64))> {
+        for _ in 0..2 {
+            match fs::symlink_metadata(&self.wal_path) {
+                Ok(path_metadata) => {
+                    Self::require_regular_single_link(&self.wal_path, &path_metadata)?;
+                    let mut options = fs::OpenOptions::new();
+                    options.write(true).append(true);
+                    #[cfg(unix)]
+                    options.custom_flags(libc::O_NOFOLLOW);
+                    let file = options.open(&self.wal_path)?;
+                    let file_metadata = file.metadata()?;
+                    Self::require_regular_single_link(&self.wal_path, &file_metadata)?;
+                    if Self::metadata_identity(&path_metadata)
+                        != Self::metadata_identity(&file_metadata)
+                    {
+                        return Err(io::Error::other(
+                            "WAL changed while being opened for append",
+                        ));
+                    }
+                    let identity = Self::metadata_identity(&file_metadata);
+                    if self.wal_identity != Some(identity) {
+                        return Err(io::Error::other("unexpected WAL inode before append"));
+                    }
+                    return Ok((file, false, identity));
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    if self.wal_identity.is_some() {
+                        return Err(io::Error::other("active WAL disappeared before append"));
+                    }
+                    let mut options = fs::OpenOptions::new();
+                    options.write(true).append(true).create_new(true);
+                    #[cfg(unix)]
+                    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+                    match options.open(&self.wal_path) {
+                        Ok(file) => {
+                            let metadata = file.metadata()?;
+                            Self::require_regular_single_link(&self.wal_path, &metadata)?;
+                            let identity = Self::metadata_identity(&metadata);
+                            return Ok((file, true, identity));
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                        Err(err) => return Err(err),
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(io::Error::other(
+            "WAL path changed repeatedly while being opened for append",
+        ))
+    }
+
     fn wal_append(&mut self, request: &RpcRequest) -> io::Result<()> {
         let record = WalRecord {
             version: Self::WAL_VERSION,
@@ -1234,11 +1305,7 @@ impl Server {
             .map_err(|err| io::Error::other(format!("serialize WAL record failed: {err}")))?;
         let parent = Self::parent_dir(&self.wal_path);
         fs::create_dir_all(&parent)?;
-        let wal_preexisted = self.wal_path.exists();
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.wal_path)?;
+        let (mut file, wal_created, wal_identity) = self.open_wal_for_append()?;
         Self::durability_failpoint("before_wal_write")?;
         file.write_all(&encoded)?;
         file.write_all(b"\n")?;
@@ -1247,17 +1314,18 @@ impl Server {
         Self::durability_failpoint("before_wal_sync")?;
         file.sync_data()?;
         Self::durability_failpoint("after_wal_sync")?;
-        if !wal_preexisted {
+        if wal_created {
             Self::durability_failpoint("before_wal_dir_fsync")?;
             Self::sync_parent_dir(&parent)?;
             Self::durability_failpoint("after_wal_dir_fsync")?;
         }
+        self.wal_identity = Some(wal_identity);
         self.wal_bytes += encoded.len() as u64 + 1;
         Ok(())
     }
 
     fn replay_wal(&mut self) -> io::Result<usize> {
-        let (records, mut wal_identity) = self.read_wal_records_with_identity()?;
+        let (records, mut wal_identity, _) = self.read_wal_records_with_identity()?;
         let generation = self.state.generation;
         let mut replayable = Vec::new();
         let mut skipped = 0usize;
@@ -1336,7 +1404,7 @@ impl Server {
                 "recovery compare-and-swap failed".to_string(),
             ));
         }
-        let (current_records, current_identity) = self
+        let (current_records, current_identity, current_raw) = self
             .read_wal_records_with_identity()
             .map_err(|err| Self::execution_io_error(format!("revalidate recovery WAL: {err}")))?;
         let Some((current_device, current_inode)) = current_identity else {
@@ -1359,6 +1427,26 @@ impl Server {
                 "recovery WAL changed before quarantine".to_string(),
             ));
         }
+        let mut held_wal = Self::open_regular_nofollow(&self.wal_path).map_err(|err| {
+            Self::execution_io_error(format!("hold recovery WAL for quarantine: {err}"))
+        })?;
+        let held_metadata = held_wal
+            .metadata()
+            .map_err(|err| Self::execution_io_error(format!("inspect held recovery WAL: {err}")))?;
+        if Self::metadata_identity(&held_metadata) != (wal_device, wal_inode) {
+            return Err(Self::execution_io_error(
+                "recovery WAL changed before quarantine hold".to_string(),
+            ));
+        }
+        let mut held_before = Vec::new();
+        held_wal
+            .read_to_end(&mut held_before)
+            .map_err(|err| Self::execution_io_error(format!("read held recovery WAL: {err}")))?;
+        if held_before != current_raw {
+            return Err(Self::execution_io_error(
+                "recovery WAL changed before quarantine rename".to_string(),
+            ));
+        }
         let parent = Self::parent_dir(&self.wal_path);
         let nonce = Self::crypto_nonce().map_err(|err| {
             Self::execution_io_error(format!("create recovery nonce failed: {err}"))
@@ -1371,6 +1459,7 @@ impl Server {
         let quarantine = parent.join(format!(
             ".{file_name}.recovery-{actual_digest}-{nonce}.quarantine"
         ));
+        Self::durability_pausepoint("before_recovery_quarantine_rename");
         Self::durability_failpoint("before_recovery_quarantine_rename").map_err(|err| {
             Self::execution_io_error(format!("quarantine recovery WAL failed: {err}"))
         })?;
@@ -1383,6 +1472,18 @@ impl Server {
                 Self::execution_io_error(format!("validate quarantined recovery WAL: {err}"))
             })?;
         if Self::metadata_identity(&quarantine_metadata) != (wal_device, wal_inode) {
+            return Err(Self::execution_io_error(
+                "recovery WAL changed during quarantine".to_string(),
+            ));
+        }
+        held_wal.seek(SeekFrom::Start(0)).map_err(|err| {
+            Self::execution_io_error(format!("rewind quarantined recovery WAL: {err}"))
+        })?;
+        let mut held_after = Vec::new();
+        held_wal.read_to_end(&mut held_after).map_err(|err| {
+            Self::execution_io_error(format!("re-read quarantined recovery WAL: {err}"))
+        })?;
+        if held_after != current_raw {
             return Err(Self::execution_io_error(
                 "recovery WAL changed during quarantine".to_string(),
             ));
@@ -1400,6 +1501,7 @@ impl Server {
             Self::execution_io_error(format!("sync recovery quarantine failed: {err}"))
         })?;
         self.wal_bytes = 0;
+        self.wal_identity = None;
         self.transaction = TransactionState::Idle;
         Ok(json!({
             "baseGeneration": base_generation,
@@ -2989,9 +3091,9 @@ fn main() -> io::Result<()> {
             ));
         }
     }
-    // EOF is not a publication event. An active batch or replayed WAL remains
-    // available for the next exclusive writer to recover and explicitly
-    // re-commit.
+    // EOF is not a publication event. An active batch remains as a
+    // RecoveryPending WAL; the next exclusive owner quarantines it with an
+    // exact token and requeues the whole document from the durable source.
     Ok(())
 }
 

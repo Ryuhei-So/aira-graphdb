@@ -1036,6 +1036,51 @@ fn recovery_discard_rejects_wal_replacement_and_append_without_quarantine() {
 
 #[cfg(unix)]
 #[test]
+fn recovery_discard_rejects_same_inode_append_during_quarantine() {
+    let db = TempDb::new("recovery-wal-concurrent-append");
+    let request = vector_upsert_for_document(1, "race-v", "race-document", [1.0, 0.0], "race");
+    let (mut native, original, digest) = open_recovery_pending_with_env(
+        &db.path,
+        &request,
+        &[
+            (
+                "AGDB_NATIVE_TEST_PAUSE_POINT",
+                "before_recovery_quarantine_rename",
+            ),
+            ("AGDB_NATIVE_TEST_PAUSE_MS", "250"),
+        ],
+    );
+    let appended_record = encoded_wal_record(
+        0,
+        &vector_upsert_for_document(2, "race-v2", "race-document-2", [0.0, 1.0], "race-append"),
+    );
+    let wal_path = db.path.with_extension("agdb.wal");
+    let append_path = wal_path.clone();
+    let append_bytes = appended_record.clone();
+    let appender = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&append_path)
+            .expect("open recovery WAL during pause");
+        file.write_all(&append_bytes)
+            .expect("append recovery WAL during pause");
+        file.sync_all().expect("sync appended recovery WAL");
+    });
+    let response = native.send(recovery_discard(3, 0, &digest));
+    appender.join().expect("concurrent WAL appender exits");
+    assert_eq!(response["ok"], json!(false));
+    assert!(response.get("result").is_none());
+    assert_ne!(native.finish().code(), Some(0));
+    assert!(!wal_path.exists());
+    let mut quarantined = original;
+    quarantined.extend_from_slice(&appended_record);
+    assert_eq!(quarantined_wal_paths(&db.dir, &quarantined).len(), 1);
+    assert!(!db.path.exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn recovery_discard_rejects_wal_symlink_and_hardlink_without_quarantine() {
     let symlink_db = TempDb::new("recovery-wal-symlink");
     let request =
