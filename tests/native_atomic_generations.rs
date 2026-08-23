@@ -362,6 +362,36 @@ fn quarantined_wal_paths(dir: &Path, wal_bytes: &[u8]) -> Vec<PathBuf> {
         .collect()
 }
 
+fn recognized_wal_retire_path(db: &TempDb, id: u64) -> PathBuf {
+    let wal_path = db.path.with_extension("agdb.wal");
+    let wal_name = wal_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("WAL file name");
+    db.dir.join(format!(
+        ".{wal_name}.wal_retire.0123456789abcdef0123456789abcdef.{id}.tmp"
+    ))
+}
+
+fn recognized_wal_retire_paths(db: &TempDb) -> Vec<PathBuf> {
+    let wal_path = db.path.with_extension("agdb.wal");
+    let wal_name = wal_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("WAL file name");
+    let prefix = format!(".{wal_name}.wal_retire.");
+    std::fs::read_dir(&db.dir)
+        .expect("read database directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".tmp"))
+        })
+        .collect()
+}
+
 fn seed_vector(path: &Path) {
     let mut native = NativeProcess::spawn(path, &[]);
     assert_eq!(native.send(batch_begin(0))["ok"], json!(true));
@@ -550,6 +580,189 @@ fn injected_write_sync_rename_and_directory_failures_never_return_a_token() {
                 );
             }
             probe_vector_pair(&db.path);
+        }
+    }
+}
+
+#[test]
+fn wal_retirement_substages_reopen_complete_generation_and_cleanup_orphan() {
+    for stage in [
+        "after_wal_retire_rename",
+        "after_wal_retire_dir_fsync",
+        "after_wal_retire_unlink",
+    ] {
+        let db = TempDb::new(stage);
+        seed_vector(&db.path);
+        let mut native = NativeProcess::spawn(&db.path, &[("AGDB_NATIVE_KILL_POINT", stage)]);
+        assert_eq!(native.send(batch_begin(2))["ok"], json!(true));
+        assert_eq!(
+            native.send(vector_upsert(3, [0.0, 1.0], "new"))["ok"],
+            json!(true)
+        );
+        native.send_without_read(batch_commit(4));
+        assert_native_killed(native.finish(), stage);
+        assert_eq!(generation(&db.path), 2, "{stage} must publish N+1 first");
+
+        let retired = recognized_wal_retire_paths(&db);
+        if stage == "after_wal_retire_unlink" {
+            assert!(retired.is_empty(), "{stage} must unlink the retired WAL");
+        } else {
+            assert_eq!(retired.len(), 1, "{stage} must leave a recognized orphan");
+        }
+        probe_vector_pair(&db.path);
+        assert_eq!(
+            generation(&db.path),
+            2,
+            "{stage} changed canonical generation"
+        );
+        assert!(
+            recognized_wal_retire_paths(&db).is_empty(),
+            "{stage} left a retired WAL artifact after restart"
+        );
+    }
+}
+
+#[test]
+fn injected_wal_retire_substage_failures_never_return_token() {
+    for stage in [
+        "after_wal_retire_rename",
+        "after_wal_retire_dir_fsync",
+        "after_wal_retire_unlink",
+    ] {
+        let db = TempDb::new(&format!("fail-{stage}"));
+        seed_vector(&db.path);
+        let canonical_before = std::fs::read(&db.path).expect("canonical state before failure");
+        let mut native = NativeProcess::spawn(&db.path, &[("AGDB_NATIVE_FAIL_POINT", stage)]);
+        assert_eq!(native.send(batch_begin(2))["ok"], json!(true));
+        assert_eq!(
+            native.send(vector_upsert(3, [0.0, 1.0], "new"))["ok"],
+            json!(true)
+        );
+        let commit = native.send(batch_commit(4));
+        assert_eq!(commit["ok"], json!(false), "{stage}: {commit}");
+        assert!(commit.get("result").is_none(), "{stage}: {commit}");
+        assert_ne!(native.finish().code(), Some(0), "{stage} stayed alive");
+        assert!(matches!(generation(&db.path), 1 | 2));
+        if generation(&db.path) == 1 {
+            assert_eq!(
+                std::fs::read(&db.path).expect("canonical state after failed retire"),
+                canonical_before,
+                "{stage} advanced canonical JSON"
+            );
+        }
+        probe_vector_pair(&db.path);
+        assert!(
+            recognized_wal_retire_paths(&db).is_empty(),
+            "{stage} left a retired WAL artifact after recovery"
+        );
+    }
+}
+
+#[test]
+fn startup_retires_only_empty_or_already_published_wal_artifacts() {
+    let request = vector_upsert_for_document(1, "old-v", "old-document", [1.0, 0.0], "old");
+    for (label, wal_bytes) in [
+        ("empty", Vec::new()),
+        ("old", encoded_wal_record(0, &request)),
+    ] {
+        let db = TempDb::new(&format!("retired-orphan-{label}"));
+        seed_vector(&db.path);
+        let retired = recognized_wal_retire_path(&db, 7);
+        std::fs::write(&retired, &wal_bytes).expect("write recognized retired orphan");
+        assert!(!db.path.with_extension("agdb.wal").exists());
+
+        let mut native = NativeProcess::spawn(&db.path, &[]);
+        let info = native.send(json!({"id":1,"method":"protocol_info","params":{}}));
+        assert_eq!(info["ok"], json!(true), "{label}: {info}");
+        assert_eq!(info["result"]["state"], json!("idle"));
+        assert_eq!(info["result"]["generation"], json!(1));
+        assert_eq!(native.finish().code(), Some(0));
+        assert!(!retired.exists(), "{label} orphan was not retired");
+
+        let mut reopened = NativeProcess::spawn(&db.path, &[]);
+        assert_eq!(
+            reopened.send(json!({"id":2,"method":"ping","params":{}}))["ok"],
+            json!(true)
+        );
+        assert_eq!(reopened.finish().code(), Some(0));
+        assert!(!retired.exists(), "{label} orphan reappeared after restart");
+        assert_eq!(
+            generation(&db.path),
+            1,
+            "{label} advanced canonical generation"
+        );
+    }
+}
+
+#[test]
+fn startup_preserves_nonretirable_wal_retire_payloads_and_unknown_names() {
+    let request =
+        vector_upsert_for_document(1, "retained-v", "retained-document", [1.0, 0.0], "retained");
+    for (label, wal_bytes) in [
+        ("malformed", b"not-json\n".to_vec()),
+        ("current", encoded_wal_record(1, &request)),
+        ("future", encoded_wal_record(2, &request)),
+    ] {
+        let db = TempDb::new(&format!("retired-retain-{label}"));
+        seed_vector(&db.path);
+        let canonical_before = std::fs::read(&db.path).expect("canonical before retained WAL");
+        let retired = recognized_wal_retire_path(&db, 8);
+        std::fs::write(&retired, &wal_bytes).expect("write retained retired WAL");
+        let native = NativeProcess::spawn(&db.path, &[]);
+        assert_ne!(native.finish().code(), Some(0), "{label} startup succeeded");
+        assert_eq!(std::fs::read(&retired).unwrap(), wal_bytes);
+        assert_eq!(std::fs::read(&db.path).unwrap(), canonical_before);
+        assert_eq!(generation(&db.path), 1);
+    }
+
+    let db = TempDb::new("retired-unknown-name");
+    seed_vector(&db.path);
+    let unknown = db.dir.join(".state.agdb.wal.unknown-stage.0123.tmp");
+    let unknown_bytes = b"unknown-payload\n";
+    std::fs::write(&unknown, unknown_bytes).expect("write unknown artifact");
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(
+        native.send(json!({"id":1,"method":"protocol_info","params":{}}))["ok"],
+        json!(true)
+    );
+    assert_eq!(native.finish().code(), Some(0));
+    assert_eq!(std::fs::read(&unknown).unwrap(), unknown_bytes);
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_does_not_touch_wal_retire_symlink_or_hardlink_aliases() {
+    for kind in ["symlink", "hardlink"] {
+        let db = TempDb::new(&format!("retired-alias-{kind}"));
+        seed_vector(&db.path);
+        let sentinel = db.dir.join("retired-alias-sentinel");
+        let sentinel_bytes = format!("retired-alias-{kind}\n").into_bytes();
+        std::fs::write(&sentinel, &sentinel_bytes).expect("write alias sentinel");
+        let retired = recognized_wal_retire_path(&db, 9);
+        if kind == "symlink" {
+            symlink(&sentinel, &retired).expect("create retired symlink");
+        } else {
+            hard_link(&sentinel, &retired).expect("create retired hardlink");
+        }
+
+        let mut native = NativeProcess::spawn(&db.path, &[]);
+        assert_eq!(
+            native.send(json!({"id":1,"method":"protocol_info","params":{}}))["ok"],
+            json!(true),
+            "{kind} alias unexpectedly blocked startup"
+        );
+        assert_eq!(native.finish().code(), Some(0));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), sentinel_bytes);
+        assert!(retired.exists());
+        if kind == "symlink" {
+            assert!(
+                std::fs::symlink_metadata(&retired)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        } else {
+            assert!(retired.exists());
         }
     }
 }

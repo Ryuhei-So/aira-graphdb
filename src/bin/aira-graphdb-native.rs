@@ -573,6 +573,7 @@ impl Server {
                 .vector_blob
                 .as_ref()
                 .map(|descriptor| descriptor.basename.as_str()),
+            state.generation,
         )?;
         Ok(Self {
             audit_log_path: db_path.with_extension("native-audit.log"),
@@ -658,17 +659,29 @@ impl Server {
         Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
-    fn temporary_path(target: &Path, suffix: &str) -> io::Result<PathBuf> {
+    fn is_durable_temp_stage(stage: &str) -> bool {
+        matches!(
+            stage,
+            "blob_temp_sync" | "json_temp_sync" | "wal_compact_sync" | "wal_retire"
+        )
+    }
+
+    fn temporary_path(target: &Path, stage: &str) -> io::Result<PathBuf> {
+        if !Self::is_durable_temp_stage(stage) {
+            return Err(io::Error::other(format!(
+                "unrecognized durable temporary stage {stage}"
+            )));
+        }
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let file_name = target
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("aira-graphdb");
         let nonce = Self::crypto_nonce()?;
-        Ok(Self::parent_dir(target).join(format!(".{file_name}.{suffix}.{nonce}.{id}.tmp")))
+        Ok(Self::parent_dir(target).join(format!(".{file_name}.{stage}.{nonce}.{id}.tmp")))
     }
 
-    fn recognized_temp_target(name: &str) -> Option<&str> {
+    fn recognized_durable_temp(name: &str) -> Option<(&str, &str)> {
         let Some(name) = name.strip_prefix('.') else {
             return None;
         };
@@ -693,20 +706,18 @@ impl Server {
             || !id.chars().all(|character| character.is_ascii_digit())
             || nonce.len() != 32
             || !nonce.chars().all(|character| character.is_ascii_hexdigit())
-            || !matches!(
-                stage,
-                "blob_temp_sync" | "json_temp_sync" | "wal_compact_sync"
-            )
+            || !Self::is_durable_temp_stage(stage)
         {
             return None;
         }
-        Some(target)
+        Some((target, stage))
     }
 
     fn cleanup_recognized_temps(
         parent: &Path,
         db_file_name: &str,
         referenced_blob: Option<&str>,
+        current_generation: u64,
     ) -> io::Result<()> {
         let db_stem = Path::new(db_file_name)
             .file_stem()
@@ -722,13 +733,22 @@ impl Server {
             Ok(entries) => entries,
             Err(err) => return Err(err),
         };
+        let mut retired_wals = Vec::new();
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            let Some(target) = Self::recognized_temp_target(&name) else {
+            let Some((target, stage)) = Self::recognized_durable_temp(&name) else {
                 continue;
             };
+            if stage == "wal_retire" {
+                if target == wal_file_name
+                    && Self::retired_wal_is_removable(&entry.path(), current_generation)?
+                {
+                    retired_wals.push(entry.path());
+                }
+                continue;
+            }
             let target_is_blob =
                 target.starts_with(&format!("{db_stem}.g")) && target.ends_with(".vblob");
             if referenced_blob.is_some_and(|referenced| referenced == target)
@@ -742,10 +762,35 @@ impl Server {
                 removed = true;
             }
         }
+        for retired in retired_wals {
+            if Self::retired_wal_is_removable(&retired, current_generation)? {
+                fs::remove_file(retired)?;
+                removed = true;
+            }
+        }
         if removed {
             Self::sync_parent_dir(parent)?;
         }
         Ok(())
+    }
+
+    fn retired_wal_is_removable(path: &Path, current_generation: u64) -> io::Result<bool> {
+        let path_metadata = fs::symlink_metadata(path)?;
+        if !path_metadata.file_type().is_file() || Self::metadata_link_count(&path_metadata) != 1 {
+            return Ok(false);
+        }
+        let (raw, identity) = Self::read_regular_nofollow_with_identity(path)?;
+        let records = Self::parse_wal_records(&raw, current_generation)?;
+        if records
+            .iter()
+            .any(|record| record.base_generation >= current_generation)
+        {
+            return Err(io::Error::other(
+                "retired WAL contains a current or future generation",
+            ));
+        }
+        Self::validate_regular_path_identity(path, identity)?;
+        Ok(true)
     }
 
     fn failpoint_matches(var_name: &str, stage: &str) -> bool {
@@ -1139,17 +1184,8 @@ impl Server {
         Self::method_spec(method).is_some_and(|spec| spec.wal)
     }
 
-    fn read_wal_records_with_identity(
-        &self,
-    ) -> io::Result<(Vec<WalRecord>, Option<(u64, u64)>, Vec<u8>)> {
-        let (raw, identity) = match Self::read_regular_nofollow_with_identity(&self.wal_path) {
-            Ok(result) => result,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Ok((Vec::new(), None, Vec::new()));
-            }
-            Err(err) => return Err(io::Error::other(format!("read WAL failed: {err}"))),
-        };
-        let content = std::str::from_utf8(&raw)
+    fn parse_wal_records(raw: &[u8], generation: u64) -> io::Result<Vec<WalRecord>> {
+        let content = std::str::from_utf8(raw)
             .map_err(|err| io::Error::other(format!("WAL is not UTF-8: {err}")))?;
         let mut records = Vec::new();
         for (line_number, line) in content.lines().enumerate() {
@@ -1158,7 +1194,7 @@ impl Server {
             }
             let record = match serde_json::from_str::<WalRecord>(line) {
                 Ok(record) => record,
-                Err(versioned_error) if self.state.generation == 0 => {
+                Err(versioned_error) if generation == 0 => {
                     // The pre-generation WAL was a raw RpcRequest. It is only
                     // safe to interpret it while the canonical state is still
                     // the legacy generation zero snapshot.
@@ -1215,6 +1251,20 @@ impl Server {
             }
             records.push(record);
         }
+        Ok(records)
+    }
+
+    fn read_wal_records_with_identity(
+        &self,
+    ) -> io::Result<(Vec<WalRecord>, Option<(u64, u64)>, Vec<u8>)> {
+        let (raw, identity) = match Self::read_regular_nofollow_with_identity(&self.wal_path) {
+            Ok(result) => result,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), None, Vec::new()));
+            }
+            Err(err) => return Err(io::Error::other(format!("read WAL failed: {err}"))),
+        };
+        let records = Self::parse_wal_records(&raw, self.state.generation)?;
         Ok((records, Some(identity), raw))
     }
 
@@ -1233,13 +1283,7 @@ impl Server {
         if held_before != expected_raw {
             return Err(io::Error::other("WAL content changed before retirement"));
         }
-        let nonce = Self::crypto_nonce()?;
-        let file_name = self
-            .wal_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("aira-graphdb.agdb.wal");
-        let retired = parent.join(format!(".{file_name}.retired-{nonce}"));
+        let retired = Self::temporary_path(&self.wal_path, "wal_retire")?;
         fs::rename(&self.wal_path, &retired)?;
         Self::validate_regular_path_identity(&retired, expected_identity)?;
         held_wal.seek(SeekFrom::Start(0))?;
@@ -1248,8 +1292,13 @@ impl Server {
         if held_after != expected_raw {
             return Err(io::Error::other("WAL content changed during retirement"));
         }
+        Self::durability_failpoint("after_wal_retire_rename")?;
+        Self::durability_failpoint("before_wal_retire_dir_fsync")?;
         Self::sync_parent_dir(&parent)?;
+        Self::durability_failpoint("after_wal_retire_dir_fsync")?;
+        Self::durability_failpoint("before_wal_retire_unlink")?;
         fs::remove_file(&retired)?;
+        Self::durability_failpoint("after_wal_retire_unlink")?;
         Self::sync_parent_dir(&parent)
     }
 
