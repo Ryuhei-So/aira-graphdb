@@ -1,0 +1,248 @@
+{
+  "candidateHits": [
+    {
+      "id": "passage:fixture-passage-1",
+      "item": {
+        "corpusId": "fixture-corpus",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "entityMentions": [
+          "Alpha",
+          "Beta"
+        ],
+        "factIds": [
+          "fixture-fact-inactive",
+          "fixture-fact-tie"
+        ],
+        "metadata": {
+          "chunkId": "fixture-chunk-1",
+          "chunkIndex": 0,
+          "convertedAt": "2026-01-01T00:01:00.000Z",
+          "documentId": "fixture-document-1",
+          "doi": "10.5555/fixture.1",
+          "language": "en",
+          "offsetEnd": 36,
+          "offsetStart": 0,
+          "sectionPath": [
+            "Results",
+            "Bounded retrieval"
+          ],
+          "sourceDb": "fixture-db",
+          "sourceType": "pdf",
+          "sourceUrl": "https://example.invalid/fixture-document-1",
+          "title": "Bounded retrieval fixture"
+        },
+        "normalizedText": "a bounded retrieval fixture passage.",
+        "passageId": "fixture-passage-1",
+        "qualityFlags": [
+          "fixture"
+        ],
+        "qualityScore": 0.95,
+        "text": "A bounded retrieval fixture passage.",
+        "updatedAt": "2026-01-02T00:00:00.000Z"
+      },
+      "namespace": "passage",
+      "score": -0.125
+    },
+    {
+      "id": "fact:fixture-fact-inactive",
+      "item": {
+        "confidence": 0.75,
+        "corpusId": "fixture-corpus",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "factId": "fixture-fact-inactive",
+        "granularityParentFactId": "fixture-parent-fact",
+        "headEntity": "Alpha",
+        "headType": "Entity",
+        "passageIds": [
+          "fixture-passage-1"
+        ],
+        "relation": "relates-to",
+        "schemaId": "fixture-schema-1",
+        "sourceDocumentIds": [
+          "fixture-document-1"
+        ],
+        "state": "inactive",
+        "tailEntity": "Beta",
+        "tailType": "Entity",
+        "temporalScope": "2026",
+        "updatedAt": "2026-01-02T00:00:00.000Z"
+      },
+      "namespace": "fact",
+      "score": -0.25
+    },
+    {
+      "id": "fact:fixture-fact-tie",
+      "item": {
+        "confidence": 0.75,
+        "corpusId": "fixture-corpus",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "factId": "fixture-fact-tie",
+        "granularityParentFactId": "fixture-parent-fact",
+        "headEntity": "Alpha",
+        "headType": "Entity",
+        "passageIds": [
+          "fixture-passage-1"
+        ],
+        "relation": "relates-to",
+        "schemaId": "fixture-schema-1",
+        "sourceDocumentIds": [
+          "fixture-document-1"
+        ],
+        "state": "inactive",
+        "tailEntity": "Beta",
+        "tailType": "Entity",
+        "temporalScope": "2026",
+        "updatedAt": "2026-01-02T00:00:00.000Z"
+      },
+      "namespace": "fact",
+      "score": -0.25
+    },
+    {
+      "id": "schema:fixture-schema-1",
+      "item": {
+        "aliases": [
+          {
+            "confidence": 1,
+            "isCanonical": true,
+            "label": "relates to",
+            "language": "en",
+            "source": "manual"
+          },
+          {
+            "confidence": 0.8,
+            "isCanonical": false,
+            "label": "関係する",
+            "language": "ja",
+            "source": "dictionary"
+          }
+        ],
+        "canonicalKey": "entity::relates-to::entity",
+        "corpusId": "fixture-corpus",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "factIds": [
+          "fixture-fact-inactive",
+          "fixture-fact-tie"
+        ],
+        "frequency": 3,
+        "headType": "Entity",
+        "relation": "relates-to",
+        "schemaId": "fixture-schema-1",
+        "sourceDocumentIds": [
+          "fixture-document-1"
+        ],
+        "stabilizationThreshold": 2,
+        "state": "stable",
+        "tailType": "Entity",
+        "updatedAt": "2026-01-02T00:00:00.000Z",
+        "version": 1
+      },
+      "namespace": "schema",
+      "score": 0.25
+    }
+  ],
+  "contractVersion": "aira-synapse-domain-contract@1",
+  "fixtureVersion": "aira-synapse-bounded-domain-fixture@1",
+  "pprMaterialization": {
+    "rankedFacts": [
+      {
+        "fact": {
+          "confidence": 0.75,
+          "corpusId": "fixture-corpus",
+          "createdAt": "2026-01-01T00:00:00.000Z",
+          "factId": "fixture-fact-inactive",
+          "granularityParentFactId": "fixture-parent-fact",
+          "headEntity": "Alpha",
+          "headType": "Entity",
+          "passageIds": [
+            "fixture-passage-1"
+          ],
+          "relation": "relates-to",
+          "schemaId": "fixture-schema-1",
+          "sourceDocumentIds": [
+            "fixture-document-1"
+          ],
+          "state": "inactive",
+          "tailEntity": "Beta",
+          "tailType": "Entity",
+          "temporalScope": "2026",
+          "updatedAt": "2026-01-02T00:00:00.000Z"
+        },
+        "nodeId": "fact:fixture-fact-inactive",
+        "rank": 1,
+        "score": 0.5
+      },
+      {
+        "fact": {
+          "confidence": 0.75,
+          "corpusId": "fixture-corpus",
+          "createdAt": "2026-01-01T00:00:00.000Z",
+          "factId": "fixture-fact-tie",
+          "granularityParentFactId": "fixture-parent-fact",
+          "headEntity": "Alpha",
+          "headType": "Entity",
+          "passageIds": [
+            "fixture-passage-1"
+          ],
+          "relation": "relates-to",
+          "schemaId": "fixture-schema-1",
+          "sourceDocumentIds": [
+            "fixture-document-1"
+          ],
+          "state": "inactive",
+          "tailEntity": "Beta",
+          "tailType": "Entity",
+          "temporalScope": "2026",
+          "updatedAt": "2026-01-02T00:00:00.000Z"
+        },
+        "nodeId": "fact:fixture-fact-tie",
+        "rank": 2,
+        "score": 0.5
+      }
+    ],
+    "rankedPassages": [
+      {
+        "nodeId": "passage:fixture-passage-1",
+        "passage": {
+          "corpusId": "fixture-corpus",
+          "createdAt": "2026-01-01T00:00:00.000Z",
+          "entityMentions": [
+            "Alpha",
+            "Beta"
+          ],
+          "factIds": [
+            "fixture-fact-inactive",
+            "fixture-fact-tie"
+          ],
+          "metadata": {
+            "chunkId": "fixture-chunk-1",
+            "chunkIndex": 0,
+            "convertedAt": "2026-01-01T00:01:00.000Z",
+            "documentId": "fixture-document-1",
+            "doi": "10.5555/fixture.1",
+            "language": "en",
+            "offsetEnd": 36,
+            "offsetStart": 0,
+            "sectionPath": [
+              "Results",
+              "Bounded retrieval"
+            ],
+            "sourceDb": "fixture-db",
+            "sourceType": "pdf",
+            "sourceUrl": "https://example.invalid/fixture-document-1",
+            "title": "Bounded retrieval fixture"
+          },
+          "normalizedText": "a bounded retrieval fixture passage.",
+          "passageId": "fixture-passage-1",
+          "qualityFlags": [
+            "fixture"
+          ],
+          "qualityScore": 0.95,
+          "text": "A bounded retrieval fixture passage.",
+          "updatedAt": "2026-01-02T00:00:00.000Z"
+        },
+        "rank": 1,
+        "score": 0.75
+      }
+    ]
+  }
+}

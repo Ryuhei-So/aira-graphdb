@@ -18,6 +18,54 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read pinned Aira Synapse commit
+        id: synapse-pin
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import re
+          from pathlib import Path
+          pin = json.loads(Path("spec/contracts/bounded-domain/bounded-domain-pin.json").read_text())
+          sha = pin.get("sourceCommit")
+          branch = pin.get("sourceBranch")
+          if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+              raise SystemExit("sourceCommit must be lowercase 40-hex Git SHA")
+          if branch != "production-runtime":
+              raise SystemExit("sourceBranch must be production-runtime")
+          print(f"sha={sha}")
+          print(f"branch={branch}")
+          PY
+
+      - name: Checkout pinned Aira Synapse domain authority
+        uses: actions/checkout@v4
+        with:
+          repository: Ryuhei-So/aira-synapse
+          ref: ${{ steps.synapse-pin.outputs.sha }}
+          path: .cross-repo/aira-synapse
+          fetch-depth: 0
+
+      - name: Verify byte-identical bounded domain authority
+        run: |
+          set -euo pipefail
+          sha='${{ steps.synapse-pin.outputs.sha }}'
+          branch='${{ steps.synapse-pin.outputs.branch }}'
+          test "$(git -C .cross-repo/aira-synapse rev-parse HEAD)" = "$sha"
+          git -C .cross-repo/aira-synapse fetch --no-tags origin "+refs/heads/$branch:refs/remotes/origin/$branch"
+          git -C .cross-repo/aira-synapse rev-parse --verify "refs/remotes/origin/$branch^{commit}" >/dev/null
+          git -C .cross-repo/aira-synapse merge-base --is-ancestor "$sha" "origin/$branch"
+          while IFS=$'\t' read -r source_path local_path; do
+            [ -n "$source_path" ]
+            [ "$(git -C .cross-repo/aira-synapse ls-tree -r "$sha" -- "$source_path" | wc -l)" -eq 1 ]
+            [ "$(git -C .cross-repo/aira-synapse ls-tree -r "$sha" -- "$source_path" | cut -d' ' -f1-2)" = "100644 blob" ]
+            cmp <(git -C .cross-repo/aira-synapse cat-file blob "$sha:$source_path") "spec/contracts/bounded-domain/$local_path"
+          done <<'EOF'
+          packages/memgraphrag/tests/fixtures/bounded-domain-contract.json	bounded-domain-contract.json
+          packages/memgraphrag/tests/fixtures/bounded-domain-fixture.json	bounded-domain-fixture.json
+          packages/memgraphrag/tests/fixtures/bounded-domain-fixture.manifest.json	bounded-domain-fixture.manifest.json
+          EOF
 
       - name: Setup Node 24
         uses: actions/setup-node@v4

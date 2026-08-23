@@ -1,0 +1,9 @@
+{
+  "contractFile": "bounded-domain-contract.json",
+  "contractSha256": "2d05969a93037c6c22f46b77e068d5d5d2fa5f85988eb923e7f7d7d78ab46ef1",
+  "contractVersion": "aira-synapse-domain-contract@1",
+  "fixtureFile": "bounded-domain-fixture.json",
+  "fixtureSha256": "8c3f0ca56dacc718e387ccfcbdcd5376b47b3a68a09e329461ed1c1e26c11601",
+  "fixtureVersion": "aira-synapse-bounded-domain-fixture@1",
+  "manifestVersion": "aira-synapse-bounded-domain-manifest@1"
+}
