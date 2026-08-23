@@ -410,6 +410,55 @@ private evidence from a hash alone.  Literature Hub CI is the authority that
 validates the detailed artifact, read-only copy manifest, required cases, and
 the equality between its redacted projection and the public attestation.
 
+The schema and checker have one executable authority.  Synapse owns a strict
+Zod contract, the generated JSON Schema, the deterministic artifact builder,
+and the private/public checker CLI.  The generated schema must be byte-derived
+from that Zod contract in CI; Literature Hub and GraphDB do not maintain a
+second field allow-list or a second comparison validator.  Literature Hub
+invokes the checker from an exact-SHA Synapse checkout, verifies that checkout
+and its behavior-path tree digest before passing any private artifact path, and
+records that evaluated Synapse authority in the artifact.  The checker emits
+stable error classes only and never logs private values.  Public repositories
+pin only the generated public schema and exact public-attestation bytes.
+
+Hashes bind bytes rather than caller assertions.  The copy-manifest hash is
+computed by the checker from the exact held manifest bytes; the fixture hash
+is computed from the exact held fixture bytes; and the public detailed-artifact
+hash is computed from the exact private artifact bytes supplied to projection.
+No API accepts any of those digests as an unverified replacement for the
+corresponding bytes.  Synapse's builder owns one deterministic UTF-8 JSON
+serialization (`JSON.stringify` over its fixed insertion-order DTO, two-space
+indent, one trailing LF, finite numbers only, and `-0` normalized to `0`).  A
+checker reserializes a parsed manifest, detailed artifact, or public
+attestation and requires byte equality before hashing it.  This avoids both a
+self-hash field and a second ad-hoc canonical-JSON implementation.
+
+Comparison evidence is derived, not declared.  Each result list has unique
+IDs, ranks exactly `1..N`, array order equal to rank order, finite scores, and
+the operation-specific deterministic ID tie order.  The checker associates
+before/after rows by ID, rejects unexplained additions/removals, recomputes
+counts, maximum absolute score delta, and maximum rank delta, and compares the
+recomputed values with the serialized summary.  Candidate, expansion, and PPR
+IDs/ranks must be identical and their scores must satisfy the versioned V15
+parity tolerance owned by Synapse.  The only V1 accepted semantic-change enum
+is the already-reviewed ID-keyed context-association correction; adding an
+enum value is a plan-version and parity-review change, not a free-form string.
+Missing object references may be nonzero in production, but their exact
+before/after skip behavior and counts must agree and the `missing-object`
+required case must pass.
+
+The builder derives the final verdict.  `pass` is valid only when every
+required case passes, every comparison and missing-object invariant above
+holds, all requested accepted changes belong to the closed V1 enum, and no
+unaccepted difference remains.  The checker independently derives the same
+verdict and rejects a serialized mismatch.  The public checker repeats all
+independently checkable shape, closed-enum, required-case, summary, source, and
+byte checks; only Literature Hub's private check is allowed to open the
+detailed artifact and copied inputs.  Evaluated implementation commits and
+behavior-path tree digests remain distinct from any later attestation-pin
+commit, so adding the attestation cannot change what was claimed to have been
+evaluated.
+
 Generation consumes a user-supplied read-only copied-state root and never
 opens the live canonical path.  Before reading, the tool rejects the live path,
 symlinks, non-regular files, unexpected hard links, and any copy manifest whose
