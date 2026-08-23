@@ -504,6 +504,19 @@ non-regular files, unexpected hard links, any repeated held `(dev, ino)`, and
 any copy manifest whose resolved files escape that root; it revalidates held
 file identity and hashes after measurement.  Thus no two roles can alias the
 same copied inode and no copied role can alias the live canonical generation.
+The Hub driver obtains the exact live canonical, owner-manifest, and
+descriptor-selected vector-blob identities from the configured owner boundary,
+opens those three roles metadata-only with no-follow authority, and holds their
+`(dev, ino, mount-id)` capabilities until copied-root validation finishes.
+Every held copied role is compared against every held live role, not merely
+against live path strings or `realpath`; equal `(dev, ino)` is rejected even
+when the mount ID and pathname differ.  Linux mount metadata is also checked so
+a copy root whose mount source is the live generation subtree is rejected
+before any copied payload byte is read.  The copy-driver negative suite injects
+a different pathname with the live `(dev, ino)` under a distinct mount ID (the
+bind-mount case), and the supported Linux E2E uses a real bind mount when its
+isolated mount namespace is available.  A platform unable to establish or
+compare the live identity capabilities fails closed.
 Logs and public artifacts redact copy roots, absolute
 paths, production identifiers, query text, and raw errors.  Private `--check`
 verifies the evaluated source authorities, detailed artifact and fixture
