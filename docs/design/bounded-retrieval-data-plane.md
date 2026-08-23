@@ -4,14 +4,15 @@ Status: design checkpoint only.  This document does not authorize native
 method or validator implementation.
 
 This design replaces the first issue-4 `retrieve_bounded` contract.  Aira
-Synapse is the sole query-policy authority.  Aira GraphDB provides three
-versioned, bounded data operations over one committed generation.  Literature
-Hub owns the generation session, availability policy, and retry circuit.
+Synapse is the sole query-policy authority.  Aira GraphDB provides two or three
+versioned, bounded data operations over one committed generation, depending on
+whether Synapse requests fact expansion.  Literature Hub owns the generation
+session, availability policy, and retry circuit.
 
 ## Decision
 
-One semantic retrieval uses three bulk operations inside one exclusive owner
-reader lease:
+One semantic retrieval uses two required and one optional bulk operation inside
+one exclusive owner reader lease:
 
 1. `candidate_search_bounded@1` performs explicitly requested vector searches
    and materializes only their domain objects.
@@ -46,8 +47,12 @@ Rejected alternatives:
 - Native owns storage lookup, exact vector arithmetic, graph arithmetic,
   domain-object lookup, work counters, checked allocation, and response
   framing for the requested data operations.
-- Synapse owns a machine-readable `V15RetrievalPlan` and the pure functions that
-  produce it.  The legacy JS path and bounded adapter call the same functions.
+- Synapse owns a machine-readable pre-acquire `V15RetrievalRequestPlan` and the
+  pure functions that derive each later operation plan from the preceding
+  validated response.  A complete downstream plan is deliberately not an
+  input to the session: candidate results do not exist before candidate
+  search, and final PPR seeds do not exist before optional fact expansion.
+  The legacy JS path and bounded adapter call the same stage builders.
   Synapse alone decides normalization, embedding, search slots, comparison
   mode, expansion parameters, seeds, PPR parameters, output limits, context,
   answer, and provenance.
@@ -70,13 +75,20 @@ may hold waiting HTTP requests, but a single `GenerationSession` owns one
 control connection, one reader connection, and one lease for the active query.
 The session:
 
-1. acquires committed generation N;
-2. heartbeats before TTL and awaits any in-flight renewal;
-3. passes N to every bulk operation and rejects any response not equal to N;
-4. permits a queued writer to mark the owner manifest dirty only at base N,
+1. validates the static request plan and unsupported-feature gate before owner
+   acquisition or any legacy memory/vector read;
+2. acquires committed generation N;
+3. heartbeats before TTL and awaits any in-flight renewal;
+4. performs candidate search, validates the exact per-slot response, and lets
+   Synapse derive the optional fact-expansion plan from those candidates;
+5. validates fact-expansion output when requested, then lets the shared
+   Synapse node-initialization helper derive the final PPR seed plan from the
+   candidate and expansion results;
+6. passes N to every bulk operation and rejects any response not equal to N;
+7. permits a queued writer to mark the owner manifest dirty only at base N,
    while native mutation/publication remains blocked;
-5. performs final renewal/validation after the last operation; and
-6. releases in `finally` exactly once.
+8. performs final renewal/validation after the last operation; and
+9. releases in `finally` exactly once.
 
 Lease loss, generation mismatch, reader disconnect, or failed final validation
 discards the whole retrieval.  A later concurrency version must use distinct
@@ -96,6 +108,26 @@ output.  Hybrid lexical RRF, dictionary injection, subquery decomposition, and
 other feature profiles remain unsupported by the bounded adapter until their
 own plan versions and parity fixtures exist.  Synapse, not native, fails closed
 when active feature flags lack a bounded plan.
+
+The versioned plan boundary is staged:
+
+- `V15RetrievalRequestPlan` contains only policy known before data access:
+  version/profile, corpus, context limit, exact ordered candidate slots,
+  comparison choice, PPR scalars, and output limits.
+- `V15FactExpansionPlan` is produced only from the validated candidate response
+  and the static comparison policy.  It is `null` when expansion is not
+  requested or no fact candidate can seed it.
+- `V15PprMaterializationPlan` is produced only after candidate search and any
+  requested expansion.  One shared pure node-initialization helper combines
+  those bounded results into the final signed seed map.  The legacy initializer
+  uses the same helper after obtaining its legacy data; the bounded path never
+  invokes `memory_load` or reconstructs a full snapshot first.
+
+All unsupported-feature checks and all static request validation happen before
+lease acquisition.  Dynamic operation plans are validated immediately after
+derivation and before their RPC.  No native default supplies a missing stage,
+and no caller may submit a fabricated complete plan that bypasses an earlier
+response.
 
 The v15 parity ledger is explicit:
 
@@ -121,11 +153,27 @@ and scores.  It is not described as parity until that evidence is accepted.
 
 ### Candidate search
 
-Synapse supplies an ordered list of slots containing namespace, finite query
-vector, threshold, and result limit.  Native returns one ordered result list
-per slot with exact cosine score, native id, and the complete corresponding
-Passage, Fact, or Schema object.  It returns a missing-object integrity error
-only after the parity-ledger gate above selects that hardening.
+Synapse supplies an ordered list of slots containing a unique stable `slotId`,
+namespace, finite query vector, threshold, and result limit.  V15 requires the
+exact `passage`, `fact`, and `schema` slot set in canonical order; a later plan
+version may declare a different set.  Native returns one ordered result list
+per slot, echoing `slotId` and namespace, with exact cosine score, native id,
+and the complete corresponding Passage, Fact, or Schema object.  It returns a
+missing-object integrity error only after the parity-ledger gate above selects
+that hardening.
+
+The response cardinality, slot order, echoed ids, and namespaces must match the
+request exactly before Synapse uses any hit.  Fixed namespace-wide response
+arrays are not the contract because they cannot preserve repeated or reordered
+slots in a future version.
+
+Each slot returns at most its requested limit.  Every hit has a finite cosine
+score in `[-1,1]` that satisfies that slot's threshold, and the list is strictly
+ordered by score descending then native id ascending with no duplicate native
+id.  The native id prefix, domain-object kind, embedded object id, and object
+`corpusId` must agree with the requested namespace and corpus.  Synapse checks
+the complete response envelope and every hit before deriving the next stage;
+native enforces the same schema while constructing the bounded response.
 
 Candidate order is score descending then native id ascending.  The same order
 must already be active in the legacy JS reference.  Candidate and domain object
@@ -146,11 +194,41 @@ returns derived score descending then fact id ascending.  It includes inactive
 facts to preserve v15 behavior.  It does not detect comparison queries or
 choose normalization, attenuation, or limits.
 
+The digest is the literal
+`v15-entity-normalization-ecmascript-tolowercase-unicode16.0.0@1`, not an
+arbitrary non-empty string.  It means full-string, locale-insensitive Unicode
+16.0.0 lowercase with no extra normalization.  Its data authority is the
+Unicode 16.0.0 UCD `UnicodeData.txt` SHA-256
+`ff58e5823bd095166564a006e47d111130813dcf8bf234ef79fa51a870edb48f`,
+`SpecialCasing.txt` SHA-256
+`8d5de354eef79f2395a54c9c7dcebbaf3d30fc962d0f85611ea97aa973a0c451`,
+and `DerivedCoreProperties.txt` SHA-256
+`39d35161f2954497f69e08bdb9e701493f476a3d30222de20028feda36c1dabd`.
+
+One generator owned by Synapse emits both the native lookup artifact and a
+manifested conformance fixture from those exact files.  The fixture exhausts
+every Unicode scalar's default lowercase mapping and every non-locale
+conditional `SpecialCasing` context, including all generated Final_Sigma
+Cased/Case_Ignorable boundary cases; it also covers invalid-scalar rejection
+at the JSON/string boundary.  Synapse's supported Node runtime must prove its
+full-string `String.prototype.toLowerCase()` output equals that fixture, and
+native must use the generated table rather than its host library's ambient
+Unicode version.  Both repositories pin the byte-identical generator input,
+fixture, lookup artifact, and manifest SHA.  Any UCD, generator, supported
+runtime, or output change requires a new digest and plan version.  Unknown
+digests fail in Synapse before the owner/native call and fail again in native
+as defense in depth.
+
 ### PPR and materialization
 
 Synapse supplies the final bounded node-id/finite-score seed map,
 `teleportProbability`, `convergenceEpsilon`, `maxIterations`,
 `hubDegreeThreshold`, and separate passage/entity rank limits.
+
+`hubDegreeThreshold` has one authority: the QueryService PPR policy placed in
+the shared PPR request/plan.  `SimplePPR` consumes that request value; it has no
+independent constructor default that can disagree with the emitted native
+plan.
 
 The shared reference and native use these canonical orders:
 
@@ -278,16 +356,33 @@ Before typed operation implementation:
 
 - delete the superseded single-RPC contract, fixtures, ignored test, and local
   error definitions so only this design remains authoritative;
-- land the Synapse `V15RetrievalPlan`/ordering helpers and cross-repository
-  domain/parity fixtures without weakening its existing test gates;
+- freeze the Synapse staged request/operation-plan helpers and ordering helpers
+  without weakening its existing test gates, but do not approve or merge them
+  until the following copied-production and cross-repository evidence exists;
+- record an immutable parity artifact naming the copied canonical generation,
+  canonical/manifest/blob hashes, Synapse base and candidate SHAs, GraphDB SHA,
+  fixture SHA, exact command and supported runtimes, plus before/after ids,
+  ranks, scores, maximum score delta, absent-seed behavior, signed sum `S <= 0`,
+  dangling loss, hub damping, and convergence;
+- add SHA-pinned cross-repository fixtures for candidate/domain shapes and the
+  normalization vectors described above, and verify byte-identical fixture
+  authority in both repositories;
 - replace the context-builder index zip with an id-keyed association shared by
   legacy and bounded paths; treat this score/provenance correction as semantic
-  hardening and record copied-production rank/score changes before rollout;
+  hardening covered by the same pre-merge parity artifact;
 - test the exclusive `GenerationSession`: renewal ordering, lease loss,
   `finally` release, queued writer, and two simultaneous HTTP requests where
   only one session is active.
 
 Before native algorithm wiring:
+
+- prove that a bounded request can be constructed before candidate access and
+  then proceeds candidate -> optional expansion -> shared seed builder -> PPR
+  without `memory_load`, global projection transfer, or a legacy vector scan;
+- reject wrong slot cardinality/order/id/namespace and a wrong normalization
+  digest before the next owner/native operation;
+- test that the legacy `SimplePPR` execution and emitted PPR plan consume the
+  same `hubDegreeThreshold` authority, including dependency-injected values;
 
 - executable validator tests cover every type, unknown field, safe-generation
   boundary, signed/non-finite score, count/byte/allocation formula, operation
