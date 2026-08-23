@@ -10,6 +10,19 @@ The build manifest beside each binary (`<binary>.manifest.json`) must contain
 `buildCommand`. The harness rejects stale or modified binaries, missing
 generation descriptors, WAL/recovery state, and ambiguous blob identities.
 
+After a clean exact checkout and supported build, generate the attestation
+before running the benchmark:
+
+```sh
+node scripts/native-build-manifest.mjs \
+  --repo /path/to/aira-graphdb \
+  --binary /path/to/aira-graphdb/target/release/aira-graphdb-native \
+  --source-sha "$(git -C /path/to/aira-graphdb rev-parse HEAD)" \
+  --cargo-profile release \
+  --rustc-version "$(rustc --version)" \
+  --build-command 'cargo build --release --bin aira-graphdb-native'
+```
+
 SIGINT/SIGTERM kills active native process groups, removes the owned temporary
 workspace in `finally`, and exits `128+signal`. SIGKILL cannot run cleanup. A
 stale workspace is safe to remove only after confirming it is a directory named

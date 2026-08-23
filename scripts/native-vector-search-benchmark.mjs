@@ -256,7 +256,7 @@ function runRequest(child, request, timeoutMs) {
   });
 }
 
-async function runBinary(binary, request, repetitions, timeoutMs, preload, startupTimeoutMs, sampleIntervalMs) {
+async function runBinary(binary, request, repetitions, timeoutMs, preload, startupTimeoutMs, sampleIntervalMs, deadline) {
   const samples = [];
   let sampleCount = 0;
   const preloadMs = [];
@@ -278,9 +278,11 @@ async function runBinary(binary, request, repetitions, timeoutMs, preload, start
     }, sampleIntervalMs) : null;
     try {
       if (preload) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw Object.assign(new Error('overall benchmark deadline exceeded'), { code: 'OVERALL_DEADLINE' });
         const preloadStart = process.hrtime.bigint();
         try {
-          assertRpcOk(await runRequest(child, { id: repetition * 3 + 1, method: 'ping', params: {} }, startupTimeoutMs), 'ping');
+          assertRpcOk(await runRequest(child, { id: repetition * 3 + 1, method: 'ping', params: {} }, Math.min(startupTimeoutMs, remaining)), 'ping');
           preloadMs.push(Number(process.hrtime.bigint() - preloadStart) / 1e6);
         } catch (error) {
           const detail = errorDetail(error);
@@ -290,9 +292,11 @@ async function runBinary(binary, request, repetitions, timeoutMs, preload, start
         }
       }
       const coldStart = process.hrtime.bigint();
+      const coldRemaining = deadline - Date.now();
+      if (coldRemaining <= 0) throw Object.assign(new Error('overall benchmark deadline exceeded'), { code: 'OVERALL_DEADLINE' });
       let cold;
       try {
-        cold = assertRpcOk(await runRequest(child, { ...request.rpc, id: repetition * 3 + 2 }, timeoutMs), 'vector_search');
+        cold = assertRpcOk(await runRequest(child, { ...request.rpc, id: repetition * 3 + 2 }, Math.min(timeoutMs, coldRemaining)), 'vector_search');
         coldMs.push(Number(process.hrtime.bigint() - coldStart) / 1e6);
       } catch (error) {
         const detail = errorDetail(error);
@@ -302,8 +306,10 @@ async function runBinary(binary, request, repetitions, timeoutMs, preload, start
       }
       const coldParity = resultParity(cold);
       const warmStart = process.hrtime.bigint();
+      const warmRemaining = deadline - Date.now();
+      if (warmRemaining <= 0) throw Object.assign(new Error('overall benchmark deadline exceeded'), { code: 'OVERALL_DEADLINE' });
       try {
-        const warm = assertRpcOk(await runRequest(child, { ...request.rpc, id: repetition * 3 + 3 }, timeoutMs), 'vector_search');
+        const warm = assertRpcOk(await runRequest(child, { ...request.rpc, id: repetition * 3 + 3 }, Math.min(timeoutMs, warmRemaining)), 'vector_search');
         warmMs.push(Number(process.hrtime.bigint() - warmStart) / 1e6);
         parity.push({ cold: coldParity, warm: resultParity(warm) });
       } catch (error) {
@@ -371,7 +377,10 @@ async function runCounterbalanced(binaries, request, repetitions, timeoutMs, pre
       const remaining = deadline - Date.now();
       if (remaining <= 0) throw Object.assign(new Error('overall benchmark deadline exceeded'), { code: 'OVERALL_DEADLINE' });
       executionOrder.push({ repetition: repetition + 1, binary: label });
-      runs[label].push(await runBinary(binaries[label], request, 1, Math.min(timeoutMs, remaining), preload, Math.min(startupTimeoutMs, remaining), sampleIntervalMs));
+      const result = await runBinary(binaries[label], request, 1, Math.min(timeoutMs, remaining), preload, Math.min(startupTimeoutMs, remaining), sampleIntervalMs, deadline);
+      runs[label].push(result);
+      const failed = result.parity.find((entry) => entry.preload?.ok === false || entry.cold?.ok === false || entry.warm?.ok === false);
+      if (failed) throw Object.assign(new Error(failed.preload?.error?.message ?? failed.cold?.error?.message ?? failed.warm?.error?.message ?? 'native RPC failed'), { code: 'NATIVE_RPC_FAILED', nativeError: failed.preload?.error ?? failed.cold?.error ?? failed.warm?.error });
     }
   }
   return { old: combineRuns(runs.old), new: combineRuns(runs.new), executionOrder };
@@ -562,6 +571,6 @@ if (artifact.failures.length > 0 || parity.some((entry) => !entry.coldEqual || !
 
 main().catch((error) => {
   console.error(error.stack ?? error.message ?? String(error));
-  console.log(JSON.stringify({ schema: 'aira.native-vector-search-benchmark.v2', failures: [{ code: error.code ?? 'BENCHMARK_FAILED', message: error.message ?? String(error) }] }));
+  console.log(JSON.stringify({ schema: 'aira.native-vector-search-benchmark.v2', failures: [{ code: error.nativeError?.code ?? error.code ?? 'BENCHMARK_FAILED', message: error.nativeError?.message ?? error.message ?? String(error) }] }));
   process.exitCode = terminationSignal ? 128 + (terminationSignal === 'SIGINT' ? 2 : 15) : 1;
 });

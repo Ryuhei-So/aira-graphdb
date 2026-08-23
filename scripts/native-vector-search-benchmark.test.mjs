@@ -1,16 +1,18 @@
 import assert from 'node:assert/strict';
-import { chmod, link, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
 
 const exec = promisify(execFile);
 const script = new URL('./native-vector-search-benchmark.mjs', import.meta.url).pathname;
+const manifestScript = new URL('./native-build-manifest.mjs', import.meta.url).pathname;
 
-async function fixture({ descriptor = true, descriptorSize, descriptorSha, generation = 1, format = 1 } = {}) {
+async function fixture({ descriptor = true, descriptorSize, descriptorSha, generation = 1, format = 1, slow = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'aira-bench-test-'));
   const db = join(directory, 'snapshot.json');
   const blob = join(directory, 'snapshot.vblob');
@@ -23,7 +25,7 @@ async function fixture({ descriptor = true, descriptorSize, descriptorSha, gener
   const blobSha = createHash('sha256').update('vectors').digest('hex');
   const state = descriptor ? { generation, vectorBlob: { basename: 'snapshot.vblob', size: descriptorSize ?? 7, sha256: descriptorSha ?? blobSha, format } } : { generation: 0, vectors: {} };
   await writeFile(db, JSON.stringify(state));
-  const native = '#!/bin/sh\nwhile IFS= read -r line; do printf \'{"ok":true,"result":[]}\\n\'; done\n';
+  const native = slow ? '#!/bin/sh\nwhile IFS= read -r line; do sleep 30; printf \'{"ok":true,"result":[]}\\n\'; done\n' : '#!/bin/sh\nwhile IFS= read -r line; do printf \'{"ok":true,"result":[]}\\n\'; done\n';
   await writeFile(old, native); await writeFile(newer, `${native}# distinct build\n`);
   await chmod(old, 0o700); await chmod(newer, 0o700);
   for (const repo of [oldDir, newDir]) {
@@ -51,6 +53,11 @@ async function run(args) {
   }
 }
 
+async function runManifest(args) {
+  try { await exec(process.execPath, [manifestScript, ...args], { encoding: 'utf8' }); return 0; }
+  catch (error) { return error.code; }
+}
+
 function argsFor(fixtureData, extra = []) {
   return ['--db', fixtureData.db, '--blob', fixtureData.blob, '--old', fixtureData.old, '--new', fixtureData.newer, '--old-sha', fixtureData.oldSha, '--new-sha', fixtureData.newSha, ...extra];
 }
@@ -59,6 +66,37 @@ test('requires explicit blob, pinned SHAs, even repetitions, and has no output-p
   const f = await fixture();
   assert.notEqual((await run(['--db', f.db, '--old', f.old, '--new', f.new, '--out', join(f.directory, 'x')])).code, 0);
   assert.notEqual((await run(argsFor(f, ['--repetitions', '3'])).code), 0);
+});
+
+test('build manifest generator proves clean exact checkout and rejects drift', async () => {
+  const f = await fixture();
+  await unlink(`${f.old}.manifest.json`);
+  assert.equal(await runManifest(['--repo', f.old.slice(0, f.old.lastIndexOf('/')), '--binary', f.old, '--source-sha', f.oldSha]), 0);
+  const dirty = await fixture();
+  await unlink(`${dirty.newer}.manifest.json`);
+  await writeFile(join(dirty.newer.slice(0, dirty.newer.lastIndexOf('/')), 'dirty.txt'), 'dirty');
+  assert.notEqual(await runManifest(['--repo', dirty.newer.slice(0, dirty.newer.lastIndexOf('/')), '--binary', dirty.newer, '--source-sha', dirty.newSha]), 0);
+  const modified = await fixture();
+  await unlink(`${modified.newer}.manifest.json`);
+  await writeFile(modified.newer, '#!/bin/sh\nmodified\n');
+  assert.notEqual(await runManifest(['--repo', modified.newer.slice(0, modified.newer.lastIndexOf('/')), '--binary', modified.newer, '--source-sha', modified.newSha]), 0);
+});
+
+test('SIGTERM kills child and removes owned temporary workspace', async () => {
+  const f = await fixture({ slow: true });
+  const child = spawn(process.execPath, [script, ...argsFor(f, ['--repetitions', '2', '--timeout-ms', '60000', '--startup-timeout-ms', '60000'])], { cwd: f.directory, env: { ...process.env, TMPDIR: f.directory }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const deadline = Date.now() + 5000;
+  let workspaces = [];
+  while (Date.now() < deadline) {
+    workspaces = (await readdir(f.directory)).filter((entry) => entry.startsWith('aira-vector-benchmark-'));
+    if (workspaces.length > 0) break;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+  }
+  assert.ok(workspaces.length > 0);
+  child.kill('SIGTERM');
+  const exit = await new Promise((resolvePromise) => child.once('close', (code, signal) => resolvePromise({ code, signal })));
+  assert.equal(exit.code, 143);
+  assert.equal((await readdir(f.directory)).filter((entry) => entry.startsWith('aira-vector-benchmark-')).length, 0);
 });
 
 test('rejects symlink/hardlink sources and WAL before native execution', async () => {

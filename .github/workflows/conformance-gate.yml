@@ -26,6 +26,7 @@ jobs:
 
       - name: Run vector benchmark harness tests
         run: |
+          node --check scripts/native-build-manifest.mjs
           node --check scripts/native-vector-search-benchmark.mjs
           node --test scripts/native-vector-search-benchmark.test.mjs
 
