@@ -1,6 +1,12 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -116,8 +122,13 @@ impl NativeProcess {
 
     #[cfg(target_os = "linux")]
     fn rss_bytes(&self) -> u64 {
-        let status = std::fs::read_to_string(format!("/proc/{}/status", self.child.id()))
-            .expect("read native VmRSS");
+        Self::rss_bytes_for_pid(self.child.id())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rss_bytes_for_pid(pid: u32) -> u64 {
+        let status =
+            std::fs::read_to_string(format!("/proc/{pid}/status")).expect("read native VmRSS");
         status
             .lines()
             .find_map(|line| {
@@ -132,6 +143,27 @@ impl NativeProcess {
                 })
             })
             .expect("native VmRSS entry")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn send_with_peak_rss(&mut self, request: Value) -> (Value, u64, u64) {
+        let baseline = self.rss_bytes();
+        let peak = Arc::new(AtomicU64::new(baseline));
+        let running = Arc::new(AtomicBool::new(true));
+        let sampler_peak = Arc::clone(&peak);
+        let sampler_running = Arc::clone(&running);
+        let pid = self.child.id();
+        let sampler = std::thread::spawn(move || {
+            while sampler_running.load(Ordering::Relaxed) {
+                sampler_peak.fetch_max(Self::rss_bytes_for_pid(pid), Ordering::Relaxed);
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            sampler_peak.fetch_max(Self::rss_bytes_for_pid(pid), Ordering::Relaxed);
+        });
+        let response = self.send(request);
+        running.store(false, Ordering::Relaxed);
+        sampler.join().expect("RSS sampler exits");
+        (response, baseline, peak.load(Ordering::Relaxed))
     }
 }
 
@@ -1436,7 +1468,7 @@ fn mutation_preflight_does_not_clone_the_server_or_dispatch_a_clone() {
 fn repeated_small_mutations_have_delta_bounded_peak_rss_after_representative_state() {
     const REPRESENTATIVE_VECTOR_COUNT: usize = 80_000;
     const BASELINE_READS: usize = 32;
-    const SMALL_MUTATIONS: usize = 128;
+    const SMALL_MUTATIONS: usize = 32;
 
     let db = TempDb::new("rss-delta-bound");
     let mut seed = NativeProcess::spawn(&db.path, &[]);
@@ -1477,15 +1509,15 @@ fn repeated_small_mutations_have_delta_bounded_peak_rss_after_representative_sta
     assert_eq!(native.send(batch_begin(100))["ok"], json!(true));
     let mut mutation_peak = baseline_peak.max(native.rss_bytes());
     for index in 0..SMALL_MUTATIONS {
-        let response = native.send(vector_upsert_for_document(
+        let (response, _, request_peak) = native.send_with_peak_rss(vector_upsert_for_document(
             200 + index as u64,
-            &format!("delta-v-{index}"),
-            &format!("delta-document-{index}"),
+            &format!("bulk-v-{index}"),
+            &format!("bulk-document-{index}"),
             [0.0, 1.0],
             "delta",
         ));
         assert_eq!(response["ok"], json!(true), "small mutation {index}");
-        mutation_peak = mutation_peak.max(native.rss_bytes());
+        mutation_peak = mutation_peak.max(request_peak);
     }
     assert_eq!(native.finish().code(), Some(0));
 

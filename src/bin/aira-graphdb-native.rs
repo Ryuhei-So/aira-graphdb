@@ -158,9 +158,15 @@ enum TransactionState {
         base_generation: u64,
         mutation_seen: bool,
     },
+    RecoveryPending {
+        base_generation: u64,
+        wal_digest: [u8; 32],
+        record_count: usize,
+        wal_device: u64,
+        wal_inode: u64,
+    },
 }
 
-#[derive(Clone)]
 struct Server {
     db_path: PathBuf,
     audit_log_path: PathBuf,
@@ -210,6 +216,11 @@ const METHOD_SPECS: &[MethodSpec] = &[
     MethodSpec {
         name: "batch_commit",
         classification: "commit",
+        wal: false,
+    },
+    MethodSpec {
+        name: "recovery_discard",
+        classification: "recovery",
         wal: false,
     },
     MethodSpec {
@@ -424,6 +435,18 @@ impl Server {
         }
     }
 
+    fn metadata_identity(metadata: &fs::Metadata) -> (u64, u64) {
+        #[cfg(unix)]
+        {
+            (metadata.dev(), metadata.ino())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            (0, 0)
+        }
+    }
+
     fn require_regular_single_link(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
         if !metadata.file_type().is_file() {
             return Err(io::Error::other(format!(
@@ -479,6 +502,24 @@ impl Server {
         let mut raw = Vec::new();
         file.read_to_end(&mut raw)?;
         Ok(raw)
+    }
+
+    fn read_regular_nofollow_with_identity(path: &Path) -> io::Result<(Vec<u8>, (u64, u64))> {
+        let path_metadata = fs::symlink_metadata(path)?;
+        Self::require_regular_single_link(path, &path_metadata)?;
+        let mut file = Self::open_regular_nofollow(path)?;
+        let file_metadata = file.metadata()?;
+        let path_identity = Self::metadata_identity(&path_metadata);
+        let file_identity = Self::metadata_identity(&file_metadata);
+        if path_identity != file_identity {
+            return Err(io::Error::other(format!(
+                "{} changed while being opened",
+                path.display()
+            )));
+        }
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)?;
+        Ok((raw, file_identity))
     }
 
     #[allow(dead_code)]
@@ -687,14 +728,13 @@ impl Server {
     }
 
     fn failpoint_matches(var_name: &str, stage: &str) -> bool {
-        let after = format!("after_{stage}");
-        let before = format!("before_{stage}");
         std::env::var(var_name)
             .ok()
             .map(|value| {
-                value.split(',').map(str::trim).any(|candidate| {
-                    candidate == stage || candidate == after || candidate == before
-                })
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .any(|candidate| candidate == stage)
             })
             .unwrap_or(false)
     }
@@ -730,21 +770,23 @@ impl Server {
     fn write_durable_temp(target: &Path, bytes: &[u8], sync_stage: &str) -> io::Result<PathBuf> {
         let tmp_path = Self::temporary_path(target, sync_stage)?;
         let result = (|| {
-            Self::durability_failpoint(&format!("{sync_stage}_create"))?;
+            Self::durability_failpoint(&format!("before_{sync_stage}_create"))?;
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&tmp_path)
                 .map_err(|err| io::Error::other(format!("create temp file failed: {err}")))?;
-            Self::durability_failpoint(&format!("{sync_stage}_write"))?;
+            Self::durability_failpoint(&format!("after_{sync_stage}_create"))?;
+            Self::durability_failpoint(&format!("before_{sync_stage}_write"))?;
             file.write_all(bytes)
                 .map_err(|err| io::Error::other(format!("write temp file failed: {err}")))?;
             file.flush()
                 .map_err(|err| io::Error::other(format!("flush temp file failed: {err}")))?;
-            Self::durability_failpoint(&format!("{sync_stage}_fsync"))?;
+            Self::durability_failpoint(&format!("after_{sync_stage}_write"))?;
+            Self::durability_failpoint(&format!("before_{sync_stage}_fsync"))?;
             file.sync_all()
                 .map_err(|err| io::Error::other(format!("sync temp file failed: {err}")))?;
-            Self::durability_failpoint(sync_stage)?;
+            Self::durability_failpoint(&format!("after_{sync_stage}_fsync"))?;
             Ok::<(), io::Error>(())
         })();
         if let Err(err) = result {
@@ -964,7 +1006,7 @@ impl Server {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 let blob_tmp =
                     Self::write_durable_temp(&blob_path, &vector_blob_payload, "blob_temp_sync")?;
-                if let Err(err) = Self::durability_failpoint("blob_rename") {
+                if let Err(err) = Self::durability_failpoint("before_blob_rename") {
                     let _ = fs::remove_file(&blob_tmp);
                     return Err(err);
                 }
@@ -974,14 +1016,14 @@ impl Server {
                         "publish vector blob failed: {err}"
                     )));
                 }
-                Self::durability_failpoint("blob_rename")?;
+                Self::durability_failpoint("after_blob_rename")?;
                 Self::read_validated_blob(&blob_path, Some(&blob_descriptor))?;
             }
             Err(err) => return Err(err),
         }
-        Self::durability_failpoint("blob_dir_fsync")?;
+        Self::durability_failpoint("before_blob_dir_fsync")?;
         Self::sync_parent_dir(&parent)?;
-        Self::durability_failpoint("blob_dir_fsync")?;
+        Self::durability_failpoint("after_blob_dir_fsync")?;
 
         persisted_state.generation = next_generation;
         persisted_state.vector_blob = Some(blob_descriptor.clone());
@@ -993,7 +1035,7 @@ impl Server {
             Err(err) => return Err(err),
         }
         let json_tmp = Self::write_durable_temp(&self.db_path, &raw, "json_temp_sync")?;
-        if let Err(err) = Self::durability_failpoint("json_rename") {
+        if let Err(err) = Self::durability_failpoint("before_json_rename") {
             let _ = fs::remove_file(&json_tmp);
             return Err(err);
         }
@@ -1003,20 +1045,20 @@ impl Server {
                 "publish canonical state failed: {err}"
             )));
         }
-        Self::durability_failpoint("json_rename")?;
-        Self::durability_failpoint("json_dir_fsync")?;
+        Self::durability_failpoint("after_json_rename")?;
+        Self::durability_failpoint("before_json_dir_fsync")?;
         Self::sync_parent_dir(&parent)?;
-        Self::durability_failpoint("json_dir_fsync")?;
+        Self::durability_failpoint("after_json_dir_fsync")?;
 
         if self.wal_path.exists() {
-            Self::durability_failpoint("wal_retire")?;
+            Self::durability_failpoint("before_wal_retire")?;
             fs::remove_file(&self.wal_path)
                 .map_err(|err| io::Error::other(format!("retire WAL failed: {err}")))?;
         }
-        Self::durability_failpoint("wal_retire")?;
-        Self::durability_failpoint("final_dir_fsync")?;
+        Self::durability_failpoint("after_wal_retire")?;
+        Self::durability_failpoint("before_final_dir_fsync")?;
         Self::sync_parent_dir(&parent)?;
-        Self::durability_failpoint("final_dir_fsync")?;
+        Self::durability_failpoint("after_final_dir_fsync")?;
 
         self.state = persisted_state;
         self.last_persist_bytes = raw.len() as u64;
@@ -1052,12 +1094,14 @@ impl Server {
         Self::method_spec(method).is_some_and(|spec| spec.wal)
     }
 
-    fn read_wal_records(&self) -> io::Result<Vec<WalRecord>> {
-        if !self.wal_path.exists() {
-            return Ok(Vec::new());
-        }
-        let content = fs::read_to_string(&self.wal_path)
-            .map_err(|err| io::Error::other(format!("read WAL failed: {err}")))?;
+    fn read_wal_records_with_identity(&self) -> io::Result<(Vec<WalRecord>, Option<(u64, u64)>)> {
+        let (raw, identity) = match Self::read_regular_nofollow_with_identity(&self.wal_path) {
+            Ok(result) => result,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), None)),
+            Err(err) => return Err(io::Error::other(format!("read WAL failed: {err}"))),
+        };
+        let content = std::str::from_utf8(&raw)
+            .map_err(|err| io::Error::other(format!("WAL is not UTF-8: {err}")))?;
         let mut records = Vec::new();
         for (line_number, line) in content.lines().enumerate() {
             if line.trim().is_empty() {
@@ -1122,16 +1166,23 @@ impl Server {
             }
             records.push(record);
         }
-        Ok(records)
+        Ok((records, Some(identity)))
+    }
+
+    fn read_wal_records(&self) -> io::Result<Vec<WalRecord>> {
+        self.read_wal_records_with_identity()
+            .map(|(records, _)| records)
     }
 
     fn rewrite_wal_records(&self, records: &[WalRecord]) -> io::Result<()> {
         if records.is_empty() {
             if self.wal_path.exists() {
-                Self::durability_failpoint("wal_retire")?;
+                Self::durability_failpoint("before_wal_rewrite_retire")?;
                 fs::remove_file(&self.wal_path)?;
-                Self::durability_failpoint("wal_dir_fsync")?;
+                Self::durability_failpoint("after_wal_rewrite_retire")?;
+                Self::durability_failpoint("before_wal_rewrite_dir_fsync")?;
                 Self::sync_parent_dir(&Self::parent_dir(&self.wal_path))?;
+                Self::durability_failpoint("after_wal_rewrite_dir_fsync")?;
             }
             return Ok(());
         }
@@ -1143,13 +1194,34 @@ impl Server {
             bytes.push(b'\n');
         }
         let tmp = Self::write_durable_temp(&self.wal_path, &bytes, "wal_compact_sync")?;
-        Self::durability_failpoint("wal_rename")?;
+        Self::durability_failpoint("before_wal_rewrite_rename")?;
         if let Err(err) = fs::rename(&tmp, &self.wal_path) {
             let _ = fs::remove_file(&tmp);
             return Err(io::Error::other(format!("replace WAL failed: {err}")));
         }
-        Self::durability_failpoint("wal_dir_fsync")?;
-        Self::sync_parent_dir(&Self::parent_dir(&self.wal_path))
+        Self::durability_failpoint("after_wal_rewrite_rename")?;
+        Self::durability_failpoint("before_wal_rewrite_dir_fsync")?;
+        Self::sync_parent_dir(&Self::parent_dir(&self.wal_path))?;
+        Self::durability_failpoint("after_wal_rewrite_dir_fsync")
+    }
+
+    fn encoded_wal_records(records: &[WalRecord]) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        for record in records {
+            let encoded = serde_json::to_vec(record)
+                .map_err(|err| io::Error::other(format!("serialize WAL failed: {err}")))?;
+            bytes.extend_from_slice(&encoded);
+            bytes.push(b'\n');
+        }
+        Ok(bytes)
+    }
+
+    fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
+        Sha256::digest(bytes).into()
+    }
+
+    fn digest_hex(digest: &[u8; 32]) -> String {
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     fn wal_append(&mut self, request: &RpcRequest) -> io::Result<()> {
@@ -1167,23 +1239,25 @@ impl Server {
             .create(true)
             .append(true)
             .open(&self.wal_path)?;
-        Self::durability_failpoint("wal_write")?;
+        Self::durability_failpoint("before_wal_write")?;
         file.write_all(&encoded)?;
         file.write_all(b"\n")?;
         file.flush()?;
-        Self::durability_failpoint("wal_sync")?;
+        Self::durability_failpoint("after_wal_write")?;
+        Self::durability_failpoint("before_wal_sync")?;
         file.sync_data()?;
+        Self::durability_failpoint("after_wal_sync")?;
         if !wal_preexisted {
-            Self::durability_failpoint("wal_dir_fsync")?;
+            Self::durability_failpoint("before_wal_dir_fsync")?;
             Self::sync_parent_dir(&parent)?;
+            Self::durability_failpoint("after_wal_dir_fsync")?;
         }
-        Self::durability_failpoint("wal_sync")?;
         self.wal_bytes += encoded.len() as u64 + 1;
         Ok(())
     }
 
     fn replay_wal(&mut self) -> io::Result<usize> {
-        let records = self.read_wal_records()?;
+        let (records, mut wal_identity) = self.read_wal_records_with_identity()?;
         let generation = self.state.generation;
         let mut replayable = Vec::new();
         let mut skipped = 0usize;
@@ -1201,25 +1275,138 @@ impl Server {
         }
         if skipped > 0 {
             self.rewrite_wal_records(&replayable)?;
+            wal_identity = self.read_wal_records_with_identity()?.1;
         }
-        self.wal_replaying = true;
-        self.transaction = TransactionState::Idle;
-        let mut replayed = 0usize;
-        for record in replayable {
-            let resp = self.handle_prepared(record.request);
-            if !resp.ok {
-                self.wal_replaying = false;
-                return Err(io::Error::other("WAL replay request failed"));
-            }
-            replayed += 1;
-        }
-        self.wal_replaying = false;
         self.wal_bytes = fs::metadata(&self.wal_path).map(|m| m.len()).unwrap_or(0);
+        if replayable.is_empty() {
+            self.transaction = TransactionState::Idle;
+            eprintln!("[wal] recoveryPending=false skipped={skipped} bytes=0");
+            return Ok(0);
+        }
+        let encoded = Self::encoded_wal_records(&replayable)?;
+        let digest = Self::digest_bytes(&encoded);
+        let (wal_device, wal_inode) = wal_identity.ok_or_else(|| {
+            io::Error::other("recovery WAL disappeared before entering recovery pending")
+        })?;
+        self.transaction = TransactionState::RecoveryPending {
+            base_generation: generation,
+            wal_digest: digest,
+            record_count: replayable.len(),
+            wal_device,
+            wal_inode,
+        };
         eprintln!(
-            "[wal] replayed={} skipped={} bytes={}",
-            replayed, skipped, self.wal_bytes
+            "[wal] recoveryPending=true generation={} records={} skipped={} bytes={} digest={}",
+            generation,
+            replayable.len(),
+            skipped,
+            self.wal_bytes,
+            Self::digest_hex(&digest),
         );
-        Ok(replayed)
+        Ok(replayable.len())
+    }
+
+    fn discard_recovery(&mut self, params: &Value) -> Result<Value, AppError> {
+        let TransactionState::RecoveryPending {
+            base_generation,
+            wal_digest,
+            record_count,
+            wal_device,
+            wal_inode,
+        } = self.transaction
+        else {
+            return Err(Self::execution_client_error(
+                "recovery_discard requires recovery pending".to_string(),
+            ));
+        };
+        let object = params.as_object().ok_or_else(|| {
+            Self::execution_client_error("recovery params must be an object".to_string())
+        })?;
+        let expected_generation = object
+            .get("baseGeneration")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Self::execution_client_error("missing baseGeneration".to_string()))?;
+        let expected_digest = object
+            .get("walDigest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Self::execution_client_error("missing walDigest".to_string()))?;
+        let actual_digest = Self::digest_hex(&wal_digest);
+        if expected_generation != base_generation || expected_digest != actual_digest {
+            return Err(Self::execution_client_error(
+                "recovery compare-and-swap failed".to_string(),
+            ));
+        }
+        let (current_records, current_identity) = self
+            .read_wal_records_with_identity()
+            .map_err(|err| Self::execution_io_error(format!("revalidate recovery WAL: {err}")))?;
+        let Some((current_device, current_inode)) = current_identity else {
+            return Err(Self::execution_io_error(
+                "recovery WAL disappeared before quarantine".to_string(),
+            ));
+        };
+        let current_encoded = Self::encoded_wal_records(&current_records)
+            .map_err(|err| Self::execution_io_error(format!("canonicalize recovery WAL: {err}")))?;
+        let current_digest = Self::digest_bytes(&current_encoded);
+        if current_device != wal_device
+            || current_inode != wal_inode
+            || current_digest != wal_digest
+            || current_records.len() != record_count
+            || current_records
+                .iter()
+                .any(|record| record.base_generation != base_generation)
+        {
+            return Err(Self::execution_io_error(
+                "recovery WAL changed before quarantine".to_string(),
+            ));
+        }
+        let parent = Self::parent_dir(&self.wal_path);
+        let nonce = Self::crypto_nonce().map_err(|err| {
+            Self::execution_io_error(format!("create recovery nonce failed: {err}"))
+        })?;
+        let file_name = self
+            .wal_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("aira-graphdb.agdb.wal");
+        let quarantine = parent.join(format!(
+            ".{file_name}.recovery-{actual_digest}-{nonce}.quarantine"
+        ));
+        Self::durability_failpoint("before_recovery_quarantine_rename").map_err(|err| {
+            Self::execution_io_error(format!("quarantine recovery WAL failed: {err}"))
+        })?;
+        fs::rename(&self.wal_path, &quarantine).map_err(|err| {
+            Self::execution_io_error(format!("quarantine recovery WAL failed: {err}"))
+        })?;
+        let quarantine_metadata = Self::open_regular_nofollow(&quarantine)
+            .and_then(|file| file.metadata())
+            .map_err(|err| {
+                Self::execution_io_error(format!("validate quarantined recovery WAL: {err}"))
+            })?;
+        if Self::metadata_identity(&quarantine_metadata) != (wal_device, wal_inode) {
+            return Err(Self::execution_io_error(
+                "recovery WAL changed during quarantine".to_string(),
+            ));
+        }
+        Self::durability_failpoint("after_recovery_quarantine_rename").map_err(|err| {
+            Self::execution_io_error(format!("quarantine recovery WAL failed: {err}"))
+        })?;
+        Self::durability_failpoint("before_recovery_quarantine_dir_fsync").map_err(|err| {
+            Self::execution_io_error(format!("sync recovery quarantine failed: {err}"))
+        })?;
+        Self::sync_parent_dir(&parent).map_err(|err| {
+            Self::execution_io_error(format!("sync recovery quarantine failed: {err}"))
+        })?;
+        Self::durability_failpoint("after_recovery_quarantine_dir_fsync").map_err(|err| {
+            Self::execution_io_error(format!("sync recovery quarantine failed: {err}"))
+        })?;
+        self.wal_bytes = 0;
+        self.transaction = TransactionState::Idle;
+        Ok(json!({
+            "baseGeneration": base_generation,
+            "walDigest": actual_digest,
+            "recordCount": record_count,
+            "quarantined": true,
+        }))
     }
 
     fn key(corpus_id: &str, id: &str) -> String {
@@ -1623,7 +1810,16 @@ impl Server {
                 let _ = Self::optional_string(params, "corpusId")?;
                 let _ = Self::optional_string(params, "documentId")?;
             }
-            _ => {}
+            "memory_save_file" => {
+                return Err(Self::execution_client_error(
+                    "memory_save_file must be canonicalized before validation".to_string(),
+                ));
+            }
+            method => {
+                return Err(Self::execution_client_error(format!(
+                    "mutation method has no validator: {method}"
+                )));
+            }
         }
         Ok(())
     }
@@ -1755,9 +1951,19 @@ impl Server {
 
     fn handle_prepared(&mut self, req: RpcRequest) -> RpcResponse {
         let is_mutation = Self::is_mutating_method(&req.method);
-        if Self::method_spec(&req.method).is_none() {
+        let Some(spec) = Self::method_spec(&req.method) else {
             return self
                 .response_for_result(req.id, Err(Self::unsupported_method_error(&req.method)));
+        };
+        if matches!(self.transaction, TransactionState::RecoveryPending { .. })
+            && !matches!(spec.classification, "health" | "recovery")
+        {
+            return self.response_for_result(
+                req.id,
+                Err(Self::execution_client_error(
+                    "recovery pending; ordinary requests are unavailable".to_string(),
+                )),
+            );
         }
         if is_mutation
             && !self.wal_replaying
@@ -1771,14 +1977,6 @@ impl Server {
                 )),
             );
         }
-        let before = is_mutation.then(|| {
-            (
-                self.state.clone(),
-                self.vector_values.clone(),
-                self.cache_dirty,
-                self.transaction,
-            )
-        });
         let result: Result<Value, AppError> = (|| {
             if is_mutation {
                 self.validate_mutation_params(&req)?;
@@ -1799,11 +1997,24 @@ impl Server {
                     Ok(json!({
                         "protocolVersion": "native-method-policy@1",
                         "generation": self.state.generation,
+                        "state": match self.transaction {
+                            TransactionState::RecoveryPending { .. } => "recoveryPending",
+                            TransactionState::Active { .. } => "active",
+                            TransactionState::Idle => "idle",
+                        },
+                        "recovery": match self.transaction {
+                            TransactionState::RecoveryPending { base_generation, wal_digest, record_count, .. } => Some(json!({
+                                "baseGeneration": base_generation,
+                                "walDigest": Self::digest_hex(&wal_digest),
+                                "recordCount": record_count,
+                            })),
+                            _ => None,
+                        },
                         "methods": methods,
                     }))
                 }
                 "batch_begin" => {
-                    if matches!(self.transaction, TransactionState::Active { .. }) {
+                    if !matches!(self.transaction, TransactionState::Idle) {
                         Err(Self::execution_client_error(
                             "batch_begin requires an idle transaction".to_string(),
                         ))
@@ -1823,6 +2034,11 @@ impl Server {
                                 "batch_commit requires an active mutated batch".to_string(),
                             ));
                         }
+                        TransactionState::RecoveryPending { .. } => {
+                            return Err(Self::execution_client_error(
+                                "batch_commit is unavailable during recovery".to_string(),
+                            ));
+                        }
                     };
                     if !mutation_seen {
                         return Err(Self::execution_client_error(
@@ -1835,6 +2051,17 @@ impl Server {
                     })?;
                     self.transaction = TransactionState::Idle;
                     Ok(serde_json::to_value(token).unwrap_or(Value::Null))
+                }
+                "recovery_discard" => {
+                    let outcome = self.discard_recovery(&req.params);
+                    if outcome
+                        .as_ref()
+                        .err()
+                        .is_some_and(|err| err.failure_class.as_deref() != Some("CLIENT_INPUT"))
+                    {
+                        self.fatal = true;
+                    }
+                    outcome
                 }
                 "upsert_nodes" => {
                     let nodes = req
@@ -2622,12 +2849,6 @@ impl Server {
         })();
 
         if result.is_err() && is_mutation {
-            if let Some((state, vector_values, cache_dirty, transaction)) = before {
-                self.state = state;
-                self.vector_values = vector_values;
-                self.cache_dirty = cache_dirty;
-                self.transaction = transaction;
-            }
             self.fatal = true;
         } else if result.is_ok() && is_mutation && !self.wal_replaying {
             if let TransactionState::Active { mutation_seen, .. } = &mut self.transaction {
@@ -2716,33 +2937,38 @@ fn main() -> io::Result<()> {
         };
         crash_tracker.set_last_request_id(req.id.to_string());
         let method_for_wal = Server::is_mutating_method(&req.method);
-        let resp = if method_for_wal {
-            match server.canonicalize_request(req.clone()) {
-                Err(err) => {
-                    server.fatal = true;
-                    server.response_for_result(req.id, Err(err))
-                }
-                Ok(canonical) => {
-                    let validation = server.clone().handle_prepared(canonical.clone());
-                    if !validation.ok {
+        let resp =
+            if method_for_wal && !matches!(server.transaction, TransactionState::Active { .. }) {
+                // Admission must precede canonicalization: memory_save_file reads
+                // an external path and must do no I/O while idle or recovering.
+                server.handle_prepared(req)
+            } else if method_for_wal {
+                match server.canonicalize_request(req.clone()) {
+                    Err(err) => {
                         server.fatal = true;
-                        validation
-                    } else if let Err(err) = server.wal_append(&canonical) {
-                        server.fatal = true;
-                        server.response_for_result(
-                            req.id,
-                            Err(Server::execution_io_error(format!(
-                                "durability failure: {err}"
-                            ))),
-                        )
-                    } else {
-                        server.handle_prepared(canonical)
+                        server.response_for_result(req.id, Err(err))
+                    }
+                    Ok(canonical) => {
+                        let validation = server.validate_mutation_params(&canonical);
+                        if let Err(err) = validation {
+                            server.fatal = true;
+                            server.response_for_result(req.id, Err(err))
+                        } else if let Err(err) = server.wal_append(&canonical) {
+                            server.fatal = true;
+                            server.response_for_result(
+                                req.id,
+                                Err(Server::execution_io_error(format!(
+                                    "durability failure: {err}"
+                                ))),
+                            )
+                        } else {
+                            server.handle_prepared(canonical)
+                        }
                     }
                 }
-            }
-        } else {
-            server.handle_prepared(req)
-        };
+            } else {
+                server.handle_prepared(req)
+            };
         let payload = serde_json::to_string(&resp)
             .map_err(|err| io::Error::other(format!("serialize response failed: {err}")))?;
         if let Err(write_err) = stdout
@@ -2818,8 +3044,9 @@ mod tests {
         let canonical = server
             .canonicalize_request(request)
             .expect("canonical mutation request");
-        let validation = server.clone().handle_prepared(canonical.clone());
-        assert!(validation.ok, "mutation preflight failed: {validation:?}");
+        server
+            .validate_mutation_params(&canonical)
+            .expect("mutation preflight failed");
         server.wal_append(&canonical).expect("append mutation WAL");
         let response = server.handle_prepared(canonical);
         assert!(response.ok, "mutation failed: {response:?}");
@@ -3091,6 +3318,7 @@ mod tests {
             "protocol_info",
             "batch_begin",
             "batch_commit",
+            "recovery_discard",
             "upsert_nodes",
             "upsert_edges",
             "get_node",
