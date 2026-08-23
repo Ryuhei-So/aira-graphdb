@@ -739,6 +739,96 @@ fn unsupported_noreplace_fails_before_loading_or_mutating_canonical_state() {
 }
 
 #[test]
+fn repeated_probe_kill_and_failure_seams_keep_artifacts_bounded_and_recover() {
+    for stage in [
+        "after_noreplace_probe_source_create",
+        "after_noreplace_probe_source_dir_fsync",
+        "after_noreplace_probe_move",
+        "after_noreplace_probe_collision_source_create",
+        "after_noreplace_probe_collision_dir_fsync",
+        "after_noreplace_probe_cleanup_unlink",
+    ] {
+        let db = TempDb::new(&format!("probe-kill-{stage}"));
+        seed_vector(&db.path);
+        let canonical_before = std::fs::read(&db.path).expect("canonical before probe kill");
+        for iteration in 0..2 {
+            let native = NativeProcess::spawn(&db.path, &[("AGDB_NATIVE_KILL_POINT", stage)]);
+            assert_native_killed(native.finish(), stage);
+            assert!(
+                rename_probe_paths(&db).len() <= 2,
+                "{stage} iteration {iteration} accumulated probe artifacts"
+            );
+            assert_eq!(std::fs::read(&db.path).unwrap(), canonical_before);
+        }
+        let mut reopened = NativeProcess::spawn(&db.path, &[]);
+        assert_eq!(
+            reopened.send(json!({"id":1,"method":"ping","params":{}}))["ok"],
+            json!(true),
+            "{stage} did not recover"
+        );
+        assert_eq!(reopened.finish().code(), Some(0));
+        assert!(rename_probe_paths(&db).is_empty(), "{stage} left artifacts");
+        assert_eq!(std::fs::read(&db.path).unwrap(), canonical_before);
+
+        let failure_db = TempDb::new(&format!("probe-failure-{stage}"));
+        seed_vector(&failure_db.path);
+        let canonical_before =
+            std::fs::read(&failure_db.path).expect("canonical before probe failure");
+        let native = NativeProcess::spawn(&failure_db.path, &[("AGDB_NATIVE_FAIL_POINT", stage)]);
+        assert_ne!(
+            native.finish().code(),
+            Some(0),
+            "{stage} failure stayed alive"
+        );
+        assert!(rename_probe_paths(&failure_db).is_empty());
+        assert_eq!(std::fs::read(&failure_db.path).unwrap(), canonical_before);
+    }
+}
+
+#[test]
+fn repeated_probe_orphan_cleanup_kills_rename_without_growing_artifacts() {
+    for stage in [
+        "after_rename_probe_cleanup_claim",
+        "after_rename_probe_cleanup_dir_fsync",
+        "after_rename_probe_cleanup_unlink",
+    ] {
+        let db = TempDb::new(&format!("probe-cleanup-kill-{stage}"));
+        seed_vector(&db.path);
+        let orphan = db
+            .dir
+            .join(".state.json.rename_probe.0123456789abcdef0123456789abcdef.99.tmp");
+        std::fs::write(&orphan, b"partial-probe").expect("write probe orphan");
+        let iterations = if stage == "after_rename_probe_cleanup_unlink" {
+            1
+        } else {
+            2
+        };
+        for iteration in 0..iterations {
+            let native = NativeProcess::spawn(&db.path, &[("AGDB_NATIVE_KILL_POINT", stage)]);
+            assert_native_killed(native.finish(), stage);
+            assert!(
+                rename_probe_paths(&db).len() <= 1,
+                "{stage} iteration {iteration} grew cleanup artifacts"
+            );
+        }
+        if stage == "after_rename_probe_cleanup_unlink" {
+            assert!(
+                rename_probe_paths(&db).is_empty(),
+                "unlink stop point must already have removed the artifact"
+            );
+        }
+        let mut reopened = NativeProcess::spawn(&db.path, &[]);
+        assert_eq!(
+            reopened.send(json!({"id":1,"method":"ping","params":{}}))["ok"],
+            json!(true)
+        );
+        assert_eq!(reopened.finish().code(), Some(0));
+        assert!(rename_probe_paths(&db).is_empty(), "{stage} left artifacts");
+        assert_eq!(generation(&db.path), 1);
+    }
+}
+
+#[test]
 fn startup_wal_retire_cleanup_kill_and_failure_seams_leave_no_orphans() {
     for (mode, env_name) in [
         ("kill", "AGDB_NATIVE_KILL_POINT"),

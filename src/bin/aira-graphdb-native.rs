@@ -550,6 +550,7 @@ impl Server {
     }
 
     fn open_resolved(db_path: PathBuf) -> io::Result<Self> {
+        Self::cleanup_rename_probe_artifacts(&db_path)?;
         Self::probe_noreplace_support(&db_path)?;
         let mut state = if let Ok(metadata) = fs::symlink_metadata(&db_path) {
             Self::require_regular_single_link(&db_path, &metadata)?;
@@ -748,6 +749,9 @@ impl Server {
             let Some((target, stage)) = Self::recognized_durable_temp(&name) else {
                 continue;
             };
+            if stage == "rename_probe" {
+                continue;
+            }
             if stage == "wal_retire" {
                 if target == wal_file_name {
                     retired_wals.push(entry.path());
@@ -827,46 +831,62 @@ impl Server {
             file.write_all(bytes)?;
             file.sync_all()
         };
-        create_probe(&source, b"source")?;
-        if let Err(err) = create_probe(&destination, b"destination") {
-            let _ = fs::remove_file(&source);
-            let _ = Self::sync_parent_dir(&parent);
-            return Err(err);
-        }
-        Self::sync_parent_dir(&parent)?;
-
-        let probe_result =
-            if Self::failpoint_matches("AGDB_NATIVE_FAIL_POINT", "noreplace_unsupported") {
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "injected no-replace capability failure",
-                ))
-            } else {
-                Self::rename_noreplace(&source, &destination)
-            };
-        let result = match probe_result {
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                let source_ok = fs::read(&source).is_ok_and(|raw| raw == b"source");
-                let destination_ok = fs::read(&destination).is_ok_and(|raw| raw == b"destination");
-                if source_ok && destination_ok {
-                    Ok(())
-                } else {
-                    Err(io::Error::other(
-                        "atomic no-replace probe altered a collision target",
+        let result = (|| -> io::Result<()> {
+            create_probe(&source, b"move-source")?;
+            Self::durability_failpoint("after_noreplace_probe_source_create")?;
+            let source_identity = Self::metadata_identity(&fs::symlink_metadata(&source)?);
+            Self::sync_parent_dir(&parent)?;
+            Self::durability_failpoint("after_noreplace_probe_source_dir_fsync")?;
+            let move_result =
+                if Self::failpoint_matches("AGDB_NATIVE_FAIL_POINT", "noreplace_unsupported") {
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "injected no-replace capability failure",
                     ))
-                }
+                } else {
+                    Self::rename_noreplace(&source, &destination)
+                };
+            move_result.map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "native persistence requires Linux renameat2 RENAME_NOREPLACE support in {}: {err}",
+                        parent.display()
+                    ),
+                )
+            })?;
+            Self::durability_failpoint("after_noreplace_probe_move")?;
+            if source.exists()
+                || !fs::read(&destination).is_ok_and(|raw| raw == b"move-source")
+                || Self::metadata_identity(&fs::symlink_metadata(&destination)?) != source_identity
+            {
+                return Err(io::Error::other(
+                    "atomic no-replace move probe did not preserve source identity and content",
+                ));
             }
-            Ok(()) => Err(io::Error::other(
-                "atomic no-replace probe replaced an existing destination",
-            )),
-            Err(err) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "native persistence requires Linux renameat2 RENAME_NOREPLACE support in {}: {err}",
-                    parent.display()
-                ),
-            )),
-        };
+
+            create_probe(&source, b"collision-source")?;
+            Self::durability_failpoint("after_noreplace_probe_collision_source_create")?;
+            Self::sync_parent_dir(&parent)?;
+            Self::durability_failpoint("after_noreplace_probe_collision_dir_fsync")?;
+            match Self::rename_noreplace(&source, &destination) {
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Ok(()) => {
+                    return Err(io::Error::other(
+                        "atomic no-replace probe replaced an existing destination",
+                    ));
+                }
+                Err(err) => return Err(err),
+            }
+            if !fs::read(&source).is_ok_and(|raw| raw == b"collision-source")
+                || !fs::read(&destination).is_ok_and(|raw| raw == b"move-source")
+            {
+                return Err(io::Error::other(
+                    "atomic no-replace probe altered a collision target",
+                ));
+            }
+            Ok(())
+        })();
         let source_cleanup = match fs::remove_file(&source) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -877,10 +897,65 @@ impl Server {
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),
         };
+        Self::durability_failpoint("after_noreplace_probe_cleanup_unlink")?;
         Self::sync_parent_dir(&parent)?;
+        Self::durability_failpoint("after_noreplace_probe_cleanup_dir_fsync")?;
         source_cleanup?;
         destination_cleanup?;
         result
+    }
+
+    fn cleanup_rename_probe_artifacts(db_path: &Path) -> io::Result<()> {
+        let parent = Self::parent_dir(db_path);
+        let db_file_name = db_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("aira-graphdb-native.json");
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(&parent)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(
+                Self::recognized_durable_temp(&name),
+                Some((target, "rename_probe")) if target == db_file_name
+            ) {
+                candidates.push(entry.path());
+            }
+        }
+        for candidate in candidates {
+            Self::cleanup_rename_probe_exact(&candidate, db_path)?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_rename_probe_exact(path: &Path, db_path: &Path) -> io::Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() || Self::metadata_link_count(&metadata) != 1 {
+            return Ok(());
+        }
+        let mut held = Self::open_regular_nofollow(path)?;
+        let identity = Self::metadata_identity(&held.metadata()?);
+        let mut raw = Vec::new();
+        held.read_to_end(&mut raw)?;
+        let claimed = Self::temporary_path(db_path, "rename_probe")?;
+        Self::rename_noreplace(path, &claimed)?;
+        Self::durability_failpoint("after_rename_probe_cleanup_claim")?;
+        Self::validate_regular_path_identity(&claimed, identity)?;
+        held.seek(SeekFrom::Start(0))?;
+        let mut claimed_raw = Vec::new();
+        held.read_to_end(&mut claimed_raw)?;
+        if claimed_raw != raw {
+            return Err(io::Error::other(
+                "rename probe artifact changed during cleanup",
+            ));
+        }
+        let parent = Self::parent_dir(db_path);
+        Self::sync_parent_dir(&parent)?;
+        Self::durability_failpoint("after_rename_probe_cleanup_dir_fsync")?;
+        fs::remove_file(&claimed)?;
+        Self::durability_failpoint("after_rename_probe_cleanup_unlink")?;
+        Self::sync_parent_dir(&parent)
     }
 
     fn cleanup_retired_wal_exact(
