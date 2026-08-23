@@ -105,6 +105,7 @@ struct State {
 const MAX_VECTOR_SEARCH_WORKERS: usize = 8;
 const MAX_VECTOR_DIMENSIONS: usize = 4_096;
 const MAX_VECTOR_SEARCH_TOP_K: usize = 10_000;
+const MAX_WAL_RECORD_BYTES: u64 = 536_870_912;
 
 #[derive(Debug)]
 struct ScoredVector {
@@ -152,6 +153,86 @@ struct WalRecord {
     version: u16,
     base_generation: u64,
     request: RpcRequest,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
+struct WalRecordRef<'a> {
+    version: u16,
+    base_generation: u64,
+    request: &'a RpcRequest,
+}
+
+#[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
+struct LimitedHashWriter<W> {
+    inner: W,
+    bytes: u64,
+    limit: u64,
+    record_hasher: Sha256,
+    wal_hasher: Option<Sha256>,
+}
+
+#[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
+struct WalWriteEvidence<W> {
+    inner: W,
+    bytes: u64,
+    record_digest: [u8; 32],
+    wal_hasher: Option<Sha256>,
+}
+
+#[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
+impl<W> LimitedHashWriter<W> {
+    fn new(inner: W, limit: u64, wal_hasher: Option<Sha256>) -> Self {
+        Self {
+            inner,
+            bytes: 0,
+            limit,
+            record_hasher: Sha256::new(),
+            wal_hasher,
+        }
+    }
+
+    fn finish(self) -> WalWriteEvidence<W> {
+        WalWriteEvidence {
+            inner: self.inner,
+            bytes: self.bytes,
+            record_digest: self.record_hasher.finalize().into(),
+            wal_hasher: self.wal_hasher,
+        }
+    }
+}
+
+#[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
+impl<W: Write> Write for LimitedHashWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let requested = u64::try_from(buf.len())
+            .map_err(|_| io::Error::other("WAL write length does not fit u64"))?;
+        let next = self
+            .bytes
+            .checked_add(requested)
+            .ok_or_else(|| io::Error::other("WAL record byte count overflow"))?;
+        if next > self.limit {
+            return Err(io::Error::other(format!(
+                "WAL record exceeds {} bytes",
+                self.limit
+            )));
+        }
+        let written = self.inner.write(buf)?;
+        self.record_hasher.update(&buf[..written]);
+        if let Some(hasher) = self.wal_hasher.as_mut() {
+            hasher.update(&buf[..written]);
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::other("WAL record byte count overflow"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2024,6 +2105,55 @@ impl Server {
 
     fn digest_hex(digest: &[u8; 32]) -> String {
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
+    fn stream_wal_record<W: Write>(
+        writer: W,
+        base_generation: u64,
+        request: &RpcRequest,
+        wal_hasher: Option<Sha256>,
+    ) -> io::Result<WalWriteEvidence<W>> {
+        Self::stream_wal_record_with_limit(
+            writer,
+            base_generation,
+            request,
+            wal_hasher,
+            MAX_WAL_RECORD_BYTES,
+        )
+    }
+
+    #[allow(dead_code)] // Test seam for max/max+1 without allocating 512 MiB.
+    fn stream_wal_record_with_limit<W: Write>(
+        writer: W,
+        base_generation: u64,
+        request: &RpcRequest,
+        wal_hasher: Option<Sha256>,
+        record_limit: u64,
+    ) -> io::Result<WalWriteEvidence<W>> {
+        let record = WalRecordRef {
+            version: Self::WAL_VERSION,
+            base_generation,
+            request,
+        };
+        let mut writer = LimitedHashWriter::new(writer, record_limit, wal_hasher);
+        serde_json::to_writer(&mut writer, &record)
+            .map_err(|err| io::Error::other(format!("serialize WAL record failed: {err}")))?;
+        writer.write_all(b"\n")?;
+        Ok(writer.finish())
+    }
+
+    #[allow(dead_code)] // Used by the atomic writer switch after reader review.
+    fn require_same_wal_record<A, B>(
+        measured: &WalWriteEvidence<A>,
+        written: &WalWriteEvidence<B>,
+    ) -> io::Result<()> {
+        if measured.bytes != written.bytes || measured.record_digest != written.record_digest {
+            return Err(io::Error::other(
+                "WAL request changed between counting and append passes",
+            ));
+        }
+        Ok(())
     }
 
     fn open_wal_for_append(&self) -> io::Result<(fs::File, bool, (u64, u64))> {
@@ -4504,6 +4634,119 @@ mod tests {
             blob_ref: None,
             metadata: json!({"id": id}),
         }
+    }
+
+    #[test]
+    fn wal_record_two_pass_stream_matches_v2_bytes_and_enforces_limit() {
+        let request = RpcRequest {
+            id: 17,
+            method: "memory_save".to_string(),
+            params: json!({"snapshot":{"corpusId":"corpus","facts":[]}}),
+        };
+        let mut expected = serde_json::to_vec(&WalRecord {
+            version: Server::WAL_VERSION,
+            base_generation: 7,
+            request: request.clone(),
+        })
+        .unwrap();
+        expected.push(b'\n');
+
+        let counted = Server::stream_wal_record(io::sink(), 7, &request, None).unwrap();
+        assert_eq!(counted.bytes, expected.len() as u64);
+        assert_eq!(counted.record_digest, Server::digest_bytes(&expected));
+
+        let prefix = b"existing WAL\n";
+        let mut seeded = Sha256::new();
+        seeded.update(prefix);
+        let written = Server::stream_wal_record(Vec::new(), 7, &request, Some(seeded)).unwrap();
+        assert_eq!(written.inner, expected);
+        assert_eq!(written.bytes, counted.bytes);
+        assert_eq!(written.record_digest, counted.record_digest);
+        Server::require_same_wal_record(&counted, &written).unwrap();
+        let mut complete = prefix.to_vec();
+        complete.extend_from_slice(&expected);
+        assert_eq!(
+            written.wal_hasher.unwrap().finalize().as_slice(),
+            Sha256::digest(&complete).as_slice()
+        );
+
+        assert!(
+            Server::stream_wal_record_with_limit(
+                io::sink(),
+                7,
+                &request,
+                None,
+                expected.len() as u64,
+            )
+            .is_ok()
+        );
+        assert!(
+            Server::stream_wal_record_with_limit(
+                io::sink(),
+                7,
+                &request,
+                None,
+                expected.len() as u64 - 1,
+            )
+            .is_err()
+        );
+
+        let changed = RpcRequest {
+            id: request.id,
+            method: request.method.clone(),
+            params: json!({"snapshot":{"corpusId":"edited","facts":[]}}),
+        };
+        let changed = Server::stream_wal_record(io::sink(), 7, &changed, None).unwrap();
+        assert_eq!(counted.bytes, changed.bytes);
+        assert_ne!(counted.record_digest, changed.record_digest);
+        assert!(Server::require_same_wal_record(&counted, &changed).is_err());
+
+        let mut production_limit = LimitedHashWriter::new(io::sink(), MAX_WAL_RECORD_BYTES, None);
+        production_limit.bytes = MAX_WAL_RECORD_BYTES - 1;
+        assert_eq!(production_limit.write(b"x").unwrap(), 1);
+        assert_eq!(production_limit.bytes, MAX_WAL_RECORD_BYTES);
+        assert!(production_limit.write(b"y").is_err());
+
+        let mut overflow = LimitedHashWriter::new(io::sink(), u64::MAX, None);
+        overflow.bytes = u64::MAX;
+        assert!(overflow.write(b"x").is_err());
+    }
+
+    #[test]
+    fn wal_record_stream_propagates_partial_writer_failure_without_evidence() {
+        struct FailAfter {
+            remaining: usize,
+        }
+
+        impl Write for FailAfter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(io::Error::other("injected partial write"));
+                }
+                let written = bytes.len().min(self.remaining);
+                self.remaining -= written;
+                Ok(written)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let request = RpcRequest {
+            id: 19,
+            method: "memory_save".to_string(),
+            params: json!({"snapshot":{"corpusId":"corpus","facts":[]}}),
+        };
+        assert!(
+            Server::stream_wal_record(
+                FailAfter { remaining: 17 },
+                7,
+                &request,
+                Some(Sha256::new()),
+            )
+            .is_err()
+        );
     }
 
     fn reference_cosine(query: &[f64], vector: &[f64]) -> f64 {
