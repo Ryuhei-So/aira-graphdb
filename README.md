@@ -61,6 +61,11 @@ spec/
 - Rust (stable, with `cargo`)
 - Node.js (for Node SDK tests)
 - Python 3.10+ (for Python SDK tests)
+- Linux with `renameat2(RENAME_NOREPLACE)` support on the database filesystem
+  for `aira-graphdb-native` durable generation persistence. The native process
+  probes this capability in the database directory before loading state or
+  accepting mutations and fails without changing canonical data when it is
+  unavailable.
 
 ## Build and test
 

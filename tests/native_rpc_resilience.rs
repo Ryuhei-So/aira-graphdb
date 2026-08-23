@@ -167,10 +167,16 @@ fn unsupported_method_returns_client_input_failure_class() {
 }
 
 #[test]
-fn invalid_payload_returns_request_execution_failed_client_input() {
+fn invalid_mutation_payload_fails_closed_without_publishing_a_prefix() {
     let mut proc = NativeProcess::spawn();
-    let response = proc.send_json(json!({
+    let begin = proc.send_json(json!({
         "id": 4,
+        "method": "batch_begin",
+        "params": {}
+    }));
+    assert_eq!(begin["ok"], json!(true));
+    let response = proc.send_json(json!({
+        "id": 5,
         "method": "upsert_nodes",
         "params": {
             "nodes": [{ "nodeId": 10 }]
@@ -179,7 +185,11 @@ fn invalid_payload_returns_request_execution_failed_client_input() {
     assert_eq!(response["ok"], json!(false));
     assert_eq!(response["error"]["code"], json!("REQUEST_EXECUTION_FAILED"));
     assert_eq!(response["error"]["failureClass"], json!("CLIENT_INPUT"));
-    proc.ensure_alive();
+    assert_ne!(
+        proc.wait_for_exit_code(Duration::from_secs(3)),
+        Some(0),
+        "a mutator validation error must stop the native writer"
+    );
     let events = proc.audit_events();
     assert!(events.iter().any(|event| {
         event.get("errorCode") == Some(&json!("REQUEST_EXECUTION_FAILED"))
