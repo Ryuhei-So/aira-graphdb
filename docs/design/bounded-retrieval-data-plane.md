@@ -424,9 +424,10 @@ pin only the generated public schema and exact public-attestation bytes.
 The artifact builder is not a public boundary that accepts caller-assembled
 comparison rows, case booleans, behavioral observations, or generic operation
 ports.  Synapse owns one `V15ParityEvaluator` which selects the versioned
-fixture cases and mints two isolated operation-runner processes from the exact
-base and candidate build capabilities described below.  The evaluator, not
-the Hub driver, assigns runner roles and verifies that the two process IDs,
+fixture cases and evaluates two isolated operation-runner processes minted and
+owned by the trusted Hub bootstrap from the exact base and candidate build
+capabilities described below.  The evaluator, not
+the Hub driver, assigns semantic runner roles and verifies that the two process IDs,
 implementation commits, trees, and build digests are distinct where required.
 It rejects swapped roles, two roles connected to one process/build, an
 unattested implementation root, or a runner response whose authority handshake
@@ -447,42 +448,176 @@ production evidence.
 Execution authority is established outside the checker before any private
 path is disclosed.  The Hub repository pins a strict
 `V15ParityExecutionManifest@1`; command-line expected commits never override
-it.  The manifest names the Synapse base/candidate and GraphDB commits and tree
-digests, repository identities, package-lock and public-manifest byte hashes,
-the candidate-owned evaluator/adapter source paths, the exact build command
-argv, the absolute Node and npm-cli paths with file hashes and versions, the
-environment allowlist, and build/operation/overall deadlines.  The evaluated
-Hub driver commit and manifest hash are private-artifact fields.
+it.  The manifest has first-class `evaluator`, `base`, `candidate`, and
+`copiedGraphDbNative` records.  Each names its owning commits/trees, repository
+identities, role-specific
+package-lock hash, dependency/build roots, implementation entrypoint,
+candidate-owned adapter entrypoint, exact install/bundle argv, bundler identity
+and version, input-graph manifest hash, and sealed-bundle byte hash where
+applicable.  The copied-native record instead pins the GraphDB native
+commit/tree, build-manifest hash, sealed executable hash, descriptor-only read-
+generation protocol, and exact read-method inventory digest.  The evaluator record is bound to the exact candidate
+Synapse commit/tree and has its own entrypoint, input graph, bundle hash, and
+launch argv; it is not inferred from the runner records.  The manifest also
+pins public-manifest byte hashes; the Git, Node, npm-cli, and bundler executable
+identities with file hashes and versions; the environment allowlist; and all
+byte/time/disk limits.  Git runs with system/global/local config, hooks,
+replacement refs, alternates, object quarantine, and caller Git environment
+disabled; the bootstrap independently hashes the extracted tracked tree rather
+than trusting a worktree status string.  The evaluated Hub driver commit and
+execution-manifest byte hash are private-artifact fields.
 
-The Hub-owned bootstrap creates unique mode-0700 roots, materializes each exact
-commit without reused ignored files, verifies the extracted tracked tree,
-performs a lockfile-clean install and forced build in isolated dependency and
-output roots, and computes a canonical build manifest over every evaluator,
-adapter, implementation, and dependency file that can be loaded.  It invokes
+An outer Hub build coordinator never receives a private path, copied file,
+fixture, or artifact and is orchestration-only: it starts, waits for, and
+validates one role-scoped dedicated build unit at a time, but never writes a
+source, dependency, build, HOME, cache, temporary, package-store, or bundle
+byte itself.  Inside that capped unit, the builder creates unique mode-0700
+roots, materializes the exact commit without reused ignored files, verifies
+the extracted tracked tree, performs a lockfile-clean install and forced build
+in isolated dependency/output roots, and uses the manifest-pinned bundler to
+produce the self-contained ESM role or evaluator bundle.  Each input-
+graph manifest covers the exact adapter, implementation, transitive
+JavaScript, and embedded data bytes used by that bundle, but never lists or
+hashes itself; its exact serialized-byte hash and the output-bundle hash are
+held by the execution manifest.  Dynamic imports, runtime filesystem module
+resolution, native addons, and undeclared external data are rejected from each
+runner input graph.  GraphDB operations and copied-state access remain external
+only through the Hub-brokered copied-native capability and bounded protocol;
+no runner is given a DB path or filesystem permission.
+The candidate adapter therefore cannot resolve base dependencies through the
+candidate dependency root or ambient parent paths.  The bootstrap invokes
 absolute runtime and tool paths with `PATH`, `NODE_OPTIONS`, preload/import
 hooks, package-manager configuration, and unrelated environment removed;
-only the manifest allowlist plus private temporary HOME/cache values exist.
-Dependency lifecycle scripts, when the locked build requires them, run under
-the same sanitized environment and deadline and cannot select an ambient
-runtime.  Source, lockfile, runtime/tool identity, and the complete build
-manifest are revalidated immediately before process launch and again before
-private-path disclosure.  Each runner then handshakes with a bootstrap nonce,
-role, process ID, implementation commit/tree, adapter commit, build-manifest
-hash, runtime hash/version, and supported protocol version.  The evaluator
-mints the role-bound capability only after exact handshake validation.
+only the manifest allowlist exists.  Every writable build `HOME`, cache,
+temporary directory, and package-manager store is below the same charged
+unique `/dev/shm` root.
+Dependency installation uses `npm ci --ignore-scripts` unless the pinned
+dependency graph proves a lifecycle step is required.  An allowed lifecycle
+step has its package-integrity and script bytes in the role input manifest and
+runs inside that same role-scoped transient user-systemd build unit under the
+same sanitized environment and output/disk/overall deadline.  Every such unit
+uses `KillMode=control-group` with bounded `TasksMax`, `MemoryMax`, and
+`MemorySwapMax=0`.  Source/dependency/build
+roots live in a unique `/dev/shm` directory, so generated bytes are charged to
+that cgroup's hard memory ceiling; capacity is checked before start.  Timeout,
+failure, or cgroup OOM stops the whole unit, waits for an empty cgroup, removes
+the unique root, and verifies cleanup before any private input is opened.  A
+lifecycle step therefore cannot select an ambient runtime, escape by
+`setsid`/double-fork, or leave a descendant.  The coordinator publishes only
+the public bundle, input-graph, runtime, and tool outputs named by the execution
+manifest.  The coordinator waits for the successful build cgroup to become
+empty before independently validating those published outputs.
+
+The separately tracked network-filtered evaluation bootstrap does not contact
+the user-systemd manager or run an installer/build.  It independently
+revalidates source, lockfile, runtime/tool identity, every published input
+graph, and bundle bytes before opening a private input.  It then writes each
+verified bundle, the Node executable, and the GraphDB native
+executable into separate Linux `memfd_create` files and applies
+`F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL`; it verifies the
+seal mask and byte hash from every held descriptor before launch.  It executes
+the sealed Node or GraphDB ELF through `/proc/self/fd/<runtime-fd>`, so neither
+rename nor in-place mutation of the original user-writable inode can change
+executed bytes.  System dynamic-loader and
+shared-library identities are recorded and revalidated as the explicit host
+runtime trust boundary; they are not copied into, or confused with, Synapse
+implementation authority.  Unsupported `memfd`/seal/held-exec semantics fail
+closed before private disclosure.  This supported-DGX boundary deliberately
+does not depend on an unprivileged user or mount namespace.
+
+The evaluation entrypoint is a tracked one-shot user-systemd unit with
+`SystemCallFilter=~@network-io`.  Before opening a private input, the Hub
+bootstrap proves the effective classic-seccomp boundary with a real child
+negative: `socket`, `socketpair`, `connect`, `bind`, `listen`, `accept`,
+`send*`, and `recv*` fail, while anonymous-pipe `read`/`write` succeeds.  A
+platform where the filter or probe is unavailable fails closed; the ineffective
+`IPAddressDeny=` cgroup-eBPF property is not used as authority.  The execution
+manifest and transcript bind the tracked unit/drop-in bytes, kernel release,
+architecture, systemd version, the fully expanded architecture-specific
+`@network-io` syscall-list digest, and the per-run raw-syscall probe result;
+any drift requires a reviewed manifest update.
+
+The same evaluation unit pins `TasksMax=32`, `MemoryHigh=48G`,
+`MemoryMax=56G`, and `MemorySwapMax=0` for the first copied-production
+generation.  These values are based on the measured approximately 17 GiB
+read-only GraphDB baseline plus bounded four-process/workspace headroom, not on
+making the live service unlimited.  Its private artifact records
+`memory.current`, `memory.peak`, `memory.swap.current`, and `memory.events`
+before/after and at peak.  A later generation must recompute the boundary from
+copied-production PSS plus the declared transient-work formula before approval;
+OOM or `memory.max` ends the run without an artifact and with copied hashes
+unchanged.
+
+The Hub bootstrap is the sole process and channel owner.  It launches the
+candidate-owned evaluator and the base/candidate runners as three direct
+children from their
+sealed bundles and sealed runtime, using fixed `--permission --input-type=module
+-` argv and the bundle descriptor as standard input.  It retains every process
+handle and creates each anonymous protocol/stdout/stderr pipe itself; no shell,
+caller executable, mutable entrypoint pathname, caller callback, socket, or
+caller-provided pipe is accepted.  The standard-input descriptor is used only
+for module loading.
+Runners receive no filesystem, child-process, worker-thread, native-addon, or
+WASI permission and inherit the unit's network-IO syscall denial.  Supported
+Node 22 and Node 24 E2E must prove pathname reads, every denied network syscall,
+subprocesses, workers, addons, and WASI fail while inherited anonymous protocol
+pipes remain usable.
+
+Hub starts both runners before the evaluator and gives the evaluator an
+unordered pair of inherited one-shot runner pipe endpoints at its own spawn.
+Hub retains every child handle; only non-authoritative parent-observed PIDs,
+nonces, sealed bundle hashes, and input-graph hashes cross the evaluator
+protocol.  The evaluator derives base/candidate roles by
+matching those authorities to its first-class execution-manifest records; it
+does not accept a Hub/caller role label.  Self-reported PID or role is
+informational only.  Base and candidate require distinct live child handles,
+PIDs, bundle descriptors, and bundle/input-graph hashes.  A valid handshake
+binds implementation commit/tree, adapter commit, input-graph and bundle
+hashes, runtime hash/version, and protocol version to the already-owned
+channel.  Only then does the evaluator mint the semantic role capabilities.
+If any child exits or the evaluator rejects authority, Hub terminates and
+reaps all remaining direct children under the non-resetting deadline; runners
+cannot create descendants.
 
 The candidate evaluator and version-specific adapters are Synapse-owned; an
-adapter loads the named operation implementation only from its attested base
-or candidate build root.  Thus an older base commit need not contain the new
-adapter, but the imported legacy implementation bytes remain bound to that
-base commit and build manifest.  After both capabilities are minted, private
-copied-state handles and fixture bytes are sent over the already-established
-bounded protocol, not exposed in the child argv or before authority readiness.
-The child also checks its executable/module real paths against its build
-manifest as defense in depth.  Bootstrap negatives execute checkout A while
-presenting clean checkout B, swap role handshakes, alias both roles to one
-process, modify `node_modules` or a build output, set `NODE_OPTIONS`, and mutate
-source after verification; each must fail before a private handle is sent.
+adapter bundles the named operation implementation only from its attested base
+or candidate input graph.  Thus an older base commit need not contain the new
+adapter, but the embedded legacy implementation bytes remain bound to that
+base commit, input graph, and sealed bundle.  After both capabilities are
+minted, Hub opens and validates the copied canonical, owner-manifest, and blob
+files as held `O_RDONLY | O_NOFOLLOW` descriptors, streams bounded hashes while
+retaining their identities and sizes without materializing whole-file copies,
+and launches the sealed GraphDB native as the fourth direct child.  A dedicated
+descriptor-only read mode receives those descriptors at spawn; it receives no
+DB pathname or parent-directory descriptor, never opens a WAL/audit/cache,
+never performs recovery or persistence, and exposes only the exact pinned read-
+method inventory.  Every mutation, transaction, commit, recovery, import, and
+save method is rejected by native dispatch before work.  Native first proves
+its process/executable/build/protocol authority, then validates and acknowledges
+the exact copied generation from the inherited descriptors.  Only after that
+second acknowledgement does Hub broker evaluator/runner operation frames over
+its directly-owned anonymous pipes.  Hub passes no process handle or file
+descriptor after spawn.  On completion the checker requires byte-identical
+held copied-state identities/hashes, failed write/pwrite/truncate attempts on
+the O_RDONLY copied descriptors, no write-capable filesystem open, rename,
+unlink, WAL, audit, cache, sidecar, or filesystem mutation event.  Bounded
+writes to protocol/diagnostic pipe descriptors are explicitly allowed and are
+the only successful writes.  The
+normal canonical GraphDB service remains the sole live-data owner; this short-
+lived native is an immutable-copy reader and cannot publish a generation by
+construction.
+The child reports the already-parent-bound bundle/runtime identities only as
+defense-in-depth handshake fields.  Bootstrap negatives execute checkout A
+while presenting clean checkout B; substitute a runner that echoes every
+expected handshake field; swap role handshakes; alias both roles to one
+process; mutate source, `node_modules`, or bundle output before sealing; try to
+write/truncate/grow the sealed descriptor; replace or overwrite the original
+Node/native executable; set `NODE_OPTIONS`; escape the systemd syscall filter;
+and attempt a dynamic import, pathname read, subprocess, network syscall, or
+direct DB open.  Each must fail before any private copied byte or operation
+frame is released, or prove that the
+parent-owned child executes only unchanged sealed bytes and communicates only
+through Hub-owned anonymous pipes.
 
 The source fields and CI inputs are named by lifecycle, not by an ambiguous
 `toolSha`.  The detailed private artifact records
@@ -526,6 +661,35 @@ bootstrap, and CLI negative suites on both Node 22 and the supported production
 Node 24 runtime; Unicode-only Node 24 coverage is not sufficient for this
 boundary.
 
+V1 numeric limits are part of the execution manifest and may only be lower
+than these schema maxima: 2 MiB per newline-delimited evaluator or runner
+or copied-native request/response frame; 64 MiB cumulative protocol input and
+64 MiB cumulative protocol output, plus 1 MiB cumulative diagnostic stdout and
+1 MiB cumulative stderr, for each evaluator, runner, or copied native; 4,096
+protocol frames per process; 64 MiB total fixture input;
+64 MiB cumulative output per Git authority command; 16 MiB cumulative output
+per install/build command; 256 transcript events; 64 MiB canonical transcript
+bytes; 64 MiB canonical detailed-artifact bytes; 2 MiB canonical public-
+attestation bytes; 500,000 input-graph entries; and 64 MiB canonical bytes per
+input-graph manifest.  Exact source materialization is limited to 250,000
+entries and 1 GiB; each isolated dependency/build root is limited to 1,000,000
+entries and 8 GiB; each sealed JavaScript bundle is limited to 8 MiB.  Copied
+production state is held rather than embedded and is limited to 16 GiB per
+copy-manifest file entry and 32 GiB total, with exact entry sizes recorded
+before any payload read.
+The sealed Node executable is limited to 512 MiB and the sealed GraphDB native
+to 512 MiB, both checked before memfd allocation.  The build unit's 12 GiB
+`MemoryMax` jointly bounds process memory and `/dev/shm` build bytes; the 8 GiB
+post-build directory limit remains the stricter acceptance bound.
+Execution/copy/public manifests are each limited to 2 MiB unless a stricter
+schema cap above applies.  Runner and operation-specific result/copy caps
+remain the stricter limits where applicable.  Readers
+reserve capacity incrementally and stop at limit plus one; they never buffer an
+unbounded line or process output before checking.  Boundary tests exercise
+each maximum and maximum-plus-one.  On overflow the owning process group is
+terminated and reaped under the same non-resetting overall deadline, and no
+partial frame, transcript, input-graph manifest, or artifact is accepted.
+
 The private artifact contains a canonical `V15ParityExecutionTranscript@1`,
 not only a caller-provided digest.  Each bounded event has consecutive
 `ordinal`, closed `caseId`, exact `role` (`base` or `candidate`), runner process
@@ -534,7 +698,10 @@ exactly one canonical success response or stable error class; it contains no
 timestamps or ambient paths.  Request/response byte hashes are derived from
 those payloads.  The transcript header binds the execution-manifest hash,
 copied-generation manifest hash, fixture hash, evaluator commit/build digest,
-and both runner handshakes.  The private checker reparses the raw transcript,
+both runner handshakes, and the parent-observed copied-native PID/channel
+authority, sealed native hash, GraphDB commit/build-manifest hash,
+`protocol_info` inventory digest, descriptor-only mode, and validated exact
+generation.  The private checker reparses the raw transcript,
 recomputes every event hash, call count, comparison, required case, aggregate,
 transcript digest, and verdict, and rejects missing, duplicate, reordered,
 role-changed, authority-changed, or extra events.  Public projection includes
