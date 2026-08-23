@@ -30,9 +30,13 @@ jobs:
           from pathlib import Path
           pin = json.loads(Path("spec/contracts/bounded-domain/bounded-domain-pin.json").read_text())
           sha = pin.get("sourceCommit")
+          branch = pin.get("sourceBranch")
           if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
               raise SystemExit("sourceCommit must be lowercase 40-hex Git SHA")
+          if branch != "production-runtime":
+              raise SystemExit("sourceBranch must be production-runtime")
           print(f"sha={sha}")
+          print(f"branch={branch}")
           PY
 
       - name: Checkout pinned Aira Synapse domain authority
@@ -47,8 +51,11 @@ jobs:
         run: |
           set -euo pipefail
           sha='${{ steps.synapse-pin.outputs.sha }}'
+          branch='${{ steps.synapse-pin.outputs.branch }}'
           test "$(git -C .cross-repo/aira-synapse rev-parse HEAD)" = "$sha"
-          git -C .cross-repo/aira-synapse merge-base --is-ancestor "$sha" origin/main
+          git -C .cross-repo/aira-synapse fetch --no-tags origin "+refs/heads/$branch:refs/remotes/origin/$branch"
+          git -C .cross-repo/aira-synapse rev-parse --verify "refs/remotes/origin/$branch^{commit}" >/dev/null
+          git -C .cross-repo/aira-synapse merge-base --is-ancestor "$sha" "origin/$branch"
           while IFS=$'\t' read -r source_path local_path; do
             [ -n "$source_path" ]
             [ "$(git -C .cross-repo/aira-synapse ls-tree -r "$sha" -- "$source_path" | wc -l)" -eq 1 ]

@@ -10,6 +10,7 @@ const CONTRACT_DIR: &str = "spec/contracts/bounded-domain";
 const PIN_FILE: &str = "bounded-domain-pin.json";
 const EXPECTED_PIN_VERSION: &str = "aira-graphdb-bounded-domain-pin@1";
 const EXPECTED_SOURCE_REPOSITORY: &str = "https://github.com/Ryuhei-So/aira-synapse";
+const EXPECTED_SOURCE_BRANCH: &str = "production-runtime";
 const MAX_ARTIFACT_BYTES: u64 = 128 * 1024;
 const MAX_TOTAL_ARTIFACT_BYTES: u64 = 256 * 1024;
 
@@ -18,6 +19,7 @@ const MAX_TOTAL_ARTIFACT_BYTES: u64 = 256 * 1024;
 struct ContractPin {
     pin_version: String,
     source_repository: String,
+    source_branch: String,
     source_commit: String,
     artifacts: Vec<PinnedArtifact>,
 }
@@ -111,6 +113,9 @@ fn verify_contract_dir(root: &Path) -> Result<(), String> {
             "unexpected sourceRepository {}",
             pin.source_repository
         ));
+    }
+    if pin.source_branch != EXPECTED_SOURCE_BRANCH {
+        return Err(format!("unexpected sourceBranch {}", pin.source_branch));
     }
     if pin.source_commit.len() != 40
         || !pin

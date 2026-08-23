@@ -20,6 +20,7 @@
     }
   ],
   "pinVersion": "aira-graphdb-bounded-domain-pin@1",
+  "sourceBranch": "production-runtime",
   "sourceCommit": "4c807a8df63aba1810da687a09a83827623d52bd",
   "sourceRepository": "https://github.com/Ryuhei-So/aira-synapse"
 }
