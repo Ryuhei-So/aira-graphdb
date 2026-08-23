@@ -2424,3 +2424,92 @@ fn repeated_small_mutations_have_delta_bounded_peak_rss_after_representative_sta
         "peak RSS grew with representative state rather than request delta: stateBytes={state_bytes} baselinePeak={baseline_peak} mutationPeak={mutation_peak} growth={growth} deltaBudget={delta_budget}"
     );
 }
+
+#[test]
+#[ignore = "checkpoint 2: enable after native retrieve_bounded admission and generation pinning exist"]
+fn retrieve_bounded_native_contract_is_pending_until_real_rpc_exists() {
+    let db = TempDb::new("retrieve-bounded-contract");
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    let info = native.send(json!({"id": 1, "method": "protocol_info", "params": {}}));
+    let method = info["result"]["methods"].as_array().and_then(|methods| {
+        methods
+            .iter()
+            .find(|method| method["name"] == "retrieve_bounded")
+    });
+    if method.is_none() {
+        assert_eq!(info["result"]["methodInventoryStatus"], json!("pending"));
+        return;
+    }
+    let method = method.expect("method checked above");
+    assert_eq!(method["classification"], json!("read"));
+    assert_eq!(method["wal"], json!(false));
+    assert_eq!(method["contractVersion"], json!("retrieve-bounded@1.0.0"));
+
+    let request = |id, expected_generation| {
+        json!({
+            "id": id,
+            "method": "retrieve_bounded",
+            "params": {
+                "protocolVersion": "retrieve-bounded@1.0.0",
+                "expectedGeneration": expected_generation,
+                "corpusId": "golden",
+                "namespace": "passage",
+                "queryVector": [1.0, 0.0],
+                "threshold": 0.0,
+                "topK": 2,
+                "topM": 2,
+                "maxIterations": 2,
+                "maxVisitedNodes": 4,
+                "maxVisitedEdges": 4,
+                "maxWorkUnits": 16,
+                "deadlineMs": 1000,
+                "maxResponseBytes": 65536
+            }
+        })
+    };
+    let response = native.send(request(2, 0));
+    assert_eq!(
+        response["ok"],
+        json!(true),
+        "real native RPC must return one complete response"
+    );
+    assert_eq!(
+        response["result"]["protocolVersion"],
+        json!("retrieve-bounded@1.0.0")
+    );
+    assert_eq!(response["result"]["generation"], json!(0));
+    for field in ["candidates", "passages", "facts", "work"] {
+        assert!(response["result"][field].is_object() || response["result"][field].is_array());
+    }
+
+    let stale = native.send(request(3, 1));
+    assert_eq!(stale["ok"], json!(false));
+    assert_eq!(
+        stale["error"]["code"],
+        json!("RETRIEVE_BOUNDED_STALE_GENERATION")
+    );
+    for (id, field, value) in [
+        (4, "topK", json!(10001)),
+        (5, "topM", json!(10001)),
+        (6, "maxIterations", json!(513)),
+        (7, "maxVisitedNodes", json!(200001)),
+        (8, "maxVisitedEdges", json!(500001)),
+        (9, "maxWorkUnits", json!(2000001)),
+        (10, "deadlineMs", json!(10001)),
+        (11, "maxResponseBytes", json!(1048577)),
+    ] {
+        let mut invalid = request(id, 0);
+        invalid["params"][field] = value;
+        let response = native.send(invalid);
+        assert_eq!(response["ok"], json!(false));
+        assert_eq!(response["error"]["code"], json!("INVALID_ARGUMENT"));
+    }
+    let mut oversized = request(12, 0);
+    oversized["params"]["queryVector"] = json!((0..4097).map(|_| 0.0f64).collect::<Vec<_>>());
+    let response = native.send(oversized);
+    assert_eq!(response["ok"], json!(false));
+    assert_eq!(response["error"]["code"], json!("INVALID_ARGUMENT"));
+    let after_invalid = native.send(json!({"id": 13, "method": "protocol_info", "params": {}}));
+    assert_eq!(after_invalid["result"]["generation"], json!(0));
+    assert_eq!(native.finish().code(), Some(0));
+}

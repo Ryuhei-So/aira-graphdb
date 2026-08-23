@@ -17,6 +17,12 @@ pub enum ErrorCode {
     InvalidThreshold,
     InvalidCorpusId,
     InvalidNamespace,
+    RecoveryPending,
+    RetrieveBoundedStaleGeneration,
+    RetrieveBoundedTimeout,
+    RetrieveBoundedTransportFailure,
+    RetrieveBoundedOom,
+    RetrieveBoundedUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,6 +48,8 @@ pub struct ErrorDefinition {
     pub code: ErrorCode,
     pub category: ErrorCategory,
     pub description: String,
+    pub retryable: bool,
+    pub failure_class: String,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +81,12 @@ impl ErrorCode {
             ErrorCode::InvalidThreshold => "INVALID_THRESHOLD",
             ErrorCode::InvalidCorpusId => "INVALID_CORPUS_ID",
             ErrorCode::InvalidNamespace => "INVALID_NAMESPACE",
+            ErrorCode::RecoveryPending => "RECOVERY_PENDING",
+            ErrorCode::RetrieveBoundedStaleGeneration => "RETRIEVE_BOUNDED_STALE_GENERATION",
+            ErrorCode::RetrieveBoundedTimeout => "RETRIEVE_BOUNDED_TIMEOUT",
+            ErrorCode::RetrieveBoundedTransportFailure => "RETRIEVE_BOUNDED_TRANSPORT_FAILURE",
+            ErrorCode::RetrieveBoundedOom => "RETRIEVE_BOUNDED_OOM",
+            ErrorCode::RetrieveBoundedUnavailable => "RETRIEVE_BOUNDED_UNAVAILABLE",
         }
     }
 
@@ -91,6 +105,14 @@ impl ErrorCode {
             "INVALID_THRESHOLD" => Some(ErrorCode::InvalidThreshold),
             "INVALID_CORPUS_ID" => Some(ErrorCode::InvalidCorpusId),
             "INVALID_NAMESPACE" => Some(ErrorCode::InvalidNamespace),
+            "RECOVERY_PENDING" => Some(ErrorCode::RecoveryPending),
+            "RETRIEVE_BOUNDED_STALE_GENERATION" => Some(ErrorCode::RetrieveBoundedStaleGeneration),
+            "RETRIEVE_BOUNDED_TIMEOUT" => Some(ErrorCode::RetrieveBoundedTimeout),
+            "RETRIEVE_BOUNDED_TRANSPORT_FAILURE" => {
+                Some(ErrorCode::RetrieveBoundedTransportFailure)
+            }
+            "RETRIEVE_BOUNDED_OOM" => Some(ErrorCode::RetrieveBoundedOom),
+            "RETRIEVE_BOUNDED_UNAVAILABLE" => Some(ErrorCode::RetrieveBoundedUnavailable),
             _ => None,
         }
     }
@@ -108,6 +130,13 @@ impl ErrorCode {
             | ErrorCode::InvalidThreshold
             | ErrorCode::InvalidCorpusId
             | ErrorCode::InvalidNamespace => ErrorCategory::Validation,
+            ErrorCode::RecoveryPending | ErrorCode::RetrieveBoundedStaleGeneration => {
+                ErrorCategory::Transaction
+            }
+            ErrorCode::RetrieveBoundedTimeout
+            | ErrorCode::RetrieveBoundedTransportFailure
+            | ErrorCode::RetrieveBoundedOom
+            | ErrorCode::RetrieveBoundedUnavailable => ErrorCategory::Query,
         }
     }
 }
@@ -173,6 +202,8 @@ impl ErrorRegistry {
                     code,
                     category,
                     description: entry.description,
+                    retryable: entry.retryable,
+                    failure_class: entry.failure_class,
                 },
             );
         }
@@ -229,6 +260,8 @@ mod tests {
                 code: "NOT_A_REAL_CODE".to_string(),
                 category: "auth".to_string(),
                 description: "invalid".to_string(),
+                retryable: false,
+                failure_class: "CLIENT_INPUT".to_string(),
             }],
         };
 

@@ -1,12 +1,32 @@
 {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "spec_id": "AGDB-RETRIEVE-BOUNDED@1.0.0",
-  "protocol_version": "retrieve-bounded@1.0.0",
+  "contractVersion": "retrieve-bounded@1.0.0",
   "method": "retrieve_bounded",
   "classification": "read",
   "wal": false,
-  "authority": "native-owner-committed-generation",
-  "request": {
+  "additionalProperties": false,
+  "authority": {
+    "canonical": "native-owner-committed-generation",
+    "transport": "private-stdio-owner-capability",
+    "roleField": "forbidden",
+    "leaseField": "forbidden"
+  },
+  "generation": {
+    "requestField": "expectedGeneration",
+    "type": "u64",
+    "admission": "exact committed generation only; RecoveryPending, partial, stale, and wrong-generation fail closed",
+    "pin": "native pins immutable in-process state for the request",
+    "publication": "owner blocks N+1 publication until the reader lease is released",
+    "responseValidation": "revalidate the same generation before emitting the complete response"
+  },
+  "materialization": "only bounded candidates, passages, and facts; never a full memory snapshot or global projection",
+  "requestSchema": {
+    "type": "object",
+    "additionalProperties": false,
     "required": [
+      "protocolVersion",
+      "expectedGeneration",
       "corpusId",
       "namespace",
       "queryVector",
@@ -19,77 +39,146 @@
       "deadlineMs",
       "maxResponseBytes"
     ],
-    "optional": ["threshold"],
-    "finiteNumbers": ["queryVector", "threshold"],
-    "threshold": {
-      "minimum": 0.0,
-      "maximum": 1.0
+    "properties": {
+      "protocolVersion": {"const": "retrieve-bounded@1.0.0"},
+      "expectedGeneration": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+      "corpusId": {"type": "string", "minLength": 1, "maxUtf8Bytes": 256},
+      "namespace": {"type": "string", "minLength": 1, "maxUtf8Bytes": 256},
+      "queryVector": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 4096,
+        "items": {"type": "number", "finite": true}
+      },
+      "threshold": {"$ref": "#/$defs/vectorThreshold"},
+      "topK": {"$ref": "#/$defs/topK"},
+      "topM": {"$ref": "#/$defs/topM"},
+      "maxIterations": {"type": "integer", "minimum": 1, "maximum": 512},
+      "maxVisitedNodes": {"type": "integer", "minimum": 1, "maximum": 200000},
+      "maxVisitedEdges": {"type": "integer", "minimum": 1, "maximum": 500000},
+      "maxWorkUnits": {"type": "integer", "minimum": 1, "maximum": 2000000},
+      "deadlineMs": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 10000,
+        "authority": "owner-native-monotonic-timeout",
+        "checkFrequency": "at least once per 1024 work units and before each response materialization"
+      },
+      "maxResponseBytes": {"type": "integer", "minimum": 1, "maximum": 1048576}
     },
-    "limits": {
-      "dimensions": {"minimum": 1, "maximum": 4096},
-      "topK": {"minimum": 1, "maximum": 10000},
-      "topM": {"minimum": 1, "maximum": 10000},
-      "maxIterations": {"minimum": 1, "maximum": 512},
-      "maxVisitedNodes": {"minimum": 1, "maximum": 200000},
-      "maxVisitedEdges": {"minimum": 1, "maximum": 500000},
-      "maxWorkUnits": {"minimum": 1, "maximum": 2000000},
-      "deadlineMs": {"minimum": 1, "maximum": 10000},
-      "maxResponseBytes": {"minimum": 1, "maximum": 1048576}
-    },
-    "unknownValues": "fail_closed_before_allocation_or_work"
-  },
-  "response": {
-    "required": [
-      "protocolVersion",
-      "generation",
-      "candidates",
-      "passages",
-      "facts",
-      "work"
-    ],
-    "generation": "one exact committed generation pinned for the complete request",
-    "materialization": "only bounded candidates, passages, and facts; never a full memory snapshot or projection",
-    "candidateItemRequired": ["id", "score", "metadata"],
-    "passageItemRequired": ["passageId", "documentId", "score", "text", "metadata"],
-    "factItemRequired": ["factId", "documentId", "score", "value", "metadata"],
-    "workRequired": [
-      "iterations",
-      "visitedNodes",
-      "visitedEdges",
-      "workUnits",
-      "elapsedMs",
-      "responseBytes"
-    ],
-    "ranking": {
-      "scoreOrder": "descending",
-      "tieBreakers": [
-        {"field": "id", "order": "ascending"},
-        {"field": "passageId", "order": "ascending"},
-        {"field": "factId", "order": "ascending"}
-      ],
-      "nonFiniteScores": "fail_closed"
+    "$defs": {
+      "vectorThreshold": {
+        "type": "number",
+        "finite": true,
+        "minimum": -1.0,
+        "maximum": 1.0,
+        "authority": "existing-exact-vector-primitive"
+      },
+      "topK": {"type": "integer", "minimum": 1, "maximum": 10000},
+      "topM": {"type": "integer", "minimum": 1, "maximum": 10000}
     }
   },
+  "responseSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["protocolVersion", "generation", "candidates", "passages", "facts", "work"],
+    "properties": {
+      "protocolVersion": {"const": "retrieve-bounded@1.0.0"},
+      "generation": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+      "candidates": {
+        "type": "array",
+        "maxItemsFrom": "request.topK",
+        "items": {"$ref": "#/$defs/candidate"}
+      },
+      "passages": {
+        "type": "array",
+        "maxItemsFrom": "request.topM",
+        "items": {"$ref": "#/$defs/passage"}
+      },
+      "facts": {
+        "type": "array",
+        "maxItemsFrom": "request.topM",
+        "items": {"$ref": "#/$defs/fact"}
+      },
+      "work": {"$ref": "#/$defs/work"}
+    },
+    "$defs": {
+      "boundedText": {"type": "string", "maxUtf8Bytes": 1048576},
+      "boundedMetadata": {"type": "object", "maxUtf8Bytes": 65536, "additionalProperties": true},
+      "candidate": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "score", "metadata"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxUtf8Bytes": 256},
+          "score": {"type": "number", "finite": true},
+          "metadata": {"$ref": "#/$defs/boundedMetadata"}
+        }
+      },
+      "passage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["passageId", "documentId", "score", "text", "metadata"],
+        "properties": {
+          "passageId": {"type": "string", "minLength": 1, "maxUtf8Bytes": 256},
+          "documentId": {"type": "string", "minLength": 1, "maxUtf8Bytes": 256},
+          "score": {"type": "number", "finite": true},
+          "text": {"$ref": "#/$defs/boundedText"},
+          "metadata": {"$ref": "#/$defs/boundedMetadata"}
+        }
+      },
+      "fact": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["factId", "documentId", "score", "value", "metadata"],
+        "properties": {
+          "factId": {"type": "string", "minLength": 1, "maxUtf8Bytes": 256},
+          "documentId": {"type": "string", "minLength": 1, "maxUtf8Bytes": 256},
+          "score": {"type": "number", "finite": true},
+          "value": {"$ref": "#/$defs/boundedText"},
+          "metadata": {"$ref": "#/$defs/boundedMetadata"}
+        }
+      },
+      "work": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["iterations", "visitedNodes", "visitedEdges", "workUnits", "elapsedMs", "responseBytes"],
+        "properties": {
+          "iterations": {"type": "integer", "minimum": 0, "maximumFrom": "request.maxIterations"},
+          "visitedNodes": {"type": "integer", "minimum": 0, "maximumFrom": "request.maxVisitedNodes"},
+          "visitedEdges": {"type": "integer", "minimum": 0, "maximumFrom": "request.maxVisitedEdges"},
+          "workUnits": {"type": "integer", "minimum": 0, "maximumFrom": "request.maxWorkUnits"},
+          "elapsedMs": {"type": "integer", "minimum": 0, "maximumFrom": "request.deadlineMs"},
+          "responseBytes": {"type": "integer", "minimum": 1, "maximumFrom": "request.maxResponseBytes"}
+        }
+      }
+    }
+  },
+  "ranking": {
+    "candidateSeeds": "exact cosine score from the existing vector primitive; apply threshold first, then retain topK",
+    "propagation": "bounded personalized PageRank: p[t+1](v)=(1-d)/|V|+d*sum(p[t](u)*w(u,v)/sumOutgoingWeight(u)); d=0.85; zero-outdegree mass remains at u",
+    "materializedScore": "seedScore * propagatedScore for the owning node/document",
+    "dedupe": "keep the highest score for each stable unique item key",
+    "passageAndFactLimit": "topM combined across passages and facts",
+    "totalOrder": "score descending, then type-specific stable unique key ascending",
+    "nonFiniteScores": "fail_closed"
+  },
+  "goldenFixture": "spec/contracts/retrieve-bounded-golden.v1.0.0.json",
+  "failureMatrix": {
+    "validationOrWrongVersion": "INVALID_ARGUMENT",
+    "staleGeneration": "RETRIEVE_BOUNDED_STALE_GENERATION",
+    "recoveryPendingOrPartial": "RECOVERY_PENDING",
+    "deadlineOrCancellation": "RETRIEVE_BOUNDED_TIMEOUT",
+    "transportDeath": "RETRIEVE_BOUNDED_TRANSPORT_FAILURE",
+    "oom": "RETRIEVE_BOUNDED_OOM",
+    "partialFrame": "never_success"
+  },
+  "errorContract": "AGDB-ERROR-CODES@1.0.0",
   "failureSemantics": {
     "partialResponse": "forbidden",
     "canonicalMutation": "forbidden",
     "generationAdvance": "forbidden",
-    "recoveryPendingOrPartialGeneration": "fail_closed",
-    "timeoutCancellationNativeDeathOrOom": "fail_closed"
-  },
-  "errors": [
-    "INVALID_RETRIEVE_BOUNDED_REQUEST",
-    "RETRIEVE_BOUNDED_CAP_EXCEEDED",
-    "RETRIEVE_BOUNDED_UNAVAILABLE",
-    "RECOVERY_PENDING",
-    "RETRIEVE_BOUNDED_TIMEOUT"
-  ],
-  "goldenRanking": {
-    "candidateScores": [
-      {"id": "candidate-a", "score": 0.75},
-      {"id": "candidate-b", "score": 0.75},
-      {"id": "candidate-c", "score": 0.5}
-    ],
-    "expectedIds": ["candidate-a", "candidate-b", "candidate-c"]
+    "backgroundWorkersAfterFailure": "forbidden",
+    "responseFraming": "serialize and size-check one complete UTF-8 JSON-RPC line before writing; EOF or partial frame is never success"
   }
 }

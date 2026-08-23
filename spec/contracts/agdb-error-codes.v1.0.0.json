@@ -1,70 +1,24 @@
 {
   "spec_id": "AGDB-ERROR-CODES@1.0.0",
   "codes": [
-    {
-      "code": "PROTOCOL_VERSION_MISMATCH",
-      "category": "protocol",
-      "description": "Client protocol/canonical type version does not match supported contract."
-    },
-    {
-      "code": "UNSUPPORTED_FEATURE",
-      "category": "query",
-      "description": "Query contains clause outside AGDB-CYPHER-P0-GRAMMAR@1.0.0."
-    },
-    {
-      "code": "RETRYABLE_CONFLICT",
-      "category": "transaction",
-      "description": "Transaction conflict detected under serializable isolation."
-    },
-    {
-      "code": "WRITE_LOCK_CONFLICT",
-      "category": "storage",
-      "description": "Write lock already held by another process for the same DB file."
-    },
-    {
-      "code": "INCOMPATIBLE_FORMAT",
-      "category": "storage",
-      "description": "Database file format version is not compatible with current runtime."
-    },
-    {
-      "code": "AUTH_REQUIRED",
-      "category": "auth",
-      "description": "Authentication is required before executing requests."
-    },
-    {
-      "code": "AUTH_FAILED",
-      "category": "auth",
-      "description": "Authentication failed due to signature/claims/policy validation."
-    },
-    {
-      "code": "REFERENTIAL_INTEGRITY_VIOLATION",
-      "category": "integrity",
-      "description": "Node delete/update violates edge referential integrity constraints."
-    },
-    {
-      "code": "INVALID_ARGUMENT",
-      "category": "validation",
-      "description": "One or more request arguments are invalid."
-    },
-    {
-      "code": "INVALID_TOP_K",
-      "category": "validation",
-      "description": "topK must be an integer greater than 0."
-    },
-    {
-      "code": "INVALID_THRESHOLD",
-      "category": "validation",
-      "description": "threshold must be within [0.0, 1.0]."
-    },
-    {
-      "code": "INVALID_CORPUS_ID",
-      "category": "validation",
-      "description": "corpusId is missing or malformed."
-    },
-    {
-      "code": "INVALID_NAMESPACE",
-      "category": "validation",
-      "description": "namespace is missing or malformed."
-    }
+    {"code": "PROTOCOL_VERSION_MISMATCH", "category": "protocol", "description": "Client protocol/canonical type version does not match supported contract.", "retryable": false, "failureClass": "CLIENT_INPUT"},
+    {"code": "UNSUPPORTED_FEATURE", "category": "query", "description": "Query contains a feature outside the supported contract.", "retryable": false, "failureClass": "CLIENT_INPUT"},
+    {"code": "RETRYABLE_CONFLICT", "category": "transaction", "description": "Transaction conflict detected under serializable isolation.", "retryable": true, "failureClass": "CLIENT_INPUT"},
+    {"code": "WRITE_LOCK_CONFLICT", "category": "storage", "description": "Write lock already held by another process for the same DB file.", "retryable": true, "failureClass": "IO_FAILURE"},
+    {"code": "INCOMPATIBLE_FORMAT", "category": "storage", "description": "Database file format version is not compatible with current runtime.", "retryable": false, "failureClass": "IO_FAILURE"},
+    {"code": "AUTH_REQUIRED", "category": "auth", "description": "Authentication is required before executing requests.", "retryable": false, "failureClass": "CLIENT_INPUT"},
+    {"code": "AUTH_FAILED", "category": "auth", "description": "Authentication failed due to signature/claims/policy validation.", "retryable": false, "failureClass": "CLIENT_INPUT"},
+    {"code": "REFERENTIAL_INTEGRITY_VIOLATION", "category": "integrity", "description": "Node delete/update violates edge referential integrity constraints.", "retryable": false, "failureClass": "CLIENT_INPUT"},
+    {"code": "INVALID_ARGUMENT", "category": "validation", "description": "One or more request arguments are invalid.", "retryable": false, "failureClass": "CLIENT_INPUT"},
+    {"code": "INVALID_TOP_K", "category": "validation", "description": "topK must be an integer greater than 0.", "retryable": false, "failureClass": "CLIENT_INPUT"},
+    {"code": "INVALID_THRESHOLD", "category": "validation", "description": "threshold must be finite and within the existing vector primitive domain.", "retryable": false, "failureClass": "CLIENT_INPUT"},
+    {"code": "INVALID_CORPUS_ID", "category": "validation", "description": "corpusId is missing or malformed.", "retryable": false, "failureClass": "CLIENT_INPUT"},
+    {"code": "INVALID_NAMESPACE", "category": "validation", "description": "namespace is missing or malformed.", "retryable": false, "failureClass": "CLIENT_INPUT"},
+    {"code": "RECOVERY_PENDING", "category": "transaction", "description": "Canonical recovery is pending; bounded retrieval cannot observe the state.", "retryable": true, "failureClass": "CLIENT_INPUT"},
+    {"code": "RETRIEVE_BOUNDED_STALE_GENERATION", "category": "transaction", "description": "The expected generation is not the exact committed generation held by the owner.", "retryable": true, "failureClass": "CLIENT_INPUT"},
+    {"code": "RETRIEVE_BOUNDED_TIMEOUT", "category": "query", "description": "Bounded retrieval exceeded its owner-native monotonic deadline or was cancelled.", "retryable": true, "failureClass": "TIMEOUT"},
+    {"code": "RETRIEVE_BOUNDED_TRANSPORT_FAILURE", "category": "query", "description": "The owner/native transport died or ended before one complete response frame.", "retryable": true, "failureClass": "IO_FAILURE"},
+    {"code": "RETRIEVE_BOUNDED_OOM", "category": "query", "description": "Bounded retrieval was terminated by an out-of-memory condition and emitted no partial success.", "retryable": true, "failureClass": "OOM"},
+    {"code": "RETRIEVE_BOUNDED_UNAVAILABLE", "category": "query", "description": "The versioned bounded retrieval capability is not available in this native build.", "retryable": false, "failureClass": "INTERNAL_BUG"}
   ]
 }

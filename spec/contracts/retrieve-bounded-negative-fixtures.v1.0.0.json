@@ -1,0 +1,34 @@
+{
+  "id": "retrieve-bounded-negative-fixtures.v1.0.0",
+  "contractVersion": "retrieve-bounded@1.0.0",
+  "baseRequest": {
+    "protocolVersion": "retrieve-bounded@1.0.0",
+    "expectedGeneration": 7,
+    "corpusId": "golden",
+    "namespace": "passage",
+    "queryVectorLength": 2,
+    "threshold": 0.0,
+    "topK": 2,
+    "topM": 2,
+    "maxIterations": 2,
+    "maxVisitedNodes": 4,
+    "maxVisitedEdges": 4,
+    "maxWorkUnits": 16,
+    "deadlineMs": 1000,
+    "maxResponseBytes": 65536
+  },
+  "cases": [
+    {"name": "unknown_field", "mutation": {"unknown": true}, "expectedCode": "INVALID_ARGUMENT"},
+    {"name": "wrong_version", "mutation": {"protocolVersion": "retrieve-bounded@9.9.9"}, "expectedCode": "PROTOCOL_VERSION_MISMATCH"},
+    {"name": "wrong_type_topK", "mutation": {"topK": "2"}, "expectedCode": "INVALID_ARGUMENT"},
+    {"name": "nonfinite_vector", "mutation": {"queryVector": "NaN"}, "expectedCode": "INVALID_ARGUMENT"},
+    {"name": "dimensions_at_max", "mutation": {"queryVectorLength": 4096}, "expectedCode": null},
+    {"name": "dimensions_over_max", "mutation": {"queryVectorLength": 4097}, "expectedCode": "INVALID_ARGUMENT"},
+    {"name": "topK_at_max", "mutation": {"topK": 10000}, "expectedCode": null},
+    {"name": "topK_over_max", "mutation": {"topK": 10001}, "expectedCode": "INVALID_ARGUMENT"},
+    {"name": "topM_at_max", "mutation": {"topM": 10000}, "expectedCode": null},
+    {"name": "topM_over_max", "mutation": {"topM": 10001}, "expectedCode": "INVALID_ARGUMENT"},
+    {"name": "stale_generation", "mutation": {"expectedGeneration": 8}, "expectedCode": "RETRIEVE_BOUNDED_STALE_GENERATION"},
+    {"name": "recovery_pending", "precondition": "RecoveryPending", "expectedCode": "RECOVERY_PENDING"}
+  ]
+}
