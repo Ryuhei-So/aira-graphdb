@@ -10,6 +10,8 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(target_os = "linux")]
 use std::{ffi::CString, os::unix::ffi::OsStrExt};
@@ -208,13 +210,15 @@ enum TransactionState {
 }
 
 struct Server {
-    db_path: PathBuf,
-    audit_log_path: PathBuf,
+    /// Filesystem paths are present only for the normal owner-facing mode.
+    /// Descriptor mode deliberately has no path or parent-directory authority.
+    db_path: Option<PathBuf>,
+    audit_log_path: Option<PathBuf>,
     state: State,
     vector_values: HashMap<String, Vec<f64>>,
     cache_dirty: bool,
     transaction: TransactionState,
-    wal_path: PathBuf,
+    wal_path: Option<PathBuf>,
     wal_bytes: u64,
     wal_identity: Option<(u64, u64)>,
     wal_replaying: bool,
@@ -225,7 +229,47 @@ struct Server {
     adjacent_edge_keys_by_node: HashMap<String, Vec<String>>,
     vector_keys_by_corpus_namespace: HashMap<String, Vec<String>>,
     passage_keys_by_corpus: HashMap<String, Vec<String>>,
+    access_mode: AccessMode,
 }
+
+#[derive(Debug, Clone)]
+enum AccessMode {
+    Normal,
+    DescriptorReadOnly(DescriptorReadHandshake),
+}
+
+#[derive(Debug, Clone)]
+struct DescriptorReadHandshake {
+    canonical_sha256: String,
+    vector_blob_sha256: String,
+    vector_blob_size: u64,
+    legacy_generation0: bool,
+    legacy_binding_sha256: Option<String>,
+    method_inventory_sha256: String,
+}
+
+#[derive(Debug)]
+struct DescriptorReadConfig {
+    canonical_fd: i32,
+    vector_blob_fd: i32,
+    expected_generation: u64,
+    legacy_generation0: bool,
+    legacy_binding_sha256: Option<String>,
+}
+
+const ACCESS_MODE_DESCRIPTOR_READ_ONLY: &str = "descriptor-read-only";
+const DESCRIPTOR_READ_ONLY_METHOD_CODE: &str = "DESCRIPTOR_READ_ONLY_METHOD";
+const DESCRIPTOR_READ_ONLY_METHOD_MESSAGE: &str =
+    "method is unavailable in descriptor read-only mode";
+const MAX_SAFE_GENERATION: u64 = 9_007_199_254_740_991;
+// The descriptor protocol must never turn an inherited file into an
+// unbounded allocation. These caps are intentionally independent from the
+// normal --db persistence path and are checked from fstat before reading.
+const MAX_DESCRIPTOR_CANONICAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_DESCRIPTOR_VECTOR_BLOB_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_DESCRIPTOR_PROTOCOL_FRAME_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DESCRIPTOR_PROTOCOL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DESCRIPTOR_PROTOCOL_FRAMES: u64 = 4096;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -618,8 +662,8 @@ impl Server {
             state.generation,
         )?;
         Ok(Self {
-            audit_log_path: db_path.with_extension("native-audit.log"),
-            wal_path: db_path.with_extension("agdb.wal"),
+            audit_log_path: Some(db_path.with_extension("native-audit.log")),
+            wal_path: Some(db_path.with_extension("agdb.wal")),
             wal_bytes: fs::metadata(db_path.with_extension("agdb.wal"))
                 .map(|metadata| metadata.len())
                 .unwrap_or(0),
@@ -628,7 +672,7 @@ impl Server {
             last_persist_bytes: fs::metadata(&db_path)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0),
-            db_path,
+            db_path: Some(db_path),
             state,
             vector_values,
             cache_dirty: true,
@@ -639,6 +683,7 @@ impl Server {
             adjacent_edge_keys_by_node: HashMap::new(),
             vector_keys_by_corpus_namespace: HashMap::new(),
             passage_keys_by_corpus: HashMap::new(),
+            access_mode: AccessMode::Normal,
         })
     }
 
@@ -676,12 +721,16 @@ impl Server {
     }
 
     fn append_request_audit_event(&self, error_code: &str, failure_class: &str, request_id: &str) {
-        let _ = Self::append_request_audit_event_for_path(
-            &self.audit_log_path,
-            error_code,
-            failure_class,
-            request_id,
-        );
+        // Descriptor mode has no audit-file authority. Its only successful
+        // writes are the protocol bytes sent to stdout by the caller.
+        if let Some(path) = self.audit_log_path.as_ref() {
+            let _ = Self::append_request_audit_event_for_path(
+                path,
+                error_code,
+                failure_class,
+                request_id,
+            );
+        }
     }
 
     fn parent_dir(path: &Path) -> PathBuf {
@@ -1319,6 +1368,258 @@ impl Server {
         Self::decode_vector_values(state, raw_blob.as_deref())
     }
 
+    fn validate_sha256(value: &str, field: &str) -> io::Result<()> {
+        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(io::Error::other(format!(
+                "{field} must be a lowercase SHA-256 hex digest"
+            )));
+        }
+        if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return Err(io::Error::other(format!(
+                "{field} must be a lowercase SHA-256 hex digest"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn validate_inherited_readonly_file(
+        file: fs::File,
+        name: &str,
+        max_bytes: u64,
+    ) -> io::Result<fs::File> {
+        // The caller has already taken ownership of every inherited
+        // descriptor, so failure while validating either file closes both.
+        // F_GETFL observes the open file description, not merely inode mode.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::other(format!(
+                "{name} fcntl(F_GETFL) failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        if flags & libc::O_ACCMODE != libc::O_RDONLY {
+            return Err(io::Error::other(format!("{name} must be opened O_RDONLY")));
+        }
+        #[cfg(target_os = "linux")]
+        if flags & libc::O_PATH != 0 {
+            return Err(io::Error::other(format!(
+                "{name} must be readable, not O_PATH"
+            )));
+        }
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::other(format!(
+                "{name} must refer to a regular file"
+            )));
+        }
+        if metadata.len() > max_bytes {
+            return Err(io::Error::other(format!("{name} exceeds its bounded size")));
+        }
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    fn validate_inherited_readonly_file(
+        _file: fs::File,
+        name: &str,
+        _max_bytes: u64,
+    ) -> io::Result<fs::File> {
+        Err(io::Error::other(format!(
+            "descriptor mode is unsupported on this platform ({name})"
+        )))
+    }
+
+    fn read_bounded_descriptor_file(
+        mut file: fs::File,
+        max_bytes: u64,
+        name: &str,
+    ) -> io::Result<Vec<u8>> {
+        let size = file.metadata()?.len();
+        if size > max_bytes {
+            return Err(io::Error::other(format!("{name} exceeds its bounded size")));
+        }
+        let capacity = usize::try_from(size)
+            .map_err(|_| io::Error::other(format!("{name} size does not fit usize")))?;
+        let mut raw = Vec::new();
+        raw.try_reserve_exact(capacity)
+            .map_err(|_| io::Error::other(format!("{name} allocation exceeds bounded capacity")))?;
+        file.seek(SeekFrom::Start(0))?;
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut raw)?;
+        if raw.len() as u64 != size || raw.len() as u64 > max_bytes {
+            return Err(io::Error::other(format!(
+                "{name} changed or exceeded its bounded size"
+            )));
+        }
+        Ok(raw)
+    }
+
+    fn validate_descriptor_blob_bytes(raw: &[u8]) -> io::Result<()> {
+        let header_len = Self::VECTOR_BLOB_MAGIC.len() + std::mem::size_of::<u16>();
+        if raw.len() < header_len {
+            return Err(io::Error::other("vector blob file is truncated"));
+        }
+        if &raw[..Self::VECTOR_BLOB_MAGIC.len()] != Self::VECTOR_BLOB_MAGIC {
+            return Err(io::Error::other("vector blob magic mismatch"));
+        }
+        let version_start = Self::VECTOR_BLOB_MAGIC.len();
+        let version_end = version_start + std::mem::size_of::<u16>();
+        let version = u16::from_le_bytes(
+            raw[version_start..version_end]
+                .try_into()
+                .expect("validated slice length"),
+        );
+        if version != Self::VECTOR_BLOB_VERSION {
+            return Err(io::Error::other(format!(
+                "vector blob version mismatch: expected {}, got {version}",
+                Self::VECTOR_BLOB_VERSION
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn open_descriptor_read(config: DescriptorReadConfig) -> io::Result<Self> {
+        if config.canonical_fd < 0 || config.vector_blob_fd < 0 {
+            // A valid peer descriptor is still owned by this consumed config.
+            for fd in [config.canonical_fd, config.vector_blob_fd] {
+                if fd >= 0 {
+                    // SAFETY: each non-negative descriptor occurs once in
+                    // this branch because the equal case is handled below.
+                    drop(unsafe { fs::File::from_raw_fd(fd) });
+                }
+            }
+            return Err(io::Error::other(
+                "descriptor FDs must be non-negative integers",
+            ));
+        }
+        if config.canonical_fd == config.vector_blob_fd {
+            // SAFETY: config is consumed and the one descriptor is converted
+            // exactly once, solely to close it on this rejection path.
+            drop(unsafe { fs::File::from_raw_fd(config.canonical_fd) });
+            return Err(io::Error::other(
+                "canonical and vector blob FDs must be distinct",
+            ));
+        }
+        // SAFETY: config is consumed and the descriptors are distinct. Take
+        // ownership of both before either validation can fail.
+        let canonical_file = unsafe { fs::File::from_raw_fd(config.canonical_fd) };
+        let blob_file = unsafe { fs::File::from_raw_fd(config.vector_blob_fd) };
+        let canonical_file = Self::validate_inherited_readonly_file(
+            canonical_file,
+            "canonical FD",
+            MAX_DESCRIPTOR_CANONICAL_BYTES,
+        )?;
+        let blob_file = Self::validate_inherited_readonly_file(
+            blob_file,
+            "vector blob FD",
+            MAX_DESCRIPTOR_VECTOR_BLOB_BYTES,
+        )?;
+        if Self::metadata_identity(&canonical_file.metadata()?)
+            == Self::metadata_identity(&blob_file.metadata()?)
+        {
+            return Err(io::Error::other(
+                "canonical and vector blob descriptors must name distinct files",
+            ));
+        }
+        let canonical_raw = Self::read_bounded_descriptor_file(
+            canonical_file,
+            MAX_DESCRIPTOR_CANONICAL_BYTES,
+            "canonical FD",
+        )?;
+        let blob_raw = Self::read_bounded_descriptor_file(
+            blob_file,
+            MAX_DESCRIPTOR_VECTOR_BLOB_BYTES,
+            "vector blob FD",
+        )?;
+        Self::validate_descriptor_blob_bytes(&blob_raw)?;
+        let canonical_sha256 = Self::sha256_hex(&canonical_raw);
+        let vector_blob_sha256 = Self::sha256_hex(&blob_raw);
+        let state: State = serde_json::from_slice(&canonical_raw)
+            .map_err(|err| io::Error::other(format!("parse canonical descriptor failed: {err}")))?;
+        if state.generation > MAX_SAFE_GENERATION {
+            return Err(io::Error::other(
+                "canonical generation exceeds MAX_SAFE_INTEGER",
+            ));
+        }
+        if state.generation != config.expected_generation {
+            return Err(io::Error::other(
+                "canonical generation does not match expectedGeneration",
+            ));
+        }
+        if config.expected_generation == 0 {
+            if !config.legacy_generation0 {
+                return Err(io::Error::other(
+                    "generation zero requires explicit legacyGeneration0",
+                ));
+            }
+            let binding = config
+                .legacy_binding_sha256
+                .as_deref()
+                .ok_or_else(|| io::Error::other("generation zero requires legacy binding hash"))?;
+            Self::validate_sha256(binding, "legacy binding hash")?;
+            if state.vector_blob.is_some() {
+                return Err(io::Error::other(
+                    "generation zero must not contain a vectorBlob descriptor",
+                ));
+            }
+        } else {
+            if config.legacy_generation0 || config.legacy_binding_sha256.is_some() {
+                return Err(io::Error::other(
+                    "legacy generation zero metadata is forbidden for positive generations",
+                ));
+            }
+            let descriptor = state.vector_blob.as_ref().ok_or_else(|| {
+                io::Error::other("positive generation requires a vectorBlob descriptor")
+            })?;
+            Self::validate_blob_basename(&descriptor.basename)?;
+            if descriptor.size != blob_raw.len() as u64 {
+                return Err(io::Error::other(
+                    "vector blob size does not match canonical descriptor",
+                ));
+            }
+            Self::validate_sha256(&descriptor.sha256, "vectorBlob.sha256")?;
+            if descriptor.sha256 != vector_blob_sha256 {
+                return Err(io::Error::other(
+                    "vector blob hash does not match canonical descriptor",
+                ));
+            }
+            if descriptor.format != Self::VECTOR_BLOB_VERSION {
+                return Err(io::Error::other("vector blob descriptor format mismatch"));
+            }
+        }
+        let vector_values = Self::decode_vector_values(&state, Some(&blob_raw))?;
+        let handshake = DescriptorReadHandshake {
+            canonical_sha256,
+            vector_blob_sha256,
+            vector_blob_size: blob_raw.len() as u64,
+            legacy_generation0: config.legacy_generation0,
+            legacy_binding_sha256: config.legacy_binding_sha256.clone(),
+            method_inventory_sha256: Self::descriptor_method_inventory_sha256(),
+        };
+        Ok(Self {
+            db_path: None,
+            audit_log_path: None,
+            state,
+            vector_values,
+            cache_dirty: true,
+            transaction: TransactionState::Idle,
+            wal_path: None,
+            wal_bytes: 0,
+            wal_identity: None,
+            wal_replaying: false,
+            last_persist_bytes: canonical_raw.len() as u64,
+            fatal: false,
+            node_keys_by_corpus: HashMap::new(),
+            edge_keys_by_corpus: HashMap::new(),
+            adjacent_edge_keys_by_node: HashMap::new(),
+            vector_keys_by_corpus_namespace: HashMap::new(),
+            passage_keys_by_corpus: HashMap::new(),
+            access_mode: AccessMode::DescriptorReadOnly(handshake),
+        })
+    }
+
     fn decode_vector_values(
         state: &State,
         raw_blob: Option<&[u8]>,
@@ -1397,7 +1698,8 @@ impl Server {
         let wal_identity = wal_identity
             .ok_or_else(|| io::Error::other("durable WAL disappeared before publication"))?;
 
-        let parent = Self::parent_dir(&self.db_path);
+        let db_path = self.require_db_path()?;
+        let parent = Self::parent_dir(db_path);
         fs::create_dir_all(&parent)
             .map_err(|err| io::Error::other(format!("create database directory failed: {err}")))?;
 
@@ -1407,7 +1709,7 @@ impl Server {
         let blob_sha256 = Self::sha256_hex(&vector_blob_payload);
         let blob_basename = format!(
             "{}.g{next_generation:020}.{blob_sha256}.vblob",
-            self.db_path
+            db_path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .unwrap_or("vectors")
@@ -1455,17 +1757,17 @@ impl Server {
         persisted_state.vector_blob = Some(blob_descriptor.clone());
         let raw = serde_json::to_vec(&persisted_state)
             .map_err(|err| io::Error::other(format!("serialize state failed: {err}")))?;
-        match fs::symlink_metadata(&self.db_path) {
-            Ok(metadata) => Self::require_regular_single_link(&self.db_path, &metadata)?,
+        match fs::symlink_metadata(db_path) {
+            Ok(metadata) => Self::require_regular_single_link(db_path, &metadata)?,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
-        let json_tmp = Self::write_durable_temp(&self.db_path, &raw, "json_temp_sync")?;
+        let json_tmp = Self::write_durable_temp(db_path, &raw, "json_temp_sync")?;
         if let Err(err) = Self::durability_failpoint("before_json_rename") {
             let _ = fs::remove_file(&json_tmp);
             return Err(err);
         }
-        if let Err(err) = fs::rename(&json_tmp, &self.db_path) {
+        if let Err(err) = fs::rename(&json_tmp, db_path) {
             let _ = fs::remove_file(&json_tmp);
             return Err(io::Error::other(format!(
                 "publish canonical state failed: {err}"
@@ -1511,6 +1813,46 @@ impl Server {
 
     fn method_spec(method: &str) -> Option<&'static MethodSpec> {
         METHOD_SPECS.iter().find(|spec| spec.name == method)
+    }
+
+    fn require_db_path(&self) -> io::Result<&Path> {
+        self.db_path.as_deref().ok_or_else(|| {
+            io::Error::other("filesystem database path is unavailable in descriptor mode")
+        })
+    }
+
+    fn require_wal_path(&self) -> io::Result<&Path> {
+        self.wal_path
+            .as_deref()
+            .ok_or_else(|| io::Error::other("WAL path is unavailable in descriptor mode"))
+    }
+
+    fn descriptor_method_specs() -> impl Iterator<Item = &'static MethodSpec> {
+        METHOD_SPECS
+            .iter()
+            // The descriptor checkpoint exposes only health. The three
+            // bounded retrieval methods are added here when their contract
+            // implementation lands; no legacy read is implicitly admitted.
+            .filter(|spec| matches!(spec.name, "ping" | "protocol_info"))
+    }
+
+    fn descriptor_method_inventory() -> Vec<Value> {
+        Self::descriptor_method_specs()
+            .map(|spec| {
+                json!({
+                    "name": spec.name,
+                    "classification": spec.classification,
+                    "wal": spec.wal,
+                })
+            })
+            .collect()
+    }
+
+    fn descriptor_method_inventory_sha256() -> String {
+        let encoded = Self::descriptor_method_specs()
+            .map(|spec| format!("{}\t{}\t{}\n", spec.name, spec.classification, spec.wal))
+            .collect::<String>();
+        Self::sha256_hex(encoded.as_bytes())
     }
 
     /// WAL admission and protocol_info both use METHOD_SPECS. Unknown
@@ -1592,7 +1934,8 @@ impl Server {
     fn read_wal_records_with_identity(
         &self,
     ) -> io::Result<(Vec<WalRecord>, Option<(u64, u64)>, Vec<u8>)> {
-        let (raw, identity) = match Self::read_regular_nofollow_with_identity(&self.wal_path) {
+        let wal_path = self.require_wal_path()?;
+        let (raw, identity) = match Self::read_regular_nofollow_with_identity(wal_path) {
             Ok(result) => result,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 return Ok((Vec::new(), None, Vec::new()));
@@ -1608,8 +1951,9 @@ impl Server {
         expected_identity: (u64, u64),
         expected_raw: &[u8],
     ) -> io::Result<()> {
-        let parent = Self::parent_dir(&self.wal_path);
-        let mut held_wal = Self::open_regular_nofollow(&self.wal_path)?;
+        let wal_path = self.require_wal_path()?;
+        let parent = Self::parent_dir(wal_path);
+        let mut held_wal = Self::open_regular_nofollow(wal_path)?;
         if Self::metadata_identity(&held_wal.metadata()?) != expected_identity {
             return Err(io::Error::other("WAL identity changed before retirement"));
         }
@@ -1618,8 +1962,8 @@ impl Server {
         if held_before != expected_raw {
             return Err(io::Error::other("WAL content changed before retirement"));
         }
-        let retired = Self::temporary_path(&self.wal_path, "wal_retire")?;
-        Self::rename_noreplace(&self.wal_path, &retired)?;
+        let retired = Self::temporary_path(wal_path, "wal_retire")?;
+        Self::rename_noreplace(wal_path, &retired)?;
         Self::validate_regular_path_identity(&retired, expected_identity)?;
         held_wal.seek(SeekFrom::Start(0))?;
         let mut held_after = Vec::new();
@@ -1650,15 +1994,16 @@ impl Server {
             bytes.extend_from_slice(&encoded);
             bytes.push(b'\n');
         }
-        let tmp = Self::write_durable_temp(&self.wal_path, &bytes, "wal_compact_sync")?;
+        let wal_path = self.require_wal_path()?;
+        let tmp = Self::write_durable_temp(wal_path, &bytes, "wal_compact_sync")?;
         Self::durability_failpoint("before_wal_rewrite_rename")?;
-        if let Err(err) = fs::rename(&tmp, &self.wal_path) {
+        if let Err(err) = fs::rename(&tmp, wal_path) {
             let _ = fs::remove_file(&tmp);
             return Err(io::Error::other(format!("replace WAL failed: {err}")));
         }
         Self::durability_failpoint("after_wal_rewrite_rename")?;
         Self::durability_failpoint("before_wal_rewrite_dir_fsync")?;
-        Self::sync_parent_dir(&Self::parent_dir(&self.wal_path))?;
+        Self::sync_parent_dir(&Self::parent_dir(wal_path))?;
         Self::durability_failpoint("after_wal_rewrite_dir_fsync")
     }
 
@@ -1682,17 +2027,18 @@ impl Server {
     }
 
     fn open_wal_for_append(&self) -> io::Result<(fs::File, bool, (u64, u64))> {
+        let wal_path = self.require_wal_path()?;
         for _ in 0..2 {
-            match fs::symlink_metadata(&self.wal_path) {
+            match fs::symlink_metadata(wal_path) {
                 Ok(path_metadata) => {
-                    Self::require_regular_single_link(&self.wal_path, &path_metadata)?;
+                    Self::require_regular_single_link(wal_path, &path_metadata)?;
                     let mut options = fs::OpenOptions::new();
                     options.write(true).append(true);
                     #[cfg(unix)]
                     options.custom_flags(libc::O_NOFOLLOW);
-                    let file = options.open(&self.wal_path)?;
+                    let file = options.open(wal_path)?;
                     let file_metadata = file.metadata()?;
-                    Self::require_regular_single_link(&self.wal_path, &file_metadata)?;
+                    Self::require_regular_single_link(wal_path, &file_metadata)?;
                     if Self::metadata_identity(&path_metadata)
                         != Self::metadata_identity(&file_metadata)
                     {
@@ -1714,10 +2060,10 @@ impl Server {
                     options.write(true).append(true).create_new(true);
                     #[cfg(unix)]
                     options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-                    match options.open(&self.wal_path) {
+                    match options.open(wal_path) {
                         Ok(file) => {
                             let metadata = file.metadata()?;
-                            Self::require_regular_single_link(&self.wal_path, &metadata)?;
+                            Self::require_regular_single_link(wal_path, &metadata)?;
                             let identity = Self::metadata_identity(&metadata);
                             return Ok((file, true, identity));
                         }
@@ -1741,7 +2087,8 @@ impl Server {
         };
         let encoded = serde_json::to_vec(&record)
             .map_err(|err| io::Error::other(format!("serialize WAL record failed: {err}")))?;
-        let parent = Self::parent_dir(&self.wal_path);
+        let wal_path = self.require_wal_path()?;
+        let parent = Self::parent_dir(wal_path);
         fs::create_dir_all(&parent)?;
         let (mut file, wal_created, wal_identity) = self.open_wal_for_append()?;
         Self::durability_failpoint("before_wal_write")?;
@@ -1758,7 +2105,7 @@ impl Server {
             Self::durability_failpoint("after_wal_dir_fsync")?;
         }
         Self::durability_pausepoint("after_wal_sync_before_identity_check")?;
-        Self::validate_regular_path_identity(&self.wal_path, wal_identity)?;
+        Self::validate_regular_path_identity(wal_path, wal_identity)?;
         self.wal_identity = Some(wal_identity);
         self.wal_bytes += encoded.len() as u64 + 1;
         Ok(())
@@ -1876,7 +2223,10 @@ impl Server {
                 "recovery WAL changed before quarantine".to_string(),
             ));
         }
-        let mut held_wal = Self::open_regular_nofollow(&self.wal_path).map_err(|err| {
+        let wal_path = self
+            .require_wal_path()
+            .map_err(|err| Self::execution_io_error(err.to_string()))?;
+        let mut held_wal = Self::open_regular_nofollow(wal_path).map_err(|err| {
             Self::execution_io_error(format!("hold recovery WAL for quarantine: {err}"))
         })?;
         let held_metadata = held_wal
@@ -1896,12 +2246,11 @@ impl Server {
                 "recovery WAL changed before quarantine rename".to_string(),
             ));
         }
-        let parent = Self::parent_dir(&self.wal_path);
+        let parent = Self::parent_dir(wal_path);
         let nonce = Self::crypto_nonce().map_err(|err| {
             Self::execution_io_error(format!("create recovery nonce failed: {err}"))
         })?;
-        let file_name = self
-            .wal_path
+        let file_name = wal_path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("aira-graphdb.agdb.wal");
@@ -1914,7 +2263,7 @@ impl Server {
         Self::durability_failpoint("before_recovery_quarantine_rename").map_err(|err| {
             Self::execution_io_error(format!("quarantine recovery WAL failed: {err}"))
         })?;
-        Self::rename_noreplace(&self.wal_path, &quarantine).map_err(|err| {
+        Self::rename_noreplace(wal_path, &quarantine).map_err(|err| {
             Self::execution_io_error(format!("quarantine recovery WAL failed: {err}"))
         })?;
         let quarantine_metadata = Self::open_regular_nofollow(&quarantine)
@@ -2702,6 +3051,18 @@ impl Server {
             return self
                 .response_for_result(req.id, Err(Self::unsupported_method_error(&req.method)));
         };
+        if matches!(self.access_mode, AccessMode::DescriptorReadOnly(_))
+            && !Self::descriptor_method_specs().any(|allowed| allowed.name == spec.name)
+        {
+            return self.response_for_result(
+                req.id,
+                Err(AppError {
+                    code: DESCRIPTOR_READ_ONLY_METHOD_CODE.to_string(),
+                    message: DESCRIPTOR_READ_ONLY_METHOD_MESSAGE.to_string(),
+                    failure_class: Some("CLIENT_INPUT".to_string()),
+                }),
+            );
+        }
         if matches!(self.transaction, TransactionState::RecoveryPending { .. })
             && !matches!(spec.classification, "health" | "recovery")
         {
@@ -2731,17 +3092,26 @@ impl Server {
             match req.method.as_str() {
                 "ping" => Ok(json!({"pong": true})),
                 "protocol_info" => {
-                    let methods: Vec<Value> = METHOD_SPECS
-                        .iter()
-                        .map(|spec| {
-                            json!({
-                                "name": spec.name,
-                                "classification": spec.classification,
-                                "wal": spec.wal,
-                            })
-                        })
-                        .collect();
-                    Ok(json!({
+                    let descriptor_handshake = match &self.access_mode {
+                        AccessMode::DescriptorReadOnly(handshake) => Some(handshake),
+                        AccessMode::Normal => None,
+                    };
+                    let methods = descriptor_handshake
+                        .is_some()
+                        .then(Self::descriptor_method_inventory)
+                        .unwrap_or_else(|| {
+                            METHOD_SPECS
+                                .iter()
+                                .map(|spec| {
+                                    json!({
+                                        "name": spec.name,
+                                        "classification": spec.classification,
+                                        "wal": spec.wal,
+                                    })
+                                })
+                                .collect()
+                        });
+                    let mut protocol = json!({
                         "protocolVersion": "native-method-policy@1",
                         "generation": self.state.generation,
                         "state": match self.transaction {
@@ -2764,7 +3134,21 @@ impl Server {
                             }
                         },
                         "methods": methods,
-                    }))
+                    });
+                    if let Some(handshake) = descriptor_handshake {
+                        protocol["accessMode"] = json!(ACCESS_MODE_DESCRIPTOR_READ_ONLY);
+                        protocol["readOnly"] = json!(true);
+                        protocol["canonicalSha256"] = json!(handshake.canonical_sha256);
+                        protocol["vectorBlobSha256"] = json!(handshake.vector_blob_sha256);
+                        protocol["vectorBlobSize"] = json!(handshake.vector_blob_size);
+                        protocol["legacyGeneration0"] = json!(handshake.legacy_generation0);
+                        protocol["methodInventorySha256"] =
+                            json!(handshake.method_inventory_sha256);
+                        if let Some(binding) = &handshake.legacy_binding_sha256 {
+                            protocol["legacyBindingSha256"] = json!(binding);
+                        }
+                    }
+                    Ok(protocol)
                 }
                 "batch_begin" => {
                     if !matches!(self.transaction, TransactionState::Idle) {
@@ -3640,17 +4024,185 @@ impl Server {
     }
 }
 
-fn main() -> io::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let mut db_path = PathBuf::from("aira-graphdb-native.json");
-    while let Some(arg) = args.next() {
-        if arg == "--db" {
-            if let Some(v) = args.next() {
-                db_path = PathBuf::from(v);
+enum CliMode {
+    Normal { db_path: PathBuf },
+    DescriptorRead(DescriptorReadConfig),
+}
+
+fn descriptor_cli_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--descriptor-read"
+            | "--canonical-fd"
+            | "--canonical-json-fd"
+            | "--vector-blob-fd"
+            | "--vector-fd"
+            | "--expected-generation"
+            | "--legacy-generation0"
+            | "--legacy-binding-hash"
+            | "--legacy-binding-sha256"
+    )
+}
+
+fn descriptor_like_cli_flag(arg: &str) -> bool {
+    descriptor_cli_flag(arg)
+        || [
+            "--descriptor",
+            "--canonical",
+            "--vector",
+            "--expected-generation",
+            "--legacy-generation",
+            "--legacy-binding",
+        ]
+        .iter()
+        .any(|prefix| arg.starts_with(prefix))
+}
+
+fn parse_descriptor_i32(value: Option<&String>, name: &str) -> io::Result<i32> {
+    let value = value.ok_or_else(|| io::Error::other(format!("{name} requires a value")))?;
+    value
+        .parse::<i32>()
+        .map_err(|_| io::Error::other(format!("{name} must be an integer FD")))
+}
+
+fn parse_descriptor_generation(value: Option<&String>) -> io::Result<u64> {
+    let value = value.ok_or_else(|| io::Error::other("--expected-generation requires a value"))?;
+    let generation = value
+        .parse::<u64>()
+        .map_err(|_| io::Error::other("--expected-generation must be an unsigned integer"))?;
+    if generation > MAX_SAFE_GENERATION {
+        return Err(io::Error::other(
+            "--expected-generation exceeds MAX_SAFE_INTEGER",
+        ));
+    }
+    Ok(generation)
+}
+
+fn parse_cli() -> io::Result<CliMode> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let descriptor_requested = args.iter().any(|arg| descriptor_like_cli_flag(arg));
+    if !descriptor_requested {
+        // Keep the historical normal-mode parser deliberately unchanged:
+        // unknown options are ignored and --db without a following value is
+        // harmless, as it was before descriptor mode existed.
+        let mut db_path = PathBuf::from("aira-graphdb-native.json");
+        let mut index = 0;
+        while index < args.len() {
+            if args[index] == "--db" {
+                if let Some(value) = args.get(index + 1) {
+                    db_path = PathBuf::from(value);
+                    index += 1;
+                }
             }
+            index += 1;
         }
+        return Ok(CliMode::Normal { db_path });
     }
 
+    let mut descriptor_mode = false;
+    let mut canonical_fd = None;
+    let mut vector_blob_fd = None;
+    let mut expected_generation = None;
+    let mut legacy_generation0 = false;
+    let mut legacy_binding_sha256 = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        match arg {
+            "--descriptor-read" => {
+                if descriptor_mode {
+                    return Err(io::Error::other("duplicate --descriptor-read"));
+                }
+                descriptor_mode = true;
+            }
+            "--db" => {
+                return Err(io::Error::other(
+                    "--db/path is mutually exclusive with descriptor read mode",
+                ));
+            }
+            "--canonical-fd" | "--canonical-json-fd" => {
+                if canonical_fd.is_some() {
+                    return Err(io::Error::other("duplicate canonical descriptor FD"));
+                }
+                canonical_fd = Some(parse_descriptor_i32(args.get(index + 1), arg)?);
+                index += 1;
+            }
+            "--vector-blob-fd" | "--vector-fd" => {
+                if vector_blob_fd.is_some() {
+                    return Err(io::Error::other("duplicate vector blob descriptor FD"));
+                }
+                vector_blob_fd = Some(parse_descriptor_i32(args.get(index + 1), arg)?);
+                index += 1;
+            }
+            "--expected-generation" => {
+                if expected_generation.is_some() {
+                    return Err(io::Error::other("duplicate --expected-generation"));
+                }
+                expected_generation = Some(parse_descriptor_generation(args.get(index + 1))?);
+                index += 1;
+            }
+            "--legacy-generation0" => {
+                if legacy_generation0 {
+                    return Err(io::Error::other("duplicate --legacy-generation0"));
+                }
+                legacy_generation0 = true;
+            }
+            "--legacy-binding-hash" | "--legacy-binding-sha256" => {
+                if legacy_binding_sha256.is_some() {
+                    return Err(io::Error::other("duplicate legacy binding hash"));
+                }
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| io::Error::other(format!("{arg} requires a value")))?;
+                Server::validate_sha256(value, "legacy binding hash")?;
+                legacy_binding_sha256 = Some(value.clone());
+                index += 1;
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "unknown descriptor read option {other}"
+                )));
+            }
+        }
+        index += 1;
+    }
+    if !descriptor_mode {
+        return Err(io::Error::other(
+            "descriptor read options require --descriptor-read",
+        ));
+    }
+    let expected_generation = expected_generation
+        .ok_or_else(|| io::Error::other("descriptor mode requires --expected-generation"))?;
+    let canonical_fd =
+        canonical_fd.ok_or_else(|| io::Error::other("descriptor mode requires --canonical-fd"))?;
+    let vector_blob_fd = vector_blob_fd
+        .ok_or_else(|| io::Error::other("descriptor mode requires --vector-blob-fd"))?;
+    if expected_generation == 0 {
+        if !legacy_generation0 {
+            return Err(io::Error::other(
+                "generation zero requires --legacy-generation0",
+            ));
+        }
+        if legacy_binding_sha256.is_none() {
+            return Err(io::Error::other(
+                "generation zero requires --legacy-binding-hash",
+            ));
+        }
+    } else if legacy_generation0 || legacy_binding_sha256.is_some() {
+        return Err(io::Error::other(
+            "legacy generation zero metadata is forbidden for positive generations",
+        ));
+    }
+    Ok(CliMode::DescriptorRead(DescriptorReadConfig {
+        canonical_fd,
+        vector_blob_fd,
+        expected_generation,
+        legacy_generation0,
+        legacy_binding_sha256,
+    }))
+}
+
+fn run_normal(db_path: PathBuf) -> io::Result<()> {
     let db_path = Server::resolve_db_path(db_path)?;
     let crash_tracker = CrashTracker::new(db_path.with_extension("native-audit.log"));
     let tracker_for_hook = crash_tracker.clone();
@@ -3683,7 +4235,10 @@ fn main() -> io::Result<()> {
             Ok(req) => req,
             Err(err) => {
                 let _ = Server::append_request_audit_event_for_path(
-                    &server.audit_log_path,
+                    server
+                        .audit_log_path
+                        .as_ref()
+                        .expect("normal mode has an audit path"),
                     "INVALID_REQUEST_JSON",
                     "CLIENT_INPUT",
                     "0",
@@ -3774,6 +4329,134 @@ fn main() -> io::Result<()> {
     // RecoveryPending WAL; the next exclusive owner quarantines it with an
     // exact token and requeues the whole document from the durable source.
     Ok(())
+}
+
+fn run_descriptor_read(config: DescriptorReadConfig) -> io::Result<()> {
+    let mut server = Server::open_descriptor_read(config)?;
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut stdout = io::stdout();
+    let mut input_bytes = 0u64;
+    let mut output_bytes = 0u64;
+    let mut frames = 0u64;
+    loop {
+        let line = read_bounded_descriptor_frame(&mut input)?;
+        let Some(line) = line else { break };
+        input_bytes = input_bytes
+            .checked_add(line.len() as u64)
+            .ok_or_else(|| io::Error::other("descriptor protocol input byte counter overflow"))?;
+        if input_bytes > MAX_DESCRIPTOR_PROTOCOL_BYTES {
+            return Err(io::Error::other(
+                "descriptor protocol cumulative input exceeds 64MiB",
+            ));
+        }
+        frames = frames
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("descriptor protocol frame counter overflow"))?;
+        if frames > MAX_DESCRIPTOR_PROTOCOL_FRAMES {
+            return Err(io::Error::other(
+                "descriptor protocol frame count exceeds 4096",
+            ));
+        }
+        let line = String::from_utf8(line)
+            .map_err(|_| io::Error::other("descriptor protocol frame is not UTF-8"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let req = match serde_json::from_str::<RpcRequest>(&line) {
+            Ok(req) => req,
+            Err(err) => {
+                let response = RpcResponse {
+                    id: 0,
+                    ok: false,
+                    result: None,
+                    error: Some(RpcError {
+                        code: "INVALID_REQUEST_JSON".to_string(),
+                        message: format!("invalid request: {err}"),
+                        failure_class: Some("CLIENT_INPUT".to_string()),
+                    }),
+                };
+                let payload = serde_json::to_string(&response)
+                    .map_err(|serialize_err| io::Error::other(serialize_err.to_string()))?;
+                output_bytes = account_descriptor_output(output_bytes, payload.len())?;
+                stdout.write_all(payload.as_bytes())?;
+                stdout.write_all(b"\n")?;
+                stdout.flush()?;
+                continue;
+            }
+        };
+        let response = server.handle_prepared(req);
+        let payload = serde_json::to_string(&response)
+            .map_err(|err| io::Error::other(format!("serialize response failed: {err}")))?;
+        output_bytes = account_descriptor_output(output_bytes, payload.len())?;
+        stdout.write_all(payload.as_bytes())?;
+        stdout.write_all(b"\n")?;
+        stdout.flush()?;
+        if server.fatal {
+            return Err(io::Error::other(
+                "descriptor read-only boundary entered fail-closed state",
+            ));
+        }
+    }
+    // Descriptor mode has no transaction, WAL, audit, cache, or persistence
+    // authority. EOF therefore only closes inherited read descriptors.
+    Ok(())
+}
+
+fn account_descriptor_output(current: u64, payload_len: usize) -> io::Result<u64> {
+    let frame_bytes = u64::try_from(payload_len)
+        .map_err(|_| io::Error::other("descriptor protocol output length does not fit u64"))?
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("descriptor protocol output frame counter overflow"))?;
+    if frame_bytes > MAX_DESCRIPTOR_PROTOCOL_FRAME_BYTES as u64 {
+        return Err(io::Error::other(
+            "descriptor protocol output frame exceeds 2MiB",
+        ));
+    }
+    let total = current
+        .checked_add(frame_bytes)
+        .ok_or_else(|| io::Error::other("descriptor protocol output byte counter overflow"))?;
+    if total > MAX_DESCRIPTOR_PROTOCOL_BYTES {
+        return Err(io::Error::other(
+            "descriptor protocol cumulative output exceeds 64MiB",
+        ));
+    }
+    Ok(total)
+}
+
+fn read_bounded_descriptor_frame<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
+    let mut frame = Vec::new();
+    loop {
+        let buffered = reader.fill_buf()?;
+        if buffered.is_empty() {
+            return if frame.is_empty() {
+                Ok(None)
+            } else {
+                Err(io::Error::other(
+                    "descriptor protocol ended with a partial frame",
+                ))
+            };
+        }
+        let newline = buffered.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(buffered.len(), |position| position + 1);
+        if frame.len().saturating_add(take) > MAX_DESCRIPTOR_PROTOCOL_FRAME_BYTES {
+            return Err(io::Error::other(
+                "descriptor protocol input frame exceeds 2MiB",
+            ));
+        }
+        frame.extend_from_slice(&buffered[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            return Ok(Some(frame));
+        }
+    }
+}
+
+fn main() -> io::Result<()> {
+    match parse_cli()? {
+        CliMode::Normal { db_path } => run_normal(db_path),
+        CliMode::DescriptorRead(config) => run_descriptor_read(config),
+    }
 }
 
 #[cfg(test)]
@@ -4486,5 +5169,325 @@ mod tests {
             Some("UNSUPPORTED_FEATURE")
         );
         cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    fn descriptor_fixture(
+        generation: u64,
+        descriptor: bool,
+    ) -> (PathBuf, PathBuf, DescriptorReadConfig, String) {
+        use std::os::fd::IntoRawFd;
+
+        let canonical_path = temp_path("agdb-native-descriptor-canonical");
+        let blob_path = temp_path("agdb-native-descriptor-blob");
+        let mut blob = Vec::new();
+        blob.extend_from_slice(Server::VECTOR_BLOB_MAGIC);
+        blob.extend_from_slice(&Server::VECTOR_BLOB_VERSION.to_le_bytes());
+        blob.extend_from_slice(&1.0f64.to_le_bytes());
+        blob.extend_from_slice(&0.0f64.to_le_bytes());
+        let blob_sha256 = Server::sha256_hex(&blob);
+        let canonical = if descriptor {
+            json!({
+                "nodes": {},
+                "edges": {},
+                "generation": generation,
+                "vectorBlob": {
+                    "basename": "copied.vblob",
+                    "size": blob.len(),
+                    "sha256": blob_sha256,
+                    "format": Server::VECTOR_BLOB_VERSION,
+                },
+                "vectors": {
+                    "c1:v1": {
+                        "id": "v1",
+                        "corpusId": "c1",
+                        "namespace": "default",
+                        "blobRef": {"offset": 0, "len": 2},
+                        "metadata": {"documentId": "d1"}
+                    }
+                },
+                "passages": {},
+                "snapshots": {},
+                "checkpoints": {}
+            })
+        } else {
+            json!({
+                "nodes": {},
+                "edges": {},
+                "generation": generation,
+                "vectors": {},
+                "passages": {},
+                "snapshots": {},
+                "checkpoints": {}
+            })
+        };
+        let canonical_raw = serde_json::to_vec(&canonical).expect("serialize descriptor fixture");
+        fs::write(&canonical_path, canonical_raw).expect("write canonical fixture");
+        fs::write(&blob_path, &blob).expect("write blob fixture");
+        let canonical_fd = fs::OpenOptions::new()
+            .read(true)
+            .open(&canonical_path)
+            .expect("open canonical fixture")
+            .into_raw_fd();
+        let vector_blob_fd = fs::OpenOptions::new()
+            .read(true)
+            .open(&blob_path)
+            .expect("open blob fixture")
+            .into_raw_fd();
+        let config = DescriptorReadConfig {
+            canonical_fd,
+            vector_blob_fd,
+            expected_generation: generation,
+            legacy_generation0: generation == 0 && !descriptor,
+            legacy_binding_sha256: (generation == 0 && !descriptor).then(|| "ab".repeat(32)),
+        };
+        (canonical_path, blob_path, config, blob_sha256)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_read_handshake_is_authoritative_and_mutations_are_rejected() {
+        let (canonical_path, blob_path, config, blob_sha256) = descriptor_fixture(1, true);
+        let mut server = Server::open_descriptor_read(config).expect("descriptor mode opens");
+        let sidecars = [
+            canonical_path.clone(),
+            blob_path.clone(),
+            canonical_path.with_extension("native-audit.log"),
+            canonical_path.with_extension("agdb.wal"),
+        ];
+        let before = sidecars
+            .iter()
+            .map(|path| path.exists())
+            .collect::<Vec<_>>();
+        let info = server.handle_prepared(RpcRequest {
+            id: 1,
+            method: "protocol_info".to_string(),
+            params: json!({}),
+        });
+        assert!(info.ok, "protocol_info failed: {info:?}");
+        let result = info.result.expect("protocol result");
+        assert_eq!(
+            result["accessMode"],
+            json!(ACCESS_MODE_DESCRIPTOR_READ_ONLY)
+        );
+        assert_eq!(result["generation"], json!(1));
+        assert_eq!(result["vectorBlobSha256"], json!(blob_sha256));
+        assert_eq!(result["readOnly"], json!(true));
+        let methods = result["methods"].as_array().expect("method inventory");
+        assert!(methods.iter().all(|method| {
+            matches!(
+                method["classification"].as_str(),
+                Some("health") | Some("read")
+            ) && method["wal"] == json!(false)
+        }));
+        assert_eq!(
+            result["methodInventorySha256"],
+            json!("126080ca61644282fd7ed09b10d5fd0571eba49c6dc19132d4cc6168d07eaf1f")
+        );
+        let legacy_read = server.handle_prepared(RpcRequest {
+            id: 2,
+            method: "get_nodes".to_string(),
+            params: json!({"corpusId": "c1"}),
+        });
+        assert_eq!(
+            legacy_read.error.as_ref().map(|error| error.code.as_str()),
+            Some(DESCRIPTOR_READ_ONLY_METHOD_CODE)
+        );
+        for method in [
+            "batch_begin",
+            "batch_commit",
+            "recovery_discard",
+            "upsert_nodes",
+            "memory_save",
+            "memory_save_file",
+        ] {
+            let response = server.handle_prepared(RpcRequest {
+                id: 3,
+                method: method.to_string(),
+                params: json!({}),
+            });
+            assert!(!response.ok, "{method} must be rejected");
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code.as_str()),
+                Some(DESCRIPTOR_READ_ONLY_METHOD_CODE),
+                "{method} must use stable descriptor rejection"
+            );
+        }
+        assert!(server.audit_log_path.is_none());
+        let after = sidecars
+            .iter()
+            .map(|path| path.exists())
+            .collect::<Vec<_>>();
+        assert_eq!(before, after, "descriptor reads must not create sidecars");
+        cleanup(&canonical_path);
+        let _ = fs::remove_file(blob_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_generation_zero_requires_explicit_legacy_binding_and_no_descriptor() {
+        let (canonical_path, blob_path, config, blob_sha256) = descriptor_fixture(0, false);
+        let mut server = Server::open_descriptor_read(config).expect("legacy descriptor opens");
+        let info = server.handle_prepared(RpcRequest {
+            id: 1,
+            method: "protocol_info".to_string(),
+            params: json!({}),
+        });
+        let result = info.result.expect("legacy protocol result");
+        assert_eq!(result["generation"], json!(0));
+        assert_eq!(result["legacyGeneration0"], json!(true));
+        assert_eq!(result["vectorBlobSha256"], json!(blob_sha256));
+        assert_eq!(result["legacyBindingSha256"], json!("ab".repeat(32)));
+        cleanup(&canonical_path);
+        let _ = fs::remove_file(blob_path);
+
+        let (canonical_path, blob_path, mut bad, _) = descriptor_fixture(0, false);
+        bad.legacy_generation0 = false;
+        assert!(Server::open_descriptor_read(bad).is_err());
+        cleanup(&canonical_path);
+        let _ = fs::remove_file(blob_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_mode_rejects_generation_and_descriptor_mismatches() {
+        let (canonical_path, blob_path, mut wrong_generation, _) = descriptor_fixture(1, true);
+        wrong_generation.expected_generation = 2;
+        assert!(Server::open_descriptor_read(wrong_generation).is_err());
+        cleanup(&canonical_path);
+        let _ = fs::remove_file(&blob_path);
+
+        let (canonical_path, blob_path, mut missing_descriptor, _) = descriptor_fixture(1, true);
+        missing_descriptor.expected_generation = 0;
+        missing_descriptor.legacy_generation0 = true;
+        missing_descriptor.legacy_binding_sha256 = Some("cd".repeat(32));
+        assert!(Server::open_descriptor_read(missing_descriptor).is_err());
+        cleanup(&canonical_path);
+        let _ = fs::remove_file(blob_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_mode_rejects_blob_authority_and_fd_alias_mismatches() {
+        use std::os::fd::IntoRawFd;
+
+        let (canonical_path, blob_path, config, _) = descriptor_fixture(1, true);
+        let mut blob = fs::read(&blob_path).expect("read blob fixture");
+        *blob.last_mut().expect("blob payload") ^= 0x01;
+        fs::write(&blob_path, blob).expect("rewrite blob fixture");
+        assert!(
+            Server::open_descriptor_read(config).is_err(),
+            "hash mismatch"
+        );
+        cleanup(&canonical_path);
+        let _ = fs::remove_file(&blob_path);
+
+        let (canonical_path, blob_path, config, _) = descriptor_fixture(1, true);
+        let mut blob = fs::read(&blob_path).expect("read blob fixture");
+        blob.extend_from_slice(&0.0f64.to_le_bytes());
+        fs::write(&blob_path, blob).expect("extend blob fixture");
+        assert!(
+            Server::open_descriptor_read(config).is_err(),
+            "size mismatch"
+        );
+        cleanup(&canonical_path);
+        let _ = fs::remove_file(&blob_path);
+
+        let (canonical_path, blob_path, config, _) = descriptor_fixture(1, true);
+        let mut canonical: Value =
+            serde_json::from_slice(&fs::read(&canonical_path).expect("read canonical fixture"))
+                .expect("parse canonical fixture");
+        canonical["vectorBlob"]["format"] = json!(2);
+        fs::write(
+            &canonical_path,
+            serde_json::to_vec(&canonical).expect("serialize canonical fixture"),
+        )
+        .expect("rewrite canonical fixture");
+        assert!(
+            Server::open_descriptor_read(config).is_err(),
+            "format mismatch"
+        );
+        cleanup(&canonical_path);
+        let _ = fs::remove_file(&blob_path);
+
+        let (canonical_path, blob_path, mut config, _) = descriptor_fixture(1, true);
+        unsafe {
+            libc::close(config.vector_blob_fd);
+        }
+        config.vector_blob_fd = config.canonical_fd;
+        assert!(Server::open_descriptor_read(config).is_err(), "same raw FD");
+        cleanup(&canonical_path);
+        let _ = fs::remove_file(&blob_path);
+
+        let (canonical_path, blob_path, mut config, _) = descriptor_fixture(1, true);
+        unsafe {
+            libc::close(config.vector_blob_fd);
+        }
+        config.vector_blob_fd = fs::OpenOptions::new()
+            .read(true)
+            .open(&canonical_path)
+            .expect("open canonical alias")
+            .into_raw_fd();
+        assert!(
+            Server::open_descriptor_read(config).is_err(),
+            "distinct FDs for same inode"
+        );
+        cleanup(&canonical_path);
+        let _ = fs::remove_file(blob_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_mode_rejects_writable_and_nonregular_fds() {
+        use std::os::fd::{IntoRawFd, RawFd};
+
+        let (canonical_path, blob_path, mut config, _) = descriptor_fixture(1, true);
+        let writable = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&canonical_path)
+            .expect("open writable canonical")
+            .into_raw_fd();
+        unsafe {
+            libc::close(config.canonical_fd);
+        }
+        config.canonical_fd = writable;
+        assert!(Server::open_descriptor_read(config).is_err());
+        cleanup(&canonical_path);
+        let _ = fs::remove_file(&blob_path);
+
+        let (canonical_path, blob_path, mut nonregular, _) = descriptor_fixture(1, true);
+        let mut pipe_fds = [0 as RawFd; 2];
+        let result = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+        assert_eq!(result, 0, "pipe setup");
+        unsafe {
+            libc::close(nonregular.canonical_fd);
+        }
+        nonregular.canonical_fd = pipe_fds[0];
+        assert!(Server::open_descriptor_read(nonregular).is_err());
+        unsafe {
+            libc::close(pipe_fds[1]);
+        }
+        cleanup(&canonical_path);
+        let _ = fs::remove_file(blob_path);
+    }
+
+    #[test]
+    fn descriptor_output_accounting_accepts_exact_limits_and_rejects_plus_one() {
+        assert_eq!(
+            account_descriptor_output(0, MAX_DESCRIPTOR_PROTOCOL_FRAME_BYTES - 1)
+                .expect("exact frame limit"),
+            MAX_DESCRIPTOR_PROTOCOL_FRAME_BYTES as u64
+        );
+        assert!(account_descriptor_output(0, MAX_DESCRIPTOR_PROTOCOL_FRAME_BYTES).is_err());
+
+        let before_last_frame =
+            MAX_DESCRIPTOR_PROTOCOL_BYTES - MAX_DESCRIPTOR_PROTOCOL_FRAME_BYTES as u64;
+        assert_eq!(
+            account_descriptor_output(before_last_frame, MAX_DESCRIPTOR_PROTOCOL_FRAME_BYTES - 1)
+                .expect("exact cumulative limit"),
+            MAX_DESCRIPTOR_PROTOCOL_BYTES
+        );
+        assert!(account_descriptor_output(MAX_DESCRIPTOR_PROTOCOL_BYTES, 0).is_err());
     }
 }
