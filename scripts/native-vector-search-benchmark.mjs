@@ -1,28 +1,29 @@
 #!/usr/bin/env node
 
 import { createHash } from 'node:crypto';
-import { lstat, open, readFile, readdir, realpath, rename, unlink } from 'node:fs/promises';
+import { chmod, lstat, mkdtemp, open, readFile, readdir, realpath, rm } from 'node:fs/promises';
 import { constants, existsSync, readFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { basename, dirname, join, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { homedir, tmpdir } from 'node:os';
 
 const DEFAULT_DIMENSIONS = 1024;
-const DEFAULT_REPETITIONS = 3;
+const DEFAULT_REPETITIONS = 4;
 const REQUEST_TIMEOUT_MS = 300_000;
 const DEFAULT_SAMPLE_INTERVAL_MS = 250;
 
 function usage(message) {
-  if (message) console.error(`error: ${message}`);
-  console.error([
+  const details = [
     'usage: native-vector-search-benchmark.mjs',
-    '  --db COPIED_SNAPSHOT_JSON --old OLD_BINARY --new NEW_BINARY',
-    '  --out ARTIFACT_JSON [--old-sha SHA] [--new-sha SHA]',
-    '  [--repetitions N] [--old-repetitions N] [--new-repetitions N]',
-    '  [--timeout-ms N] [--startup-timeout-ms N] [--sample-interval-ms N] [--preload]',
+    '  --db SOURCE_JSON --blob SOURCE_VBLOB --old OLD_BINARY --new NEW_BINARY',
+    '  --old-sha SHA --new-sha SHA',
+    '  artifact is emitted on stdout; capture via a runner/API, never shell-redirect into live data paths',
+    '  [--repetitions N] [--timeout-ms N] [--startup-timeout-ms N] [--sample-interval-ms N]',
     '  [--corpus ID] [--namespace NAME] [--top-k N]',
-  ].join('\n'));
-  process.exit(2);
+  ].join('\n');
+  const error = new Error(message ? `${message}\n${details}` : details);
+  error.code = 'USAGE';
+  throw error;
 }
 
 function parseArgs(argv) {
@@ -32,16 +33,12 @@ function parseArgs(argv) {
     if (!arg.startsWith('--')) usage(`unknown argument ${arg}`);
     const key = arg.slice(2).replaceAll('-', '_');
     if (key === 'help') usage();
-    if (key === 'preload') {
-      values[key] = 'true';
-      continue;
-    }
     const value = argv[index + 1];
     if (!value || value.startsWith('--')) usage(`missing value for --${key.replaceAll('_', '-')}`);
     values[key] = value;
     index += 1;
   }
-  for (const required of ['db', 'old', 'new', 'out']) {
+  for (const required of ['db', 'blob', 'old', 'new', 'old_sha', 'new_sha']) {
     if (!values[required]) usage(`missing --${required}`);
   }
   return values;
@@ -74,41 +71,42 @@ async function fileDigest(path, canonicalIdentities) {
   }
 }
 
-async function rejectUnsafePath(path, protectedIdentities, label) {
+async function openPrivateSource(path, label, { singleLink = true } = {}) {
   const absolute = resolve(path);
-  let metadata;
-  try {
-    metadata = await lstat(absolute);
-  } catch (error) {
-    if (error.code === 'ENOENT') return;
-    throw error;
-  }
-  if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.nlink !== 1) {
+  const metadata = await lstat(absolute);
+  if (metadata.isSymbolicLink() || !metadata.isFile() || (singleLink && metadata.nlink !== 1)) {
     throw new Error(`${label} must be a private regular inode: ${absolute}`);
   }
-  if (protectedIdentities.has(`${metadata.dev}:${metadata.ino}`)) {
-    throw new Error(`${label} aliases a protected snapshot/binary inode: ${absolute}`);
+  const resolvedPath = await realpath(absolute);
+  const handle = await open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const held = await handle.stat();
+  if (held.dev !== metadata.dev || held.ino !== metadata.ino || (singleLink && held.nlink !== 1) || !held.isFile()) {
+    await handle.close();
+    throw new Error(`${label} inode changed during validation: ${absolute}`);
   }
+  return { path: absolute, realpath: resolvedPath, handle, device: held.dev, inode: held.ino, bytes: held.size, mtimeNs: held.mtimeNs };
 }
 
-async function writeArtifactAtomically(path, content, protectedIdentities) {
-  const output = resolve(path);
-  await rejectUnsafePath(output, protectedIdentities, 'benchmark output');
-  const parent = resolve(dirname(output));
-  const temp = join(parent, `.${basename(output)}.${process.pid}.${randomUUID()}.tmp`);
-  const handle = await open(temp, 'wx', 0o600);
+async function copyPrivate(source, target, mode) {
+  const output = await open(target, 'wx', mode);
+  const digest = createHash('sha256');
   try {
-    await handle.writeFile(content, 'utf8');
-    await handle.sync();
+    for await (const chunk of source.handle.createReadStream({ autoClose: false })) {
+      digest.update(chunk);
+      await output.write(chunk);
+    }
+    const after = await source.handle.stat();
+    if (after.dev !== source.device || after.ino !== source.inode || after.size !== source.bytes || after.mtimeNs !== source.mtimeNs) {
+      throw new Error(`source changed while copying: ${source.path}`);
+    }
+    await output.sync();
   } finally {
-    await handle.close();
+    await output.close();
+    await source.handle.close();
   }
-  try {
-    await rename(temp, output);
-  } catch (error) {
-    try { await unlink(temp); } catch {}
-    throw error;
-  }
+  await chmod(target, mode);
+  const copied = await lstat(target);
+  return { path: target, realpath: await realpath(target), bytes: copied.size, sha256: digest.digest('hex'), device: copied.dev, inode: copied.ino };
 }
 
 function percentile(values, probability) {
@@ -248,7 +246,7 @@ async function runBinary(binary, request, repetitions, timeoutMs, preload, start
       detached: true,
       stdio: ['pipe', 'pipe', 'ignore'],
     });
-    const initialMemory = readMemory(child.pid);
+    const initialMemory = sampleIntervalMs > 0 ? readMemory(child.pid) : null;
     if (initialMemory) { samples.push(initialMemory); sampleCount += 1; }
     const poll = sampleIntervalMs > 0 ? setInterval(() => {
       const memory = readMemory(child.pid);
@@ -334,6 +332,11 @@ function combineRuns(runs) {
   return combined;
 }
 
+function publicResult(result) {
+  const { binary, ...publicFields } = result;
+  return publicFields;
+}
+
 async function runCounterbalanced(binaries, request, repetitions, timeoutMs, preload, startupTimeoutMs, sampleIntervalMs) {
   const runs = { old: [], new: [] };
   const executionOrder = [];
@@ -352,55 +355,49 @@ function gitSha(path) {
   return result.status === 0 ? result.stdout.trim() : null;
 }
 
-const args = parseArgs(process.argv.slice(2));
-const db = resolve(args.db);
-const canonical = process.env.LITERATURE_HUB_CANONICAL_DB && resolve(process.env.LITERATURE_HUB_CANONICAL_DB);
-if (canonical && db === canonical) usage('refusing to benchmark the configured canonical DB; pass a copied snapshot');
-if (db.includes('/literature-hub/semantic/data/')) usage('refusing a Literature Hub live-data path; pass a copied snapshot');
-if (!existsSync(db)) usage(`snapshot does not exist: ${db}`);
-
-const canonicalIdentities = new Set();
-if (canonical) {
-  for (const entry of await readdir(dirname(canonical))) {
-    try {
-      const metadata = await lstat(resolve(dirname(canonical), entry));
-      if (metadata.isFile()) canonicalIdentities.add(`${metadata.dev}:${metadata.ino}`);
-    } catch {
-      // The canonical directory may contain files which disappear during rotation.
-    }
-  }
-}
-const state = JSON.parse(await readFile(db, 'utf8'));
-const adjacentBlob = db.endsWith('.json') ? `${db.slice(0, -'.json'.length)}.vblob` : `${db}.vblob`;
-const descriptorBlob = state.vectorBlob?.basename ? resolve(dirname(db), state.vectorBlob.basename) : null;
-if (descriptorBlob && dirname(descriptorBlob) !== dirname(db)) usage('vector blob descriptor must remain in the snapshot directory');
-if (descriptorBlob && descriptorBlob !== adjacentBlob && existsSync(adjacentBlob)) {
-  usage(`ambiguous vector blob: descriptor=${descriptorBlob} adjacent legacy=${adjacentBlob}`);
-}
-const walPath = `${db.endsWith('.json') ? db.slice(0, -'.json'.length) : db}.agdb.wal`;
-if (existsSync(walPath)) usage(`refusing snapshot with WAL/recovery pending: ${walPath}`);
-const recoveryEntries = (await readdir(dirname(db))).filter((entry) => entry.includes('.recovery-') || entry.endsWith('.quarantine'));
-if (recoveryEntries.length > 0) usage(`refusing snapshot with recovery quarantine artifacts: ${recoveryEntries.join(', ')}`);
-const snapshotPaths = [db];
-if (descriptorBlob) snapshotPaths.push(descriptorBlob);
-else if (existsSync(adjacentBlob)) snapshotPaths.push(adjacentBlob);
-const snapshotFiles = [];
-for (const path of snapshotPaths) snapshotFiles.push(await fileDigest(path, canonicalIdentities));
-const snapshotHash = sha256Bytes(snapshotFiles.map((file) => `${basename(file.path)}:${file.sha256}\n`).join(''));
-const protectedIdentities = new Set([...canonicalIdentities, ...snapshotFiles.map((file) => `${file.device}:${file.inode}`)]);
-for (const binary of [args.old, args.new]) {
-  const binaryFile = await fileDigest(binary, new Set());
-  protectedIdentities.add(`${binaryFile.device}:${binaryFile.inode}`);
-}
+async function main() {
+  let workspace;
+  try {
+    const args = parseArgs(process.argv.slice(2));
+    const sourceDb = resolve(args.db);
+    const sourceBlob = resolve(args.blob);
+    const canonical = process.env.LITERATURE_HUB_CANONICAL_DB && resolve(process.env.LITERATURE_HUB_CANONICAL_DB);
+    if (canonical && (sourceDb === canonical || sourceBlob === canonical)) usage('refusing configured canonical DB/blob');
+    if (sourceDb.includes('/literature-hub/semantic/data/') || sourceBlob.includes('/literature-hub/semantic/data/')) usage('refusing Literature Hub live-data path; pass a copied snapshot');
+    if (!existsSync(sourceDb) || !existsSync(sourceBlob)) usage('source DB and --blob must exist');
+    const dbSource = await openPrivateSource(sourceDb, 'source DB');
+    const blobSource = await openPrivateSource(sourceBlob, 'source blob');
+    const walPath = `${sourceDb.endsWith('.json') ? sourceDb.slice(0, -'.json'.length) : sourceDb}.agdb.wal`;
+    if (existsSync(walPath)) usage('refusing source with WAL/recovery pending');
+    const recoveryEntries = (await readdir(dirname(sourceDb))).filter((entry) => entry.includes('.recovery-') || entry.endsWith('.quarantine'));
+    if (recoveryEntries.length > 0) usage(`refusing source recovery artifacts: ${recoveryEntries.join(', ')}`);
+    const oldSource = await openPrivateSource(args.old, 'old binary', { singleLink: false });
+    const newSource = await openPrivateSource(args.new, 'new binary', { singleLink: false });
+    if (gitSha(args.old) !== args.old_sha) usage(`old binary SHA mismatch: supplied ${args.old_sha}`);
+    if (gitSha(args.new) !== args.new_sha) usage(`new binary SHA mismatch: supplied ${args.new_sha}`);
+    workspace = await mkdtemp(join(tmpdir(), 'aira-vector-benchmark-'));
+    await chmod(workspace, 0o700);
+    const db = join(workspace, basename(sourceDb));
+    const blob = join(workspace, basename(sourceBlob));
+    const old = join(workspace, `old-${basename(args.old)}`);
+    const newer = join(workspace, `new-${basename(args.new)}`);
+    const snapshotFiles = [await copyPrivate(dbSource, db, 0o600), await copyPrivate(blobSource, blob, 0o600)];
+    const binaryFiles = { old: await copyPrivate(oldSource, old, 0o700), new: await copyPrivate(newSource, newer, 0o700) };
+    const state = JSON.parse(await readFile(db, 'utf8'));
+    const adjacentBlob = db.endsWith('.json') ? `${db.slice(0, -'.json'.length)}.vblob` : `${db}.vblob`;
+    const descriptorBlob = state.vectorBlob?.basename ? resolve(dirname(db), state.vectorBlob.basename) : null;
+    if (descriptorBlob && dirname(descriptorBlob) !== dirname(db)) usage('vector blob descriptor must remain in private directory');
+    if (descriptorBlob && descriptorBlob !== blob) usage(`--blob does not match generation descriptor: ${basename(descriptorBlob)}`);
+    if (!descriptorBlob && blob !== adjacentBlob) usage(`legacy --blob must be adjacent to private DB: ${basename(adjacentBlob)}`);
+    const snapshotHash = sha256Bytes(snapshotFiles.map((file) => `${basename(file.path)}:${file.sha256}\n`).join(''));
 
 const dimensions = Number(args.dimensions ?? DEFAULT_DIMENSIONS);
 const repetitions = Number(args.repetitions ?? DEFAULT_REPETITIONS);
-const oldRepetitions = Number(args.old_repetitions ?? repetitions);
-const newRepetitions = Number(args.new_repetitions ?? repetitions);
+if (!Number.isInteger(repetitions) || repetitions < 2 || repetitions % 2 !== 0) usage('--repetitions must be an even integer >= 2');
 const timeoutMs = Number(args.timeout_ms ?? REQUEST_TIMEOUT_MS);
 const startupTimeoutMs = Number(args.startup_timeout_ms ?? timeoutMs);
 const sampleIntervalMs = Number(args.sample_interval_ms ?? DEFAULT_SAMPLE_INTERVAL_MS);
-const preload = args.preload === 'true';
+if (!Number.isInteger(sampleIntervalMs) || sampleIntervalMs < 0) usage('--sample-interval-ms must be >= 0');
 const queryVector = Array.from({ length: dimensions }, (_, index) => (index === 0 ? 1 : 0.001));
 const rpc = {
   method: 'vector_search',
@@ -412,15 +409,15 @@ const rpc = {
   },
 };
 const request = { db, rpc };
-if (oldRepetitions !== newRepetitions) usage('counterbalanced benchmark requires equal --old-repetitions and --new-repetitions');
-const balanced = await runCounterbalanced({ old: args.old, new: args.new }, request, oldRepetitions, timeoutMs, preload, startupTimeoutMs, sampleIntervalMs);
-const oldResult = balanced.old;
-const newResult = balanced.new;
+const sampled = await runCounterbalanced({ old, new: newer }, request, repetitions, timeoutMs, true, startupTimeoutMs, sampleIntervalMs);
+const unsampled = await runCounterbalanced({ old, new: newer }, request, repetitions, timeoutMs, true, startupTimeoutMs, 0);
+const oldResult = sampled.old;
+const newResult = sampled.new;
 let snapshotStable = true;
 let snapshotRevalidationError = null;
 try {
   const finalSnapshotFiles = [];
-  for (const file of snapshotFiles) finalSnapshotFiles.push(await fileDigest(file.path, canonicalIdentities));
+  for (const file of snapshotFiles) finalSnapshotFiles.push(await fileDigest(file.path, new Set()));
   snapshotStable = JSON.stringify(finalSnapshotFiles.map((file) => [file.realpath, file.bytes, file.sha256, file.device, file.inode]))
     === JSON.stringify(snapshotFiles.map((file) => [file.realpath, file.bytes, file.sha256, file.device, file.inode]));
   if (!snapshotStable) snapshotRevalidationError = { code: 'SNAPSHOT_CHANGED', message: 'snapshot identity or digest changed during benchmark' };
@@ -433,48 +430,80 @@ const parity = oldResult.parity.map((oldRun, index) => ({
   coldEqual: JSON.stringify(oldRun.cold) === JSON.stringify(newResult.parity[index]?.cold),
   warmEqual: JSON.stringify(oldRun.warm) === JSON.stringify(newResult.parity[index]?.warm),
 }));
+const unsampledParity = unsampled.old.parity.map((oldRun, index) => ({
+  repetition: index + 1,
+  coldEqual: JSON.stringify(oldRun.cold) === JSON.stringify(unsampled.new.parity[index]?.cold),
+  warmEqual: JSON.stringify(oldRun.warm) === JSON.stringify(unsampled.new.parity[index]?.warm),
+}));
 
 const artifact = {
-  schema: 'aira.native-vector-search-benchmark.v1',
+  schema: 'aira.native-vector-search-benchmark.v2',
   generatedAt: new Date().toISOString(),
   copiedSnapshotOnly: true,
-  snapshot: { db, snapshotHash, files: snapshotFiles },
+  snapshot: {
+    source: {
+      db: { path: dbSource.path, realpath: dbSource.realpath, device: dbSource.device, inode: dbSource.inode, bytes: dbSource.bytes, sha256: snapshotFiles[0].sha256 },
+      blob: { path: blobSource.path, realpath: blobSource.realpath, device: blobSource.device, inode: blobSource.inode, bytes: blobSource.bytes, sha256: snapshotFiles[1].sha256 },
+    },
+    copied: { basenames: snapshotFiles.map((file) => basename(file.path)), snapshotHash, files: snapshotFiles.map((file) => ({ bytes: file.bytes, sha256: file.sha256 })) },
+  },
   snapshotStable,
   rpc,
-  repetitions: { old: oldRepetitions, new: newRepetitions },
-  executionOrder: balanced.executionOrder,
+  repetitions: { old: repetitions, new: repetitions },
+  executionOrder: sampled.executionOrder,
+  unsampledExecutionOrder: unsampled.executionOrder,
   orderDefinition: 'counterbalanced by repetition: old,new then new,old; both binaries use the same copied snapshot and sampler settings',
   timeoutMs,
   startupTimeoutMs,
   sampleIntervalMs,
-  preload,
+  preload: true,
   timingDefinition: {
-    preload: 'optional fresh native process ping; includes process startup and full snapshot load, elapsed from ping write until response line',
-    cold: 'elapsed from vector_search request write until response line; with --preload this is the first retrieval after a completed preload',
+    preload: 'fresh native process ping; includes process startup and full snapshot load, elapsed from ping write until response line',
+    cold: 'process-preloaded first retrieval: elapsed from vector_search request write until response line after a completed ping; this is not a page-cache-cold claim',
     warm: 'same native process immediately after cold response; elapsed from vector_search request write until response line',
     p50: 'nearest-rank percentile over repetition wall-clock samples',
     p95: 'nearest-rank percentile over repetition wall-clock samples',
   },
-  memoryDefinition: `${sampleIntervalMs}ms polling of /proc/$pid/status VmRSS/VmSwap and /proc/$pid/smaps_rollup Pss; peaks can under-sample short-lived maxima`,
+  memoryDefinition: `${sampleIntervalMs}ms polling of /proc/$pid/status VmRSS/VmSwap and /proc/$pid/smaps_rollup Pss; sample-interval 0 performs zero /proc reads; peaks can under-sample short-lived maxima`,
   sampling: {
     intervalMs: sampleIntervalMs,
     sampleCount: {
       old: oldResult.sampleCount,
       new: newResult.sampleCount,
+      unsampledOld: unsampled.old.sampleCount,
+      unsampledNew: unsampled.new.sampleCount,
     },
     noSamplingControl: sampleIntervalMs === 0,
     overhead: 'sampling reads are included in the benchmark process and are deliberately disabled with --sample-interval-ms 0 for a counterfactual control; timings must be compared using the same setting',
   },
-  binaries: { old: { ...oldResult, gitSha: args.old_sha ?? gitSha(args.old) }, new: { ...newResult, gitSha: args.new_sha ?? gitSha(args.new) } },
+  binaries: {
+    source: {
+      old: { path: args.old, realpath: oldSource.realpath, device: oldSource.device, inode: oldSource.inode, bytes: oldSource.bytes, gitSha: args.old_sha, sha256: binaryFiles.old.sha256 },
+      new: { path: args.new, realpath: newSource.realpath, device: newSource.device, inode: newSource.inode, bytes: newSource.bytes, gitSha: args.new_sha, sha256: binaryFiles.new.sha256 },
+    },
+    old: { ...publicResult(oldResult), gitSha: args.old_sha },
+    new: { ...publicResult(newResult), gitSha: args.new_sha },
+  },
+  unsampled: { old: unsampled.old, new: unsampled.new },
   parity,
-  failures: [snapshotRevalidationError, ...[oldResult, newResult].flatMap((result, binaryIndex) => result.parity.flatMap((run, repetition) => {
+  unsampledParity,
+  failures: [snapshotRevalidationError, ...[oldResult, newResult, unsampled.old, unsampled.new].flatMap((result, binaryIndex) => result.parity.flatMap((run, repetition) => {
     const failures = [];
     for (const phase of ['preload', 'cold', 'warm']) {
-      if (run[phase] && run[phase].ok === false) failures.push({ binary: binaryIndex === 0 ? 'old' : 'new', repetition: repetition + 1, phase, error: run[phase].error });
+      if (run[phase] && run[phase].ok === false) failures.push({ binary: binaryIndex % 2 === 0 ? 'old' : 'new', repetition: repetition + 1, phase, error: run[phase].error });
     }
     return failures;
   }))].filter(Boolean),
 };
-await writeArtifactAtomically(resolve(args.out), `${JSON.stringify(artifact, null, 2)}\n`, protectedIdentities);
-console.log(JSON.stringify({ out: resolve(args.out), snapshotHash, parity, old: artifact.binaries.old.p95Ms, new: artifact.binaries.new.p95Ms }));
-if (artifact.failures.length > 0 || parity.some((entry) => !entry.coldEqual || !entry.warmEqual)) process.exitCode = 1;
+console.log(JSON.stringify(artifact));
+if (artifact.failures.length > 0 || parity.some((entry) => !entry.coldEqual || !entry.warmEqual) || unsampledParity.some((entry) => !entry.coldEqual || !entry.warmEqual)) process.exitCode = 1;
+  } finally {
+    if (workspace) await rm(workspace, { recursive: true, force: true });
+  }
+}
+
+main().catch((error) => {
+  console.error(error.stack ?? error.message ?? String(error));
+  console.log(JSON.stringify({ schema: 'aira.native-vector-search-benchmark.v2', failures: [{ code: error.code ?? 'BENCHMARK_FAILED', message: error.message ?? String(error) }] }));
+  process.exitCode = 1;
+});
