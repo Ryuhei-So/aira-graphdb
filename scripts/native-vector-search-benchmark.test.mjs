@@ -54,8 +54,8 @@ async function run(args) {
 }
 
 async function runManifest(args) {
-  try { await exec(process.execPath, [manifestScript, ...args], { encoding: 'utf8' }); return 0; }
-  catch (error) { return error.code; }
+  try { await exec(process.execPath, [manifestScript, ...args], { encoding: 'utf8' }); return { code: 0 }; }
+  catch (error) { return { code: error.code, stderr: error.stderr ?? '' }; }
 }
 
 function argsFor(fixtureData, extra = []) {
@@ -68,18 +68,29 @@ test('requires explicit blob, pinned SHAs, even repetitions, and has no output-p
   assert.notEqual((await run(argsFor(f, ['--repetitions', '3'])).code), 0);
 });
 
-test('build manifest generator proves clean exact checkout and rejects drift', async () => {
-  const f = await fixture();
-  await unlink(`${f.old}.manifest.json`);
-  assert.equal(await runManifest(['--repo', f.old.slice(0, f.old.lastIndexOf('/')), '--binary', f.old, '--source-sha', f.oldSha]), 0);
-  const dirty = await fixture();
-  await unlink(`${dirty.newer}.manifest.json`);
-  await writeFile(join(dirty.newer.slice(0, dirty.newer.lastIndexOf('/')), 'dirty.txt'), 'dirty');
-  assert.notEqual(await runManifest(['--repo', dirty.newer.slice(0, dirty.newer.lastIndexOf('/')), '--binary', dirty.newer, '--source-sha', dirty.newSha]), 0);
-  const modified = await fixture();
-  await unlink(`${modified.newer}.manifest.json`);
-  await writeFile(modified.newer, '#!/bin/sh\nmodified\n');
-  assert.notEqual(await runManifest(['--repo', modified.newer.slice(0, modified.newer.lastIndexOf('/')), '--binary', modified.newer, '--source-sha', modified.newSha]), 0);
+test('build manifest generator owns fixed clean build and rejects dirty/wrong/collision inputs', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'aira-build-repo-'));
+  await mkdir(join(repo, 'src'));
+  await writeFile(join(repo, 'Cargo.toml'), '[package]\nname="aira-graphdb"\nversion="0.1.0"\nedition="2021"\n[[bin]]\nname="aira-graphdb-native"\npath="src/main.rs"\n');
+  await writeFile(join(repo, 'src/main.rs'), 'fn main() {}\n');
+  await exec('cargo', ['generate-lockfile'], { cwd: repo });
+  await exec('git', ['init', '-q', repo]);
+  await exec('git', ['-C', repo, 'config', 'user.email', 'test@example.invalid']);
+  await exec('git', ['-C', repo, 'config', 'user.name', 'test']);
+  await exec('git', ['-C', repo, 'add', '.']);
+  await exec('git', ['-C', repo, 'commit', '-qm', 'fixture']);
+  const sha = (await exec('git', ['-C', repo, 'rev-parse', 'HEAD'])).stdout.trim();
+  const destination = join(repo, 'private-output'); await mkdir(destination); await chmod(destination, 0o700);
+  const generated = await runManifest(['--repo', repo, '--source-sha', sha, '--destination-dir', destination]);
+  assert.equal(generated.code, 0);
+  assert.notEqual((await runManifest(['--repo', repo, '--source-sha', sha, '--destination-dir', destination])).code, 0);
+  const dirty = await mkdtemp(join(tmpdir(), 'aira-build-dirty-')); await mkdir(join(dirty, 'src'));
+  await writeFile(join(dirty, 'Cargo.toml'), '[package]\nname="aira-graphdb"\nversion="0.1.0"\nedition="2021"\n[[bin]]\nname="aira-graphdb-native"\npath="src/main.rs"\n'); await writeFile(join(dirty, 'src/main.rs'), 'fn main() {}\n');
+  await exec('cargo', ['generate-lockfile'], { cwd: dirty });
+  await exec('git', ['init', '-q', dirty]); await exec('git', ['-C', dirty, 'config', 'user.email', 'test@example.invalid']); await exec('git', ['-C', dirty, 'config', 'user.name', 'test']); await exec('git', ['-C', dirty, 'add', '.']); await exec('git', ['-C', dirty, 'commit', '-qm', 'fixture']);
+  const dirtySha = (await exec('git', ['-C', dirty, 'rev-parse', 'HEAD'])).stdout.trim(); await writeFile(join(dirty, 'dirty.txt'), 'dirty'); const dirtyOut = join(dirty, 'out'); await mkdir(dirtyOut); await chmod(dirtyOut, 0o700);
+  assert.notEqual((await runManifest(['--repo', dirty, '--source-sha', dirtySha, '--destination-dir', dirtyOut])).code, 0);
+  assert.notEqual((await runManifest(['--repo', repo, '--source-sha', '0'.repeat(40), '--destination-dir', join(repo, 'other-out')])).code, 0);
 });
 
 test('SIGTERM kills child and removes owned temporary workspace', async () => {
