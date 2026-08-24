@@ -16,7 +16,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(target_os = "linux")]
 use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
-use serde::{Deserialize, Serialize};
+use serde::ser::{SerializeMap, SerializeStruct};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -100,6 +101,137 @@ struct State {
         skip_serializing_if = "Option::is_none"
     )]
     vector_blob: Option<VectorBlobDescriptor>,
+}
+
+struct SortedMapView<'a, T>(&'a HashMap<String, T>);
+
+impl<T: Serialize> Serialize for SortedMapView<'_, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut keys: Vec<&String> = self.0.keys().collect();
+        keys.sort_unstable();
+        let mut map = serializer.serialize_map(Some(keys.len()))?;
+        for key in keys {
+            map.serialize_entry(key, &self.0[key])?;
+        }
+        map.end()
+    }
+}
+
+struct PersistedVectorView<'a> {
+    vector: &'a VectorRecord,
+    blob_ref: &'a VectorBlobRef,
+}
+
+impl Serialize for PersistedVectorView<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("VectorRecord", 5)?;
+        state.serialize_field("id", &self.vector.id)?;
+        state.serialize_field("corpusId", &self.vector.corpus_id)?;
+        state.serialize_field("namespace", &self.vector.namespace)?;
+        state.serialize_field("blobRef", self.blob_ref)?;
+        state.serialize_field("metadata", &self.vector.metadata)?;
+        state.end()
+    }
+}
+
+struct PersistedVectorMapView<'a> {
+    vectors: &'a HashMap<String, VectorRecord>,
+    refs: &'a HashMap<String, VectorBlobRef>,
+}
+
+impl Serialize for PersistedVectorMapView<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut keys: Vec<&String> = self.vectors.keys().collect();
+        keys.sort_unstable();
+        let mut map = serializer.serialize_map(Some(keys.len()))?;
+        for key in keys {
+            let blob_ref = self
+                .refs
+                .get(key)
+                .ok_or_else(|| serde::ser::Error::custom("missing prepared vector reference"))?;
+            map.serialize_entry(
+                key,
+                &PersistedVectorView {
+                    vector: &self.vectors[key],
+                    blob_ref,
+                },
+            )?;
+        }
+        map.end()
+    }
+}
+
+struct PersistedStateView<'a> {
+    state: &'a State,
+    generation: u64,
+    vector_blob: &'a VectorBlobDescriptor,
+    vector_refs: &'a HashMap<String, VectorBlobRef>,
+}
+
+impl Serialize for PersistedStateView<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("State", 8)?;
+        state.serialize_field("nodes", &SortedMapView(&self.state.nodes))?;
+        state.serialize_field("edges", &SortedMapView(&self.state.edges))?;
+        state.serialize_field(
+            "vectors",
+            &PersistedVectorMapView {
+                vectors: &self.state.vectors,
+                refs: self.vector_refs,
+            },
+        )?;
+        state.serialize_field("passages", &SortedMapView(&self.state.passages))?;
+        state.serialize_field("snapshots", &SortedMapView(&self.state.snapshots))?;
+        state.serialize_field("checkpoints", &SortedMapView(&self.state.checkpoints))?;
+        state.serialize_field("generation", &self.generation)?;
+        state.serialize_field("vectorBlob", self.vector_blob)?;
+        state.end()
+    }
+}
+
+struct ArtifactHashWriter<W> {
+    inner: W,
+    bytes: u64,
+    hasher: Sha256,
+}
+
+struct ArtifactEvidence {
+    bytes: u64,
+    sha256: String,
+}
+
+impl<W> ArtifactHashWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            bytes: 0,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> ArtifactEvidence {
+        let digest = self.hasher.finalize();
+        ArtifactEvidence {
+            bytes: self.bytes,
+            sha256: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+        }
+    }
+}
+
+impl<W: Write> Write for ArtifactHashWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        self.bytes = self
+            .bytes
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::other("artifact byte count overflow"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 const MAX_VECTOR_SEARCH_WORKERS: usize = 8;
@@ -1472,6 +1604,151 @@ impl Server {
         Ok(tmp_path)
     }
 
+    fn create_streaming_temp(target: &Path, sync_stage: &str) -> io::Result<(PathBuf, fs::File)> {
+        let tmp_path = Self::temporary_path(target, sync_stage)?;
+        Self::durability_failpoint(&format!("before_{sync_stage}_create"))?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let file = options
+            .open(&tmp_path)
+            .map_err(|err| io::Error::other(format!("create temp file failed: {err}")))?;
+        Self::durability_failpoint(&format!("after_{sync_stage}_create"))?;
+        Ok((tmp_path, file))
+    }
+
+    fn sync_streaming_temp(
+        file: &mut fs::File,
+        tmp_path: &Path,
+        sync_stage: &str,
+    ) -> io::Result<()> {
+        let result = (|| {
+            file.flush()
+                .map_err(|err| io::Error::other(format!("flush temp file failed: {err}")))?;
+            Self::durability_failpoint(&format!("after_{sync_stage}_write"))?;
+            Self::durability_failpoint(&format!("before_{sync_stage}_fsync"))?;
+            file.sync_all()
+                .map_err(|err| io::Error::other(format!("sync temp file failed: {err}")))?;
+            Self::durability_failpoint(&format!("after_{sync_stage}_fsync"))
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(tmp_path);
+        }
+        result
+    }
+
+    fn validate_blob_streaming(
+        path: &Path,
+        descriptor: &VectorBlobDescriptor,
+    ) -> io::Result<fs::File> {
+        let mut file = Self::open_regular_nofollow(path)
+            .map_err(|err| io::Error::other(format!("open vector blob failed: {err}")))?;
+        let identity = Self::metadata_identity(&file.metadata()?);
+        let mut writer = ArtifactHashWriter::new(io::sink());
+        let mut prefix = [0u8; 10];
+        let mut prefix_used = 0usize;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            let copy = (prefix.len() - prefix_used).min(count);
+            prefix[prefix_used..prefix_used + copy].copy_from_slice(&buffer[..copy]);
+            prefix_used += copy;
+            writer.write_all(&buffer[..count])?;
+        }
+        let evidence = writer.finish();
+        if prefix_used < Self::VECTOR_BLOB_MAGIC.len() + std::mem::size_of::<u16>() {
+            return Err(io::Error::other("vector blob file is truncated"));
+        }
+        if &prefix[..Self::VECTOR_BLOB_MAGIC.len()] != Self::VECTOR_BLOB_MAGIC {
+            return Err(io::Error::other("vector blob magic mismatch"));
+        }
+        let version_start = Self::VECTOR_BLOB_MAGIC.len();
+        let version = u16::from_le_bytes(
+            prefix[version_start..version_start + 2]
+                .try_into()
+                .expect("validated version prefix"),
+        );
+        if descriptor.format != version
+            || descriptor.size != evidence.bytes
+            || descriptor.sha256 != evidence.sha256
+        {
+            return Err(io::Error::other(
+                "vector blob does not match its committed descriptor",
+            ));
+        }
+        Self::validate_regular_path_identity(path, identity)?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(file)
+    }
+
+    fn stream_vector_blob_temp(
+        db_path: &Path,
+        vectors: &HashMap<String, VectorRecord>,
+        vector_values: &HashMap<String, Vec<f64>>,
+    ) -> io::Result<(PathBuf, ArtifactEvidence, HashMap<String, VectorBlobRef>)> {
+        let (tmp_path, mut file) = Self::create_streaming_temp(db_path, "blob_temp_sync")?;
+        let result = (|| {
+            Self::durability_failpoint("before_blob_temp_sync_write")?;
+            let mut writer = ArtifactHashWriter::new(&mut file);
+            writer.write_all(Self::VECTOR_BLOB_MAGIC)?;
+            writer.write_all(&Self::VECTOR_BLOB_VERSION.to_le_bytes())?;
+            let mut offset = 0u64;
+            let mut refs = HashMap::with_capacity(vectors.len());
+            let mut keys: Vec<&String> = vectors.keys().collect();
+            keys.sort_unstable();
+            for key in keys {
+                let vector = &vectors[key];
+                let values = vector_values.get(key).unwrap_or(&vector.values);
+                let len = u32::try_from(values.len())
+                    .map_err(|_| io::Error::other("vector dimensions exceed u32"))?;
+                refs.insert(key.clone(), VectorBlobRef { offset, len });
+                for value in values {
+                    writer.write_all(&value.to_le_bytes())?;
+                }
+                offset = offset
+                    .checked_add((len as u64) * std::mem::size_of::<f64>() as u64)
+                    .ok_or_else(|| io::Error::other("vector blob offset overflow"))?;
+            }
+            let evidence = writer.finish();
+            Self::sync_streaming_temp(&mut file, &tmp_path, "blob_temp_sync")?;
+            Ok::<_, io::Error>((evidence, refs))
+        })();
+        match result {
+            Ok((evidence, refs)) => Ok((tmp_path, evidence, refs)),
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                Err(err)
+            }
+        }
+    }
+
+    fn stream_canonical_temp(
+        db_path: &Path,
+        view: &PersistedStateView<'_>,
+    ) -> io::Result<(PathBuf, u64)> {
+        let (tmp_path, mut file) = Self::create_streaming_temp(db_path, "json_temp_sync")?;
+        let result = (|| {
+            Self::durability_failpoint("before_json_temp_sync_write")?;
+            let mut writer = ArtifactHashWriter::new(&mut file);
+            serde_json::to_writer(&mut writer, view)
+                .map_err(|err| io::Error::other(format!("serialize state failed: {err}")))?;
+            let evidence = writer.finish();
+            Self::sync_streaming_temp(&mut file, &tmp_path, "json_temp_sync")?;
+            Ok::<_, io::Error>(evidence.bytes)
+        })();
+        match result {
+            Ok(bytes) => Ok((tmp_path, bytes)),
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                Err(err)
+            }
+        }
+    }
+
     fn validate_blob_basename(basename: &str) -> io::Result<()> {
         let path = Path::new(basename);
         if basename.is_empty()
@@ -1911,21 +2188,20 @@ impl Server {
         fs::create_dir_all(&parent)
             .map_err(|err| io::Error::other(format!("create database directory failed: {err}")))?;
 
-        let mut persisted_state = self.state.clone();
-        let vector_blob_payload =
-            Self::build_vector_blob_payload(&mut persisted_state, &self.vector_values)?;
-        let blob_sha256 = Self::sha256_hex(&vector_blob_payload);
+        let (blob_tmp, blob_evidence, prepared_vector_refs) =
+            Self::stream_vector_blob_temp(db_path, &self.state.vectors, &self.vector_values)?;
         let blob_basename = format!(
-            "{}.g{next_generation:020}.{blob_sha256}.vblob",
+            "{}.g{next_generation:020}.{}.vblob",
             db_path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
-                .unwrap_or("vectors")
+                .unwrap_or("vectors"),
+            blob_evidence.sha256,
         );
         let blob_descriptor = VectorBlobDescriptor {
             basename: blob_basename,
-            size: vector_blob_payload.len() as u64,
-            sha256: blob_sha256,
+            size: blob_evidence.bytes,
+            sha256: blob_evidence.sha256,
             format: Self::VECTOR_BLOB_VERSION,
         };
         let blob_path = parent.join(&blob_descriptor.basename);
@@ -1933,44 +2209,48 @@ impl Server {
         match fs::symlink_metadata(&blob_path) {
             Ok(metadata) => {
                 Self::require_regular_single_link(&blob_path, &metadata)?;
-                let (file, _) = Self::open_validated_blob(&blob_path, Some(&blob_descriptor))?;
+                let file = Self::validate_blob_streaming(&blob_path, &blob_descriptor)?;
                 Self::durability_failpoint("blob_existing_sync")?;
                 file.sync_all().map_err(|err| {
                     io::Error::other(format!("sync existing vector blob failed: {err}"))
                 })?;
+                fs::remove_file(&blob_tmp)?;
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                let blob_tmp =
-                    Self::write_durable_temp(&blob_path, &vector_blob_payload, "blob_temp_sync")?;
                 if let Err(err) = Self::durability_failpoint("before_blob_rename") {
                     let _ = fs::remove_file(&blob_tmp);
                     return Err(err);
                 }
-                if let Err(err) = fs::rename(&blob_tmp, &blob_path) {
+                if let Err(err) = Self::rename_noreplace(&blob_tmp, &blob_path) {
                     let _ = fs::remove_file(&blob_tmp);
                     return Err(io::Error::other(format!(
                         "publish vector blob failed: {err}"
                     )));
                 }
                 Self::durability_failpoint("after_blob_rename")?;
-                Self::read_validated_blob(&blob_path, Some(&blob_descriptor))?;
+                Self::validate_blob_streaming(&blob_path, &blob_descriptor)?;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                let _ = fs::remove_file(&blob_tmp);
+                return Err(err);
+            }
         }
         Self::durability_failpoint("before_blob_dir_fsync")?;
         Self::sync_parent_dir(&parent)?;
         Self::durability_failpoint("after_blob_dir_fsync")?;
 
-        persisted_state.generation = next_generation;
-        persisted_state.vector_blob = Some(blob_descriptor.clone());
-        let raw = serde_json::to_vec(&persisted_state)
-            .map_err(|err| io::Error::other(format!("serialize state failed: {err}")))?;
+        let persisted_state = PersistedStateView {
+            state: &self.state,
+            generation: next_generation,
+            vector_blob: &blob_descriptor,
+            vector_refs: &prepared_vector_refs,
+        };
         match fs::symlink_metadata(db_path) {
             Ok(metadata) => Self::require_regular_single_link(db_path, &metadata)?,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
-        let json_tmp = Self::write_durable_temp(db_path, &raw, "json_temp_sync")?;
+        let (json_tmp, json_bytes) = Self::stream_canonical_temp(db_path, &persisted_state)?;
         if let Err(err) = Self::durability_failpoint("before_json_rename") {
             let _ = fs::remove_file(&json_tmp);
             return Err(err);
@@ -1994,17 +2274,24 @@ impl Server {
         Self::sync_parent_dir(&parent)?;
         Self::durability_failpoint("after_final_dir_fsync")?;
 
-        self.state = persisted_state;
-        self.last_persist_bytes = raw.len() as u64;
+        self.state.generation = next_generation;
+        self.state.vector_blob = Some(blob_descriptor.clone());
+        for (key, blob_ref) in prepared_vector_refs {
+            let vector = self
+                .state
+                .vectors
+                .get_mut(&key)
+                .expect("prepared vector key came from live state");
+            vector.values.clear();
+            vector.blob_ref = Some(blob_ref);
+        }
+        self.last_persist_bytes = json_bytes;
         self.wal_bytes = 0;
         self.wal_identity = None;
         let total_ms = start.elapsed().as_millis();
         eprintln!(
             "[persist] generation={} blobBytes={} blobSha256={} jsonBytes={} elapsedMs={total_ms}",
-            next_generation,
-            vector_blob_payload.len(),
-            blob_descriptor.sha256,
-            raw.len(),
+            next_generation, blob_descriptor.size, blob_descriptor.sha256, json_bytes,
         );
         Ok(DurableGenerationToken {
             generation: next_generation,
@@ -2570,38 +2857,6 @@ impl Server {
 
     fn key(corpus_id: &str, id: &str) -> String {
         format!("{corpus_id}:{id}")
-    }
-
-    fn build_vector_blob_payload(
-        state: &mut State,
-        vector_values: &HashMap<String, Vec<f64>>,
-    ) -> io::Result<Vec<u8>> {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(Self::VECTOR_BLOB_MAGIC);
-        payload.extend_from_slice(&Self::VECTOR_BLOB_VERSION.to_le_bytes());
-        let mut offset = 0u64;
-        let mut keys: Vec<String> = state.vectors.keys().cloned().collect();
-        keys.sort();
-        for key in keys {
-            let Some(vector) = state.vectors.get_mut(&key) else {
-                continue;
-            };
-            let values = vector_values
-                .get(&key)
-                .cloned()
-                .unwrap_or_else(|| vector.values.clone());
-            let len = u32::try_from(values.len())
-                .map_err(|_| io::Error::other("vector dimensions exceed u32"))?;
-            for value in &values {
-                payload.extend_from_slice(&value.to_le_bytes());
-            }
-            vector.values.clear();
-            vector.blob_ref = Some(VectorBlobRef { offset, len });
-            offset = offset
-                .checked_add((len as u64) * std::mem::size_of::<f64>() as u64)
-                .ok_or_else(|| io::Error::other("vector blob offset overflow"))?;
-        }
-        Ok(payload)
     }
 
     fn node_key(corpus_id: &str, node_id: &str) -> String {
