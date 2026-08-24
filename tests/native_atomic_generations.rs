@@ -2438,6 +2438,36 @@ fn mutation_preflight_does_not_clone_the_server_or_dispatch_a_clone() {
     );
 }
 
+#[test]
+fn commit_path_has_no_output_sized_state_blob_or_json_buffers() {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/aira-graphdb-native.rs");
+    let source = std::fs::read_to_string(source_path).expect("native source");
+    let persist_start = source
+        .find("fn persist(&mut self)")
+        .expect("persist function");
+    let persist_end = source[persist_start..]
+        .find("fn persist_if_needed")
+        .map(|offset| persist_start + offset)
+        .expect("persist function boundary");
+    let persist = &source[persist_start..persist_end];
+    for forbidden in [
+        "self.state.clone()",
+        "build_vector_blob_payload",
+        "serde_json::to_vec(&persisted_state)",
+    ] {
+        assert!(
+            !persist.contains(forbidden),
+            "commit path reintroduced output-sized materialization: {forbidden}"
+        );
+    }
+    for required in ["stream_vector_blob_temp", "stream_canonical_temp"] {
+        assert!(
+            persist.contains(required),
+            "commit path bypassed the streaming publication authority: {required}"
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn repeated_small_mutations_have_delta_bounded_peak_rss_after_representative_state() {
@@ -2494,6 +2524,14 @@ fn repeated_small_mutations_have_delta_bounded_peak_rss_after_representative_sta
         assert_eq!(response["ok"], json!(true), "small mutation {index}");
         mutation_peak = mutation_peak.max(request_peak);
     }
+    let (commit, _, commit_peak) = native.send_with_peak_rss(batch_commit(500));
+    assert_eq!(
+        commit["ok"],
+        json!(true),
+        "streaming commit failed: {commit}"
+    );
+    assert_eq!(commit["result"]["generation"], json!(2));
+    mutation_peak = mutation_peak.max(commit_peak);
     assert_eq!(native.finish().code(), Some(0));
 
     let growth = mutation_peak.saturating_sub(baseline_peak);

@@ -16,11 +16,13 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(target_os = "linux")]
 use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
-use serde::{Deserialize, Serialize};
+use serde::ser::{SerializeMap, SerializeStruct};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use aira_graphdb::graph::{InMemoryGraphStore, Properties, Value as GraphValue};
+use aira_graphdb::native_persistence_contract::JSON_SAFE_INTEGER_MAX;
 use aira_graphdb::query::{CypherDialect, execute_query_with_dialect};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -101,9 +103,141 @@ struct State {
     vector_blob: Option<VectorBlobDescriptor>,
 }
 
+struct SortedMapView<'a, T>(&'a HashMap<String, T>);
+
+impl<T: Serialize> Serialize for SortedMapView<'_, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut keys: Vec<&String> = self.0.keys().collect();
+        keys.sort_unstable();
+        let mut map = serializer.serialize_map(Some(keys.len()))?;
+        for key in keys {
+            map.serialize_entry(key, &self.0[key])?;
+        }
+        map.end()
+    }
+}
+
+struct PersistedVectorView<'a> {
+    vector: &'a VectorRecord,
+    blob_ref: &'a VectorBlobRef,
+}
+
+impl Serialize for PersistedVectorView<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("VectorRecord", 5)?;
+        state.serialize_field("id", &self.vector.id)?;
+        state.serialize_field("corpusId", &self.vector.corpus_id)?;
+        state.serialize_field("namespace", &self.vector.namespace)?;
+        state.serialize_field("blobRef", self.blob_ref)?;
+        state.serialize_field("metadata", &self.vector.metadata)?;
+        state.end()
+    }
+}
+
+struct PersistedVectorMapView<'a> {
+    vectors: &'a HashMap<String, VectorRecord>,
+    refs: &'a HashMap<String, VectorBlobRef>,
+}
+
+impl Serialize for PersistedVectorMapView<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut keys: Vec<&String> = self.vectors.keys().collect();
+        keys.sort_unstable();
+        let mut map = serializer.serialize_map(Some(keys.len()))?;
+        for key in keys {
+            let blob_ref = self
+                .refs
+                .get(key)
+                .ok_or_else(|| serde::ser::Error::custom("missing prepared vector reference"))?;
+            map.serialize_entry(
+                key,
+                &PersistedVectorView {
+                    vector: &self.vectors[key],
+                    blob_ref,
+                },
+            )?;
+        }
+        map.end()
+    }
+}
+
+struct PersistedStateView<'a> {
+    state: &'a State,
+    generation: u64,
+    vector_blob: &'a VectorBlobDescriptor,
+    vector_refs: &'a HashMap<String, VectorBlobRef>,
+}
+
+impl Serialize for PersistedStateView<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("State", 8)?;
+        state.serialize_field("nodes", &SortedMapView(&self.state.nodes))?;
+        state.serialize_field("edges", &SortedMapView(&self.state.edges))?;
+        state.serialize_field(
+            "vectors",
+            &PersistedVectorMapView {
+                vectors: &self.state.vectors,
+                refs: self.vector_refs,
+            },
+        )?;
+        state.serialize_field("passages", &SortedMapView(&self.state.passages))?;
+        state.serialize_field("snapshots", &SortedMapView(&self.state.snapshots))?;
+        state.serialize_field("checkpoints", &SortedMapView(&self.state.checkpoints))?;
+        state.serialize_field("generation", &self.generation)?;
+        state.serialize_field("vectorBlob", self.vector_blob)?;
+        state.end()
+    }
+}
+
+struct ArtifactHashWriter<W> {
+    inner: W,
+    bytes: u64,
+    hasher: Sha256,
+}
+
+struct ArtifactEvidence {
+    bytes: u64,
+    sha256: String,
+}
+
+impl<W> ArtifactHashWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            bytes: 0,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> ArtifactEvidence {
+        let digest = self.hasher.finalize();
+        ArtifactEvidence {
+            bytes: self.bytes,
+            sha256: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+        }
+    }
+}
+
+impl<W: Write> Write for ArtifactHashWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        self.bytes = self
+            .bytes
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::other("artifact byte count overflow"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 const MAX_VECTOR_SEARCH_WORKERS: usize = 8;
 const MAX_VECTOR_DIMENSIONS: usize = 4_096;
 const MAX_VECTOR_SEARCH_TOP_K: usize = 10_000;
+const MAX_WAL_RECORD_BYTES: u64 = 536_870_912;
 
 #[derive(Debug)]
 struct ScoredVector {
@@ -151,6 +285,208 @@ struct WalRecord {
     version: u16,
     base_generation: u64,
     request: RpcRequest,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
+struct WalRecordRef<'a> {
+    version: u16,
+    base_generation: u64,
+    request: &'a RpcRequest,
+}
+
+#[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
+struct LimitedHashWriter<W> {
+    inner: W,
+    bytes: u64,
+    limit: u64,
+    record_hasher: Sha256,
+    wal_hasher: Option<Sha256>,
+}
+
+#[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
+struct WalWriteEvidence<W> {
+    inner: W,
+    bytes: u64,
+    record_digest: [u8; 32],
+    wal_hasher: Option<Sha256>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Passed to the semantic WAL visitor in the next checkpoint.
+struct WalRecordReadEvidence {
+    bytes: u64,
+    digest: [u8; 32],
+}
+
+#[allow(dead_code)] // Wired only after the semantic WAL visitor checkpoint.
+struct StrictLfRecordReader<'a, R: BufRead> {
+    inner: &'a mut R,
+    limit: u64,
+    bytes: u64,
+    payload_bytes: u64,
+    record_hasher: Sha256,
+    wal_hasher: &'a mut Sha256,
+    finished: bool,
+}
+
+#[allow(dead_code)] // Wired only after the semantic WAL visitor checkpoint.
+impl<'a, R: BufRead> StrictLfRecordReader<'a, R> {
+    fn new(inner: &'a mut R, limit: u64, wal_hasher: &'a mut Sha256) -> Self {
+        Self {
+            inner,
+            limit,
+            bytes: 0,
+            payload_bytes: 0,
+            record_hasher: Sha256::new(),
+            wal_hasher,
+            finished: false,
+        }
+    }
+
+    fn account(&mut self, bytes: &[u8], payload: bool) -> io::Result<()> {
+        let added = u64::try_from(bytes.len())
+            .map_err(|_| io::Error::other("WAL read length does not fit u64"))?;
+        let next = self
+            .bytes
+            .checked_add(added)
+            .ok_or_else(|| io::Error::other("WAL record byte count overflow"))?;
+        if next > self.limit {
+            return Err(io::Error::other(format!(
+                "WAL record exceeds {} bytes",
+                self.limit
+            )));
+        }
+        self.record_hasher.update(bytes);
+        self.wal_hasher.update(bytes);
+        self.bytes = next;
+        if payload {
+            self.payload_bytes = self
+                .payload_bytes
+                .checked_add(added)
+                .ok_or_else(|| io::Error::other("WAL payload byte count overflow"))?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> io::Result<WalRecordReadEvidence> {
+        if !self.finished {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "WAL final record is missing LF",
+            ));
+        }
+        if self.payload_bytes == 0 {
+            return Err(io::Error::other("WAL contains a blank record"));
+        }
+        Ok(WalRecordReadEvidence {
+            bytes: self.bytes,
+            digest: self.record_hasher.finalize().into(),
+        })
+    }
+}
+
+impl<R: BufRead> Read for StrictLfRecordReader<'_, R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() || self.finished {
+            return Ok(0);
+        }
+        let available = self.inner.fill_buf()?;
+        if available.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "WAL final record is missing LF",
+            ));
+        }
+        let before_lf = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(available.len());
+        if before_lf == 0 {
+            self.account(b"\n", false)?;
+            self.inner.consume(1);
+            self.finished = true;
+            return Ok(0);
+        }
+        let consumed = before_lf.min(output.len());
+        output[..consumed].copy_from_slice(&available[..consumed]);
+        let added = u64::try_from(consumed)
+            .map_err(|_| io::Error::other("WAL read length does not fit u64"))?;
+        let next = self
+            .bytes
+            .checked_add(added)
+            .ok_or_else(|| io::Error::other("WAL record byte count overflow"))?;
+        if next > self.limit {
+            return Err(io::Error::other(format!(
+                "WAL record exceeds {} bytes",
+                self.limit
+            )));
+        }
+        self.record_hasher.update(&available[..consumed]);
+        self.wal_hasher.update(&available[..consumed]);
+        self.bytes = next;
+        self.payload_bytes = self
+            .payload_bytes
+            .checked_add(added)
+            .ok_or_else(|| io::Error::other("WAL payload byte count overflow"))?;
+        self.inner.consume(consumed);
+        Ok(consumed)
+    }
+}
+
+#[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
+impl<W> LimitedHashWriter<W> {
+    fn new(inner: W, limit: u64, wal_hasher: Option<Sha256>) -> Self {
+        Self {
+            inner,
+            bytes: 0,
+            limit,
+            record_hasher: Sha256::new(),
+            wal_hasher,
+        }
+    }
+
+    fn finish(self) -> WalWriteEvidence<W> {
+        WalWriteEvidence {
+            inner: self.inner,
+            bytes: self.bytes,
+            record_digest: self.record_hasher.finalize().into(),
+            wal_hasher: self.wal_hasher,
+        }
+    }
+}
+
+#[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
+impl<W: Write> Write for LimitedHashWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let requested = u64::try_from(buf.len())
+            .map_err(|_| io::Error::other("WAL write length does not fit u64"))?;
+        let next = self
+            .bytes
+            .checked_add(requested)
+            .ok_or_else(|| io::Error::other("WAL record byte count overflow"))?;
+        if next > self.limit {
+            return Err(io::Error::other(format!(
+                "WAL record exceeds {} bytes",
+                self.limit
+            )));
+        }
+        let written = self.inner.write(buf)?;
+        self.record_hasher.update(&buf[..written]);
+        if let Some(hasher) = self.wal_hasher.as_mut() {
+            hasher.update(&buf[..written]);
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::other("WAL record byte count overflow"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -261,7 +597,6 @@ const ACCESS_MODE_DESCRIPTOR_READ_ONLY: &str = "descriptor-read-only";
 const DESCRIPTOR_READ_ONLY_METHOD_CODE: &str = "DESCRIPTOR_READ_ONLY_METHOD";
 const DESCRIPTOR_READ_ONLY_METHOD_MESSAGE: &str =
     "method is unavailable in descriptor read-only mode";
-const MAX_SAFE_GENERATION: u64 = 9_007_199_254_740_991;
 // The descriptor protocol must never turn an inherited file into an
 // unbounded allocation. These caps are intentionally independent from the
 // normal --db persistence path and are checked from fstat before reading.
@@ -1269,6 +1604,151 @@ impl Server {
         Ok(tmp_path)
     }
 
+    fn create_streaming_temp(target: &Path, sync_stage: &str) -> io::Result<(PathBuf, fs::File)> {
+        let tmp_path = Self::temporary_path(target, sync_stage)?;
+        Self::durability_failpoint(&format!("before_{sync_stage}_create"))?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let file = options
+            .open(&tmp_path)
+            .map_err(|err| io::Error::other(format!("create temp file failed: {err}")))?;
+        Self::durability_failpoint(&format!("after_{sync_stage}_create"))?;
+        Ok((tmp_path, file))
+    }
+
+    fn sync_streaming_temp(
+        file: &mut fs::File,
+        tmp_path: &Path,
+        sync_stage: &str,
+    ) -> io::Result<()> {
+        let result = (|| {
+            file.flush()
+                .map_err(|err| io::Error::other(format!("flush temp file failed: {err}")))?;
+            Self::durability_failpoint(&format!("after_{sync_stage}_write"))?;
+            Self::durability_failpoint(&format!("before_{sync_stage}_fsync"))?;
+            file.sync_all()
+                .map_err(|err| io::Error::other(format!("sync temp file failed: {err}")))?;
+            Self::durability_failpoint(&format!("after_{sync_stage}_fsync"))
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(tmp_path);
+        }
+        result
+    }
+
+    fn validate_blob_streaming(
+        path: &Path,
+        descriptor: &VectorBlobDescriptor,
+    ) -> io::Result<fs::File> {
+        let mut file = Self::open_regular_nofollow(path)
+            .map_err(|err| io::Error::other(format!("open vector blob failed: {err}")))?;
+        let identity = Self::metadata_identity(&file.metadata()?);
+        let mut writer = ArtifactHashWriter::new(io::sink());
+        let mut prefix = [0u8; 10];
+        let mut prefix_used = 0usize;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            let copy = (prefix.len() - prefix_used).min(count);
+            prefix[prefix_used..prefix_used + copy].copy_from_slice(&buffer[..copy]);
+            prefix_used += copy;
+            writer.write_all(&buffer[..count])?;
+        }
+        let evidence = writer.finish();
+        if prefix_used < Self::VECTOR_BLOB_MAGIC.len() + std::mem::size_of::<u16>() {
+            return Err(io::Error::other("vector blob file is truncated"));
+        }
+        if &prefix[..Self::VECTOR_BLOB_MAGIC.len()] != Self::VECTOR_BLOB_MAGIC {
+            return Err(io::Error::other("vector blob magic mismatch"));
+        }
+        let version_start = Self::VECTOR_BLOB_MAGIC.len();
+        let version = u16::from_le_bytes(
+            prefix[version_start..version_start + 2]
+                .try_into()
+                .expect("validated version prefix"),
+        );
+        if descriptor.format != version
+            || descriptor.size != evidence.bytes
+            || descriptor.sha256 != evidence.sha256
+        {
+            return Err(io::Error::other(
+                "vector blob does not match its committed descriptor",
+            ));
+        }
+        Self::validate_regular_path_identity(path, identity)?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(file)
+    }
+
+    fn stream_vector_blob_temp(
+        db_path: &Path,
+        vectors: &HashMap<String, VectorRecord>,
+        vector_values: &HashMap<String, Vec<f64>>,
+    ) -> io::Result<(PathBuf, ArtifactEvidence, HashMap<String, VectorBlobRef>)> {
+        let (tmp_path, mut file) = Self::create_streaming_temp(db_path, "blob_temp_sync")?;
+        let result = (|| {
+            Self::durability_failpoint("before_blob_temp_sync_write")?;
+            let mut writer = ArtifactHashWriter::new(&mut file);
+            writer.write_all(Self::VECTOR_BLOB_MAGIC)?;
+            writer.write_all(&Self::VECTOR_BLOB_VERSION.to_le_bytes())?;
+            let mut offset = 0u64;
+            let mut refs = HashMap::with_capacity(vectors.len());
+            let mut keys: Vec<&String> = vectors.keys().collect();
+            keys.sort_unstable();
+            for key in keys {
+                let vector = &vectors[key];
+                let values = vector_values.get(key).unwrap_or(&vector.values);
+                let len = u32::try_from(values.len())
+                    .map_err(|_| io::Error::other("vector dimensions exceed u32"))?;
+                refs.insert(key.clone(), VectorBlobRef { offset, len });
+                for value in values {
+                    writer.write_all(&value.to_le_bytes())?;
+                }
+                offset = offset
+                    .checked_add((len as u64) * std::mem::size_of::<f64>() as u64)
+                    .ok_or_else(|| io::Error::other("vector blob offset overflow"))?;
+            }
+            let evidence = writer.finish();
+            Self::sync_streaming_temp(&mut file, &tmp_path, "blob_temp_sync")?;
+            Ok::<_, io::Error>((evidence, refs))
+        })();
+        match result {
+            Ok((evidence, refs)) => Ok((tmp_path, evidence, refs)),
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                Err(err)
+            }
+        }
+    }
+
+    fn stream_canonical_temp(
+        db_path: &Path,
+        view: &PersistedStateView<'_>,
+    ) -> io::Result<(PathBuf, u64)> {
+        let (tmp_path, mut file) = Self::create_streaming_temp(db_path, "json_temp_sync")?;
+        let result = (|| {
+            Self::durability_failpoint("before_json_temp_sync_write")?;
+            let mut writer = ArtifactHashWriter::new(&mut file);
+            serde_json::to_writer(&mut writer, view)
+                .map_err(|err| io::Error::other(format!("serialize state failed: {err}")))?;
+            let evidence = writer.finish();
+            Self::sync_streaming_temp(&mut file, &tmp_path, "json_temp_sync")?;
+            Ok::<_, io::Error>(evidence.bytes)
+        })();
+        match result {
+            Ok(bytes) => Ok((tmp_path, bytes)),
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                Err(err)
+            }
+        }
+    }
+
     fn validate_blob_basename(basename: &str) -> io::Result<()> {
         let path = Path::new(basename);
         if basename.is_empty()
@@ -1543,7 +2023,7 @@ impl Server {
         let vector_blob_sha256 = Self::sha256_hex(&blob_raw);
         let state: State = serde_json::from_slice(&canonical_raw)
             .map_err(|err| io::Error::other(format!("parse canonical descriptor failed: {err}")))?;
-        if state.generation > MAX_SAFE_GENERATION {
+        if state.generation > JSON_SAFE_INTEGER_MAX {
             return Err(io::Error::other(
                 "canonical generation exceeds MAX_SAFE_INTEGER",
             ));
@@ -1708,21 +2188,20 @@ impl Server {
         fs::create_dir_all(&parent)
             .map_err(|err| io::Error::other(format!("create database directory failed: {err}")))?;
 
-        let mut persisted_state = self.state.clone();
-        let vector_blob_payload =
-            Self::build_vector_blob_payload(&mut persisted_state, &self.vector_values)?;
-        let blob_sha256 = Self::sha256_hex(&vector_blob_payload);
+        let (blob_tmp, blob_evidence, prepared_vector_refs) =
+            Self::stream_vector_blob_temp(db_path, &self.state.vectors, &self.vector_values)?;
         let blob_basename = format!(
-            "{}.g{next_generation:020}.{blob_sha256}.vblob",
+            "{}.g{next_generation:020}.{}.vblob",
             db_path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
-                .unwrap_or("vectors")
+                .unwrap_or("vectors"),
+            blob_evidence.sha256,
         );
         let blob_descriptor = VectorBlobDescriptor {
             basename: blob_basename,
-            size: vector_blob_payload.len() as u64,
-            sha256: blob_sha256,
+            size: blob_evidence.bytes,
+            sha256: blob_evidence.sha256,
             format: Self::VECTOR_BLOB_VERSION,
         };
         let blob_path = parent.join(&blob_descriptor.basename);
@@ -1730,44 +2209,48 @@ impl Server {
         match fs::symlink_metadata(&blob_path) {
             Ok(metadata) => {
                 Self::require_regular_single_link(&blob_path, &metadata)?;
-                let (file, _) = Self::open_validated_blob(&blob_path, Some(&blob_descriptor))?;
+                let file = Self::validate_blob_streaming(&blob_path, &blob_descriptor)?;
                 Self::durability_failpoint("blob_existing_sync")?;
                 file.sync_all().map_err(|err| {
                     io::Error::other(format!("sync existing vector blob failed: {err}"))
                 })?;
+                fs::remove_file(&blob_tmp)?;
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                let blob_tmp =
-                    Self::write_durable_temp(&blob_path, &vector_blob_payload, "blob_temp_sync")?;
                 if let Err(err) = Self::durability_failpoint("before_blob_rename") {
                     let _ = fs::remove_file(&blob_tmp);
                     return Err(err);
                 }
-                if let Err(err) = fs::rename(&blob_tmp, &blob_path) {
+                if let Err(err) = Self::rename_noreplace(&blob_tmp, &blob_path) {
                     let _ = fs::remove_file(&blob_tmp);
                     return Err(io::Error::other(format!(
                         "publish vector blob failed: {err}"
                     )));
                 }
                 Self::durability_failpoint("after_blob_rename")?;
-                Self::read_validated_blob(&blob_path, Some(&blob_descriptor))?;
+                Self::validate_blob_streaming(&blob_path, &blob_descriptor)?;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                let _ = fs::remove_file(&blob_tmp);
+                return Err(err);
+            }
         }
         Self::durability_failpoint("before_blob_dir_fsync")?;
         Self::sync_parent_dir(&parent)?;
         Self::durability_failpoint("after_blob_dir_fsync")?;
 
-        persisted_state.generation = next_generation;
-        persisted_state.vector_blob = Some(blob_descriptor.clone());
-        let raw = serde_json::to_vec(&persisted_state)
-            .map_err(|err| io::Error::other(format!("serialize state failed: {err}")))?;
+        let persisted_state = PersistedStateView {
+            state: &self.state,
+            generation: next_generation,
+            vector_blob: &blob_descriptor,
+            vector_refs: &prepared_vector_refs,
+        };
         match fs::symlink_metadata(db_path) {
             Ok(metadata) => Self::require_regular_single_link(db_path, &metadata)?,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
-        let json_tmp = Self::write_durable_temp(db_path, &raw, "json_temp_sync")?;
+        let (json_tmp, json_bytes) = Self::stream_canonical_temp(db_path, &persisted_state)?;
         if let Err(err) = Self::durability_failpoint("before_json_rename") {
             let _ = fs::remove_file(&json_tmp);
             return Err(err);
@@ -1791,17 +2274,24 @@ impl Server {
         Self::sync_parent_dir(&parent)?;
         Self::durability_failpoint("after_final_dir_fsync")?;
 
-        self.state = persisted_state;
-        self.last_persist_bytes = raw.len() as u64;
+        self.state.generation = next_generation;
+        self.state.vector_blob = Some(blob_descriptor.clone());
+        for (key, blob_ref) in prepared_vector_refs {
+            let vector = self
+                .state
+                .vectors
+                .get_mut(&key)
+                .expect("prepared vector key came from live state");
+            vector.values.clear();
+            vector.blob_ref = Some(blob_ref);
+        }
+        self.last_persist_bytes = json_bytes;
         self.wal_bytes = 0;
         self.wal_identity = None;
         let total_ms = start.elapsed().as_millis();
         eprintln!(
             "[persist] generation={} blobBytes={} blobSha256={} jsonBytes={} elapsedMs={total_ms}",
-            next_generation,
-            vector_blob_payload.len(),
-            blob_descriptor.sha256,
-            raw.len(),
+            next_generation, blob_descriptor.size, blob_descriptor.sha256, json_bytes,
         );
         Ok(DurableGenerationToken {
             generation: next_generation,
@@ -2029,6 +2519,55 @@ impl Server {
 
     fn digest_hex(digest: &[u8; 32]) -> String {
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
+    fn stream_wal_record<W: Write>(
+        writer: W,
+        base_generation: u64,
+        request: &RpcRequest,
+        wal_hasher: Option<Sha256>,
+    ) -> io::Result<WalWriteEvidence<W>> {
+        Self::stream_wal_record_with_limit(
+            writer,
+            base_generation,
+            request,
+            wal_hasher,
+            MAX_WAL_RECORD_BYTES,
+        )
+    }
+
+    #[allow(dead_code)] // Test seam for max/max+1 without allocating 512 MiB.
+    fn stream_wal_record_with_limit<W: Write>(
+        writer: W,
+        base_generation: u64,
+        request: &RpcRequest,
+        wal_hasher: Option<Sha256>,
+        record_limit: u64,
+    ) -> io::Result<WalWriteEvidence<W>> {
+        let record = WalRecordRef {
+            version: Self::WAL_VERSION,
+            base_generation,
+            request,
+        };
+        let mut writer = LimitedHashWriter::new(writer, record_limit, wal_hasher);
+        serde_json::to_writer(&mut writer, &record)
+            .map_err(|err| io::Error::other(format!("serialize WAL record failed: {err}")))?;
+        writer.write_all(b"\n")?;
+        Ok(writer.finish())
+    }
+
+    #[allow(dead_code)] // Used by the atomic writer switch after reader review.
+    fn require_same_wal_record<A, B>(
+        measured: &WalWriteEvidence<A>,
+        written: &WalWriteEvidence<B>,
+    ) -> io::Result<()> {
+        if measured.bytes != written.bytes || measured.record_digest != written.record_digest {
+            return Err(io::Error::other(
+                "WAL request changed between counting and append passes",
+            ));
+        }
+        Ok(())
     }
 
     fn open_wal_for_append(&self) -> io::Result<(fs::File, bool, (u64, u64))> {
@@ -2318,38 +2857,6 @@ impl Server {
 
     fn key(corpus_id: &str, id: &str) -> String {
         format!("{corpus_id}:{id}")
-    }
-
-    fn build_vector_blob_payload(
-        state: &mut State,
-        vector_values: &HashMap<String, Vec<f64>>,
-    ) -> io::Result<Vec<u8>> {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(Self::VECTOR_BLOB_MAGIC);
-        payload.extend_from_slice(&Self::VECTOR_BLOB_VERSION.to_le_bytes());
-        let mut offset = 0u64;
-        let mut keys: Vec<String> = state.vectors.keys().cloned().collect();
-        keys.sort();
-        for key in keys {
-            let Some(vector) = state.vectors.get_mut(&key) else {
-                continue;
-            };
-            let values = vector_values
-                .get(&key)
-                .cloned()
-                .unwrap_or_else(|| vector.values.clone());
-            let len = u32::try_from(values.len())
-                .map_err(|_| io::Error::other("vector dimensions exceed u32"))?;
-            for value in &values {
-                payload.extend_from_slice(&value.to_le_bytes());
-            }
-            vector.values.clear();
-            vector.blob_ref = Some(VectorBlobRef { offset, len });
-            offset = offset
-                .checked_add((len as u64) * std::mem::size_of::<f64>() as u64)
-                .ok_or_else(|| io::Error::other("vector blob offset overflow"))?;
-        }
-        Ok(payload)
     }
 
     fn node_key(corpus_id: &str, node_id: &str) -> String {
@@ -4081,7 +4588,7 @@ fn parse_descriptor_generation(value: Option<&String>) -> io::Result<u64> {
     let generation = value
         .parse::<u64>()
         .map_err(|_| io::Error::other("--expected-generation must be an unsigned integer"))?;
-    if generation > MAX_SAFE_GENERATION {
+    if generation > JSON_SAFE_INTEGER_MAX {
         return Err(io::Error::other(
             "--expected-generation exceeds MAX_SAFE_INTEGER",
         ));
@@ -4474,6 +4981,7 @@ fn main() -> io::Result<()> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::io::BufReader;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(prefix: &str) -> PathBuf {
@@ -4515,6 +5023,168 @@ mod tests {
             blob_ref: None,
             metadata: json!({"id": id}),
         }
+    }
+
+    #[test]
+    fn wal_record_two_pass_stream_matches_v2_bytes_and_enforces_limit() {
+        let request = RpcRequest {
+            id: 17,
+            method: "memory_save".to_string(),
+            params: json!({"snapshot":{"corpusId":"corpus","facts":[]}}),
+        };
+        let mut expected = serde_json::to_vec(&WalRecord {
+            version: Server::WAL_VERSION,
+            base_generation: 7,
+            request: request.clone(),
+        })
+        .unwrap();
+        expected.push(b'\n');
+
+        let counted = Server::stream_wal_record(io::sink(), 7, &request, None).unwrap();
+        assert_eq!(counted.bytes, expected.len() as u64);
+        assert_eq!(counted.record_digest, Server::digest_bytes(&expected));
+
+        let prefix = b"existing WAL\n";
+        let mut seeded = Sha256::new();
+        seeded.update(prefix);
+        let written = Server::stream_wal_record(Vec::new(), 7, &request, Some(seeded)).unwrap();
+        assert_eq!(written.inner, expected);
+        assert_eq!(written.bytes, counted.bytes);
+        assert_eq!(written.record_digest, counted.record_digest);
+        Server::require_same_wal_record(&counted, &written).unwrap();
+        let mut complete = prefix.to_vec();
+        complete.extend_from_slice(&expected);
+        assert_eq!(
+            written.wal_hasher.unwrap().finalize().as_slice(),
+            Sha256::digest(&complete).as_slice()
+        );
+
+        assert!(
+            Server::stream_wal_record_with_limit(
+                io::sink(),
+                7,
+                &request,
+                None,
+                expected.len() as u64,
+            )
+            .is_ok()
+        );
+        assert!(
+            Server::stream_wal_record_with_limit(
+                io::sink(),
+                7,
+                &request,
+                None,
+                expected.len() as u64 - 1,
+            )
+            .is_err()
+        );
+
+        let changed = RpcRequest {
+            id: request.id,
+            method: request.method.clone(),
+            params: json!({"snapshot":{"corpusId":"edited","facts":[]}}),
+        };
+        let changed = Server::stream_wal_record(io::sink(), 7, &changed, None).unwrap();
+        assert_eq!(counted.bytes, changed.bytes);
+        assert_ne!(counted.record_digest, changed.record_digest);
+        assert!(Server::require_same_wal_record(&counted, &changed).is_err());
+
+        let mut production_limit = LimitedHashWriter::new(io::sink(), MAX_WAL_RECORD_BYTES, None);
+        production_limit.bytes = MAX_WAL_RECORD_BYTES - 1;
+        assert_eq!(production_limit.write(b"x").unwrap(), 1);
+        assert_eq!(production_limit.bytes, MAX_WAL_RECORD_BYTES);
+        assert!(production_limit.write(b"y").is_err());
+
+        let mut overflow = LimitedHashWriter::new(io::sink(), u64::MAX, None);
+        overflow.bytes = u64::MAX;
+        assert!(overflow.write(b"x").is_err());
+    }
+
+    #[test]
+    fn wal_record_stream_propagates_partial_writer_failure_without_evidence() {
+        struct FailAfter {
+            remaining: usize,
+        }
+
+        impl Write for FailAfter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(io::Error::other("injected partial write"));
+                }
+                let written = bytes.len().min(self.remaining);
+                self.remaining -= written;
+                Ok(written)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let request = RpcRequest {
+            id: 19,
+            method: "memory_save".to_string(),
+            params: json!({"snapshot":{"corpusId":"corpus","facts":[]}}),
+        };
+        assert!(
+            Server::stream_wal_record(
+                FailAfter { remaining: 17 },
+                7,
+                &request,
+                Some(Sha256::new()),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn strict_lf_framer_hashes_exact_frames_without_confusing_escaped_lf() {
+        let raw = b"{\"value\":\"line\\ninside\"}\n{\"value\":2}\n";
+        let expected = [
+            b"{\"value\":\"line\\ninside\"}".as_slice(),
+            b"{\"value\":2}".as_slice(),
+        ];
+        let mut source = BufReader::new(raw.as_slice());
+        let mut wal_hasher = Sha256::new();
+        let mut total = 0_u64;
+        for expected_payload in expected {
+            let mut record = StrictLfRecordReader::new(&mut source, 128, &mut wal_hasher);
+            let mut payload = Vec::new();
+            record.read_to_end(&mut payload).unwrap();
+            let evidence = record.finish().unwrap();
+            assert_eq!(payload, expected_payload);
+            let mut framed = expected_payload.to_vec();
+            framed.push(b'\n');
+            assert_eq!(evidence.bytes, framed.len() as u64);
+            assert_eq!(evidence.digest, Server::digest_bytes(&framed));
+            total += evidence.bytes;
+        }
+        assert!(source.fill_buf().unwrap().is_empty());
+        assert_eq!(total, raw.len() as u64);
+        assert_eq!(
+            wal_hasher.finalize().as_slice(),
+            Sha256::digest(raw).as_slice()
+        );
+    }
+
+    #[test]
+    fn strict_lf_framer_rejects_partial_blank_and_record_limit_plus_one() {
+        fn frame(raw: &[u8], limit: u64) -> io::Result<(Vec<u8>, WalRecordReadEvidence)> {
+            let mut source = BufReader::new(raw);
+            let mut wal_hasher = Sha256::new();
+            let mut record = StrictLfRecordReader::new(&mut source, limit, &mut wal_hasher);
+            let mut payload = Vec::new();
+            record.read_to_end(&mut payload)?;
+            Ok((payload, record.finish()?))
+        }
+
+        let (payload, evidence) = frame(b"{}\n", 3).unwrap();
+        assert_eq!(payload, b"{}");
+        assert_eq!(evidence.bytes, 3);
+        assert!(frame(b"{}\n", 2).is_err(), "record max+1");
+        assert!(frame(b"{}", 3).is_err(), "missing final LF");
+        assert!(frame(b"\n", 1).is_err(), "blank record");
     }
 
     fn reference_cosine(query: &[f64], vector: &[f64]) -> f64 {
