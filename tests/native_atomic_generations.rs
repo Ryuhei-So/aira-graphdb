@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 #[cfg(target_os = "linux")]
@@ -20,6 +20,8 @@ use std::os::unix::process::ExitStatusExt;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+use aira_graphdb::native_persistence_contract::BATCH_COMMIT_PHASES;
 
 struct TempDb {
     dir: PathBuf,
@@ -117,6 +119,36 @@ impl NativeProcess {
         stdin.flush().expect("flush request");
     }
 
+    fn send_with_progress(&mut self, request: Value) -> (Vec<Value>, Value) {
+        let line = request.to_string();
+        let stdin = self.stdin.as_mut().expect("native stdin is open");
+        stdin.write_all(line.as_bytes()).expect("write request");
+        stdin.write_all(b"\n").expect("write request newline");
+        stdin.flush().expect("flush request");
+
+        let mut progress = Vec::new();
+        loop {
+            let mut line = String::new();
+            let read = self
+                .stdout
+                .read_line(&mut line)
+                .expect("read native progress or terminal response");
+            assert_ne!(read, 0, "native stdout closed before terminal response");
+            assert!(
+                line.ends_with('\n'),
+                "native emitted a partial output frame"
+            );
+            let value: Value =
+                serde_json::from_str(line.trim_end()).expect("native output is JSON");
+            if value.get("ok").is_some() {
+                return (progress, value);
+            }
+            assert_eq!(value["schema"], json!("NativeProgressFrame@1"));
+            assert_eq!(value["kind"], json!("progress"));
+            progress.push(value);
+        }
+    }
+
     fn prepare_commit(&mut self, id: u64) -> Value {
         let response = self.send(json!({
             "id": id,
@@ -140,6 +172,15 @@ impl NativeProcess {
     fn finish(mut self) -> ExitStatus {
         self.stdin.take();
         self.child.wait().expect("native exits")
+    }
+
+    fn finish_with_stdout_tail(mut self) -> (ExitStatus, String) {
+        self.stdin.take();
+        let mut tail = String::new();
+        self.stdout
+            .read_to_string(&mut tail)
+            .expect("drain native stdout");
+        (self.child.wait().expect("native exits"), tail)
     }
 
     #[cfg(target_os = "linux")]
@@ -2266,6 +2307,105 @@ fn prepared_commit_is_idempotent_cas_bound_and_exposed_as_one_canonical_fact() {
 }
 
 #[test]
+fn negotiated_commit_emits_closed_progress_then_one_terminal_response() {
+    let db = TempDb::new("negotiated-progress");
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    let protocol = native.send(json!({"id":0,"method":"protocol_info","params":{}}));
+    assert_eq!(
+        protocol["result"]["progressPolicy"]["schema"],
+        json!("NativeProgressPolicy@1")
+    );
+    assert_eq!(
+        protocol["result"]["progressPolicySha256"],
+        json!("61ce9d5474d536d42b624706abe3a989f59a1c0887d9d63ca5a4dd69120a2f07")
+    );
+    assert_eq!(native.send(batch_begin(1))["ok"], json!(true));
+    assert_eq!(
+        native.send(vector_upsert(2, [1.0, 0.0], "progress"))["ok"],
+        json!(true)
+    );
+    let evidence = native.prepare_commit(3);
+    let (frames, terminal) = native.send_with_progress(json!({
+        "id": 4,
+        "method": "batch_commit",
+        "params": {"preparedCommitEvidence": evidence},
+        "progressProtocolVersion": 1
+    }));
+    assert_eq!(terminal["id"], json!(4));
+    assert_eq!(terminal["ok"], json!(true), "terminal response: {terminal}");
+    assert!(terminal.get("kind").is_none());
+    assert!(terminal.get("schema").is_none());
+
+    let mut unique_phases = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        assert_eq!(frame["id"], json!(4));
+        assert_eq!(frame["protocolVersion"], json!(1));
+        assert_eq!(frame["method"], json!("batch_commit"));
+        assert_eq!(frame["sequence"], json!((index + 1) as u64));
+        assert!(frame.get("ok").is_none());
+        assert!(frame.get("result").is_none());
+        assert!(frame.get("error").is_none());
+        let phase = frame["phase"].as_str().expect("closed progress phase");
+        if unique_phases.last().copied() != Some(phase) {
+            unique_phases.push(phase);
+        }
+    }
+    assert_eq!(unique_phases, BATCH_COMMIT_PHASES);
+    assert_eq!(frames.first().unwrap()["phase"], json!("admitted"));
+    assert_eq!(frames.last().unwrap()["phase"], json!("complete"));
+
+    let (status, tail) = native.finish_with_stdout_tail();
+    assert_eq!(status.code(), Some(0));
+    assert!(
+        tail.is_empty(),
+        "native emitted output after terminal: {tail}"
+    );
+}
+
+#[test]
+fn omitted_progress_negotiation_preserves_single_response_protocol() {
+    let db = TempDb::new("progress-omitted");
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(native.send(batch_begin(1))["ok"], json!(true));
+    assert_eq!(
+        native.send(vector_upsert(2, [1.0, 0.0], "no-progress"))["ok"],
+        json!(true)
+    );
+    let terminal = native.commit(3);
+    assert_eq!(terminal["ok"], json!(true));
+    assert!(terminal.get("kind").is_none());
+    let (status, tail) = native.finish_with_stdout_tail();
+    assert_eq!(status.code(), Some(0));
+    assert!(
+        tail.is_empty(),
+        "non-negotiated request emitted extra frames"
+    );
+}
+
+#[test]
+fn progress_negotiation_is_commit_only_and_exact_version() {
+    for (label, request) in [
+        (
+            "wrong-method",
+            json!({"id":1,"method":"ping","params":{},"progressProtocolVersion":1}),
+        ),
+        (
+            "wrong-version",
+            json!({"id":1,"method":"batch_commit","params":{},"progressProtocolVersion":2}),
+        ),
+    ] {
+        let db = TempDb::new(label);
+        let mut native = NativeProcess::spawn(&db.path, &[]);
+        let response = native.send(request);
+        assert_eq!(response["ok"], json!(false), "{label}: {response}");
+        assert!(response.get("result").is_none());
+        assert_ne!(native.finish().code(), Some(0));
+        assert!(!db.path.exists());
+        assert!(!db.path.with_extension("agdb.wal").exists());
+    }
+}
+
+#[test]
 fn different_transaction_evidence_cannot_publish_the_same_next_generation() {
     let first = TempDb::new("first-same-generation-transaction");
     let second = TempDb::new("second-same-generation-transaction");
@@ -2780,9 +2920,27 @@ fn prepare_and_commit_use_rolling_and_streamed_wal_evidence() {
         .map(|offset| persist_start + offset)
         .expect("persist boundary");
     let persist = &source[persist_start..persist_end];
-    assert!(persist.contains("scan_wal_with_identity(false)"));
+    assert!(persist.contains("scan_wal_with_identity_progress(false, progress)"));
     assert!(!persist.contains("Vec<WalRecord>"));
     assert!(!persist.contains("wal_raw"));
+}
+
+#[test]
+fn negotiated_progress_observes_every_output_sized_commit_stream() {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/aira-graphdb-native.rs");
+    let source = std::fs::read_to_string(source_path).expect("native source");
+    for required in [
+        "scan_wal_with_identity_progress(false, progress)",
+        "stream_vector_blob_temp(",
+        "validate_blob_streaming_progress(",
+        "stream_canonical_temp(",
+        "hash_wal_file_progress(&mut held_wal, progress)",
+    ] {
+        assert!(
+            source.contains(required),
+            "negotiated progress lost output-sized stream observation: {required}"
+        );
+    }
 }
 
 #[test]
