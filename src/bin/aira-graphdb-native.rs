@@ -22,7 +22,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use aira_graphdb::graph::{InMemoryGraphStore, Properties, Value as GraphValue};
-use aira_graphdb::native_persistence_contract::JSON_SAFE_INTEGER_MAX;
+use aira_graphdb::native_persistence_contract::{
+    COMMIT_EVIDENCE_SCHEMA, CommitEvidence, JSON_SAFE_INTEGER_MAX, PreparedCommitEvidence,
+};
 use aira_graphdb::query::{CypherDialect, execute_query_with_dialect};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -63,6 +65,66 @@ struct VectorBlobDescriptor {
     format: u16,
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredCommitEvidence {
+    schema: String,
+    transaction_nonce: String,
+    base_generation: u64,
+    generation: u64,
+    wal_sha256: String,
+    wal_bytes: u64,
+    wal_record_count: u64,
+}
+
+impl StoredCommitEvidence {
+    fn from_validated(evidence: &CommitEvidence) -> Self {
+        Self {
+            schema: COMMIT_EVIDENCE_SCHEMA.to_string(),
+            transaction_nonce: evidence.transaction_nonce().to_string(),
+            base_generation: evidence.base_generation(),
+            generation: evidence.generation(),
+            wal_sha256: evidence.wal_sha256().to_string(),
+            wal_bytes: evidence.wal_bytes(),
+            wal_record_count: evidence.wal_record_count(),
+        }
+    }
+
+    fn validate(&self) -> Result<CommitEvidence, String> {
+        if self.schema != COMMIT_EVIDENCE_SCHEMA {
+            return Err(format!("expected schema {COMMIT_EVIDENCE_SCHEMA}"));
+        }
+        let evidence = PreparedCommitEvidence::new(
+            self.transaction_nonce.clone(),
+            self.base_generation,
+            self.generation,
+            self.wal_sha256.clone(),
+            self.wal_bytes,
+            self.wal_record_count,
+        )?
+        .commit_evidence();
+        let encoded = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        if evidence.canonical_bytes() != encoded {
+            return Err("stored commit evidence is not canonical JSON".to_string());
+        }
+        Ok(evidence)
+    }
+}
+
+impl Serialize for StoredCommitEvidence {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("CommitEvidence", 7)?;
+        state.serialize_field("schema", &self.schema)?;
+        state.serialize_field("transactionNonce", &self.transaction_nonce)?;
+        state.serialize_field("baseGeneration", &self.base_generation)?;
+        state.serialize_field("generation", &self.generation)?;
+        state.serialize_field("walSha256", &self.wal_sha256)?;
+        state.serialize_field("walBytes", &self.wal_bytes)?;
+        state.serialize_field("walRecordCount", &self.wal_record_count)?;
+        state.end()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct VectorRecord {
@@ -101,6 +163,12 @@ struct State {
         skip_serializing_if = "Option::is_none"
     )]
     vector_blob: Option<VectorBlobDescriptor>,
+    #[serde(
+        default,
+        rename = "commitEvidence",
+        skip_serializing_if = "Option::is_none"
+    )]
+    commit_evidence: Option<StoredCommitEvidence>,
 }
 
 struct SortedMapView<'a, T>(&'a HashMap<String, T>);
@@ -166,11 +234,12 @@ struct PersistedStateView<'a> {
     generation: u64,
     vector_blob: &'a VectorBlobDescriptor,
     vector_refs: &'a HashMap<String, VectorBlobRef>,
+    commit_evidence: &'a StoredCommitEvidence,
 }
 
 impl Serialize for PersistedStateView<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("State", 8)?;
+        let mut state = serializer.serialize_struct("State", 9)?;
         state.serialize_field("nodes", &SortedMapView(&self.state.nodes))?;
         state.serialize_field("edges", &SortedMapView(&self.state.edges))?;
         state.serialize_field(
@@ -185,6 +254,7 @@ impl Serialize for PersistedStateView<'_> {
         state.serialize_field("checkpoints", &SortedMapView(&self.state.checkpoints))?;
         state.serialize_field("generation", &self.generation)?;
         state.serialize_field("vectorBlob", self.vector_blob)?;
+        state.serialize_field("commitEvidence", self.commit_evidence)?;
         state.end()
     }
 }
@@ -494,6 +564,7 @@ impl<W: Write> Write for LimitedHashWriter<W> {
 struct DurableGenerationToken {
     generation: u64,
     vector_blob: VectorBlobDescriptor,
+    commit_evidence: StoredCommitEvidence,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -529,12 +600,17 @@ struct CrashTracker {
     last_request_id: Arc<Mutex<Option<String>>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TransactionState {
     Idle,
     Active {
         base_generation: u64,
+        transaction_nonce: String,
         mutation_seen: bool,
+    },
+    Prepared {
+        evidence: PreparedCommitEvidence,
+        wal_identity: (u64, u64),
     },
     RecoveryPending {
         base_generation: u64,
@@ -630,6 +706,11 @@ const METHOD_SPECS: &[MethodSpec] = &[
     },
     MethodSpec {
         name: "batch_begin",
+        classification: "transaction",
+        wal: false,
+    },
+    MethodSpec {
+        name: "batch_prepare_commit",
         classification: "transaction",
         wal: false,
     },
@@ -977,6 +1058,7 @@ impl Server {
         } else {
             State::default()
         };
+        Self::validate_state_commit_evidence(&state)?;
         let legacy_vector_blob_path = db_path.with_extension("vblob");
         let vector_values = Self::load_vector_values(&state, &db_path, &legacy_vector_blob_path)?;
         for (key, values) in &vector_values {
@@ -1080,6 +1162,13 @@ impl Server {
 
     fn crypto_nonce() -> io::Result<String> {
         let mut bytes = [0u8; 16];
+        let mut source = fs::File::open("/dev/urandom")?;
+        source.read_exact(&mut bytes)?;
+        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    fn crypto_transaction_nonce() -> io::Result<String> {
+        let mut bytes = [0u8; 32];
         let mut source = fs::File::open("/dev/urandom")?;
         source.read_exact(&mut bytes)?;
         Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
@@ -1575,35 +1664,6 @@ impl Server {
         Ok(())
     }
 
-    fn write_durable_temp(target: &Path, bytes: &[u8], sync_stage: &str) -> io::Result<PathBuf> {
-        let tmp_path = Self::temporary_path(target, sync_stage)?;
-        let result = (|| {
-            Self::durability_failpoint(&format!("before_{sync_stage}_create"))?;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)
-                .map_err(|err| io::Error::other(format!("create temp file failed: {err}")))?;
-            Self::durability_failpoint(&format!("after_{sync_stage}_create"))?;
-            Self::durability_failpoint(&format!("before_{sync_stage}_write"))?;
-            file.write_all(bytes)
-                .map_err(|err| io::Error::other(format!("write temp file failed: {err}")))?;
-            file.flush()
-                .map_err(|err| io::Error::other(format!("flush temp file failed: {err}")))?;
-            Self::durability_failpoint(&format!("after_{sync_stage}_write"))?;
-            Self::durability_failpoint(&format!("before_{sync_stage}_fsync"))?;
-            file.sync_all()
-                .map_err(|err| io::Error::other(format!("sync temp file failed: {err}")))?;
-            Self::durability_failpoint(&format!("after_{sync_stage}_fsync"))?;
-            Ok::<(), io::Error>(())
-        })();
-        if let Err(err) = result {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err);
-        }
-        Ok(tmp_path)
-    }
-
     fn create_streaming_temp(target: &Path, sync_stage: &str) -> io::Result<(PathBuf, fs::File)> {
         let tmp_path = Self::temporary_path(target, sync_stage)?;
         Self::durability_failpoint(&format!("before_{sync_stage}_create"))?;
@@ -2023,6 +2083,7 @@ impl Server {
         let vector_blob_sha256 = Self::sha256_hex(&blob_raw);
         let state: State = serde_json::from_slice(&canonical_raw)
             .map_err(|err| io::Error::other(format!("parse canonical descriptor failed: {err}")))?;
+        Self::validate_state_commit_evidence(&state)?;
         if state.generation > JSON_SAFE_INTEGER_MAX {
             return Err(io::Error::other(
                 "canonical generation exceeds MAX_SAFE_INTEGER",
@@ -2145,22 +2206,174 @@ impl Server {
         Ok(values)
     }
 
-    fn persist(&mut self) -> io::Result<DurableGenerationToken> {
-        let start = std::time::Instant::now();
-        let current_generation = self.state.generation;
-        let transaction = self.transaction;
-        let TransactionState::Active {
-            base_generation,
-            mutation_seen: true,
-        } = transaction
-        else {
-            return Err(io::Error::other(
-                "generation publication requires an active mutated batch",
-            ));
+    fn validate_state_commit_evidence(state: &State) -> io::Result<Option<CommitEvidence>> {
+        let Some(stored) = state.commit_evidence.as_ref() else {
+            return Ok(None);
         };
-        if base_generation != current_generation {
+        if state.generation == 0 {
+            return Err(io::Error::other(
+                "legacy generation zero must not contain commit evidence",
+            ));
+        }
+        let evidence = stored
+            .validate()
+            .map_err(|error| io::Error::other(format!("invalid commit evidence: {error}")))?;
+        if evidence.generation() != state.generation {
+            return Err(io::Error::other(
+                "commit evidence generation does not match canonical generation",
+            ));
+        }
+        Ok(Some(evidence))
+    }
+
+    fn prepared_evidence_value(evidence: &PreparedCommitEvidence) -> Value {
+        serde_json::from_slice(&evidence.canonical_bytes())
+            .expect("validated prepared evidence is canonical JSON")
+    }
+
+    fn prepared_evidence_from_params(params: &Value) -> Result<PreparedCommitEvidence, AppError> {
+        let params = params.as_object().ok_or_else(|| {
+            Self::execution_client_error("batch_commit params must be an object".to_string())
+        })?;
+        if params.len() != 1 {
+            return Err(Self::execution_client_error(
+                "batch_commit requires only preparedCommitEvidence".to_string(),
+            ));
+        }
+        let raw = params
+            .get("preparedCommitEvidence")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                Self::execution_client_error(
+                    "batch_commit requires preparedCommitEvidence".to_string(),
+                )
+            })?;
+        let required = [
+            "schema",
+            "transactionNonce",
+            "baseGeneration",
+            "generation",
+            "walSha256",
+            "walBytes",
+            "walRecordCount",
+        ];
+        if raw.len() != required.len() || required.iter().any(|field| !raw.contains_key(*field)) {
+            return Err(Self::execution_client_error(
+                "preparedCommitEvidence has an invalid field set".to_string(),
+            ));
+        }
+        if raw.get("schema").and_then(Value::as_str) != Some("PreparedCommitEvidence@1") {
+            return Err(Self::execution_client_error(
+                "preparedCommitEvidence schema is invalid".to_string(),
+            ));
+        }
+        PreparedCommitEvidence::new(
+            raw.get("transactionNonce")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            raw.get("baseGeneration")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX),
+            raw.get("generation")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX),
+            raw.get("walSha256")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            raw.get("walBytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX),
+            raw.get("walRecordCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX),
+        )
+        .map_err(Self::execution_client_error)
+    }
+
+    fn prepare_commit(&mut self) -> io::Result<PreparedCommitEvidence> {
+        if let TransactionState::Prepared { evidence, .. } = &self.transaction {
+            return Ok(evidence.clone());
+        }
+        let (base_generation, transaction_nonce, mutation_seen) = match &self.transaction {
+            TransactionState::Active {
+                base_generation,
+                transaction_nonce,
+                mutation_seen,
+            } => (*base_generation, transaction_nonce.clone(), *mutation_seen),
+            _ => {
+                return Err(io::Error::other("prepare requires an active mutated batch"));
+            }
+        };
+        if !mutation_seen {
+            return Err(io::Error::other(
+                "prepare requires a successful durable mutation",
+            ));
+        }
+        if base_generation != self.state.generation {
             return Err(io::Error::other(
                 "active batch base generation does not match canonical generation",
+            ));
+        }
+        let (records, identity, raw) = self.read_wal_records_with_identity()?;
+        let identity = identity.ok_or_else(|| io::Error::other("durable WAL is missing"))?;
+        if self.wal_identity != Some(identity) || self.wal_bytes != raw.len() as u64 {
+            return Err(io::Error::other(
+                "durable WAL identity or byte count changed before prepare",
+            ));
+        }
+        if records.is_empty()
+            || records
+                .iter()
+                .any(|record| record.base_generation != base_generation)
+        {
+            return Err(io::Error::other(
+                "prepare requires one non-empty canonical WAL generation",
+            ));
+        }
+        let record_count = u64::try_from(records.len())
+            .map_err(|_| io::Error::other("WAL record count overflow"))?;
+        let evidence = PreparedCommitEvidence::new(
+            transaction_nonce,
+            base_generation,
+            base_generation
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("generation overflow"))?,
+            Self::digest_hex(&Self::digest_bytes(&raw)),
+            raw.len() as u64,
+            record_count,
+        )
+        .map_err(io::Error::other)?;
+        self.transaction = TransactionState::Prepared {
+            evidence: evidence.clone(),
+            wal_identity: identity,
+        };
+        Ok(evidence)
+    }
+
+    fn persist(
+        &mut self,
+        supplied_evidence: &PreparedCommitEvidence,
+    ) -> io::Result<DurableGenerationToken> {
+        let start = std::time::Instant::now();
+        let current_generation = self.state.generation;
+        let (prepared_evidence, prepared_identity) = match &self.transaction {
+            TransactionState::Prepared {
+                evidence,
+                wal_identity,
+            } => (evidence.clone(), *wal_identity),
+            _ => return Err(io::Error::other("generation publication requires prepare")),
+        };
+        if &prepared_evidence != supplied_evidence {
+            return Err(io::Error::other(
+                "batch_commit evidence does not match the prepared transaction",
+            ));
+        }
+        let base_generation = prepared_evidence.base_generation();
+        if base_generation != current_generation {
+            return Err(io::Error::other(
+                "prepared base generation does not match canonical generation",
             ));
         }
         let next_generation = current_generation
@@ -2182,6 +2395,17 @@ impl Server {
         }
         let wal_identity = wal_identity
             .ok_or_else(|| io::Error::other("durable WAL disappeared before publication"))?;
+        if wal_identity != prepared_identity
+            || wal_raw.len() as u64 != prepared_evidence.wal_bytes()
+            || wal_records.len() as u64 != prepared_evidence.wal_record_count()
+            || Self::digest_hex(&Self::digest_bytes(&wal_raw)) != prepared_evidence.wal_sha256()
+        {
+            return Err(io::Error::other(
+                "durable WAL does not match prepared commit evidence",
+            ));
+        }
+        let commit_evidence = prepared_evidence.commit_evidence();
+        let stored_commit_evidence = StoredCommitEvidence::from_validated(&commit_evidence);
 
         let db_path = self.require_db_path()?;
         let parent = Self::parent_dir(db_path);
@@ -2244,6 +2468,7 @@ impl Server {
             generation: next_generation,
             vector_blob: &blob_descriptor,
             vector_refs: &prepared_vector_refs,
+            commit_evidence: &stored_commit_evidence,
         };
         match fs::symlink_metadata(db_path) {
             Ok(metadata) => Self::require_regular_single_link(db_path, &metadata)?,
@@ -2276,6 +2501,7 @@ impl Server {
 
         self.state.generation = next_generation;
         self.state.vector_blob = Some(blob_descriptor.clone());
+        self.state.commit_evidence = Some(stored_commit_evidence.clone());
         for (key, blob_ref) in prepared_vector_refs {
             let vector = self
                 .state
@@ -2296,6 +2522,7 @@ impl Server {
         Ok(DurableGenerationToken {
             generation: next_generation,
             vector_blob: blob_descriptor,
+            commit_evidence: stored_commit_evidence,
         })
     }
 
@@ -2476,32 +2703,6 @@ impl Server {
         Self::sync_parent_dir(&parent)
     }
 
-    fn rewrite_wal_records(&self, records: &[WalRecord]) -> io::Result<()> {
-        if records.is_empty() {
-            return Err(io::Error::other(
-                "empty WAL rewrite requires exact retirement identity",
-            ));
-        }
-        let mut bytes = Vec::new();
-        for record in records {
-            let encoded = serde_json::to_vec(record)
-                .map_err(|err| io::Error::other(format!("serialize WAL failed: {err}")))?;
-            bytes.extend_from_slice(&encoded);
-            bytes.push(b'\n');
-        }
-        let wal_path = self.require_wal_path()?;
-        let tmp = Self::write_durable_temp(wal_path, &bytes, "wal_compact_sync")?;
-        Self::durability_failpoint("before_wal_rewrite_rename")?;
-        if let Err(err) = fs::rename(&tmp, wal_path) {
-            let _ = fs::remove_file(&tmp);
-            return Err(io::Error::other(format!("replace WAL failed: {err}")));
-        }
-        Self::durability_failpoint("after_wal_rewrite_rename")?;
-        Self::durability_failpoint("before_wal_rewrite_dir_fsync")?;
-        Self::sync_parent_dir(&Self::parent_dir(wal_path))?;
-        Self::durability_failpoint("after_wal_rewrite_dir_fsync")
-    }
-
     fn encoded_wal_records(records: &[WalRecord]) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         for record in records {
@@ -2656,23 +2857,9 @@ impl Server {
     }
 
     fn replay_wal(&mut self) -> io::Result<usize> {
-        let (records, mut wal_identity, mut wal_raw) = self.read_wal_records_with_identity()?;
+        let (records, wal_identity, wal_raw) = self.read_wal_records_with_identity()?;
         let generation = self.state.generation;
-        let mut replayable = Vec::new();
-        let mut skipped = 0usize;
-        for record in records {
-            match record.base_generation.cmp(&generation) {
-                std::cmp::Ordering::Less => skipped += 1,
-                std::cmp::Ordering::Equal => replayable.push(record),
-                std::cmp::Ordering::Greater => {
-                    return Err(io::Error::other(format!(
-                        "WAL base generation {} is newer than canonical generation {generation}",
-                        record.base_generation
-                    )));
-                }
-            }
-        }
-        if replayable.is_empty() {
+        if records.is_empty() {
             if let Some(identity) = wal_identity {
                 Self::durability_failpoint("before_wal_rewrite_retire")?;
                 self.retire_wal_exact(identity, &wal_raw)?;
@@ -2681,37 +2868,72 @@ impl Server {
             self.wal_bytes = 0;
             self.wal_identity = None;
             self.transaction = TransactionState::Idle;
-            eprintln!("[wal] recoveryPending=false skipped={skipped} bytes=0");
+            eprintln!("[wal] recoveryPending=false skipped=0 bytes=0");
             return Ok(0);
         }
-        if skipped > 0 {
-            self.rewrite_wal_records(&replayable)?;
-            let snapshot = self.read_wal_records_with_identity()?;
-            wal_identity = snapshot.1;
-            wal_raw = snapshot.2;
+        let wal_base_generation = records[0].base_generation;
+        if records
+            .iter()
+            .any(|record| record.base_generation != wal_base_generation)
+        {
+            return Err(io::Error::other("WAL contains mixed base generations"));
+        }
+        if wal_base_generation > generation {
+            return Err(io::Error::other(format!(
+                "WAL base generation {wal_base_generation} is newer than canonical generation {generation}",
+            )));
+        }
+        let wal_identity = wal_identity
+            .ok_or_else(|| io::Error::other("non-empty WAL has no durable identity"))?;
+        if wal_base_generation < generation {
+            if let Some(stored) = self.state.commit_evidence.as_ref() {
+                let evidence = stored.validate().map_err(|error| {
+                    io::Error::other(format!("invalid canonical commit evidence: {error}"))
+                })?;
+                let record_count = u64::try_from(records.len())
+                    .map_err(|_| io::Error::other("WAL record count overflow"))?;
+                if wal_base_generation != evidence.base_generation()
+                    || generation != evidence.generation()
+                    || wal_raw.len() as u64 != evidence.wal_bytes()
+                    || record_count != evidence.wal_record_count()
+                    || Self::digest_hex(&Self::digest_bytes(&wal_raw)) != evidence.wal_sha256()
+                {
+                    return Err(io::Error::other(
+                        "committed WAL residue does not match canonical commit evidence",
+                    ));
+                }
+            }
+            Self::durability_failpoint("before_wal_rewrite_retire")?;
+            self.retire_wal_exact(wal_identity, &wal_raw)?;
+            Self::durability_failpoint("after_wal_rewrite_retire")?;
+            self.wal_bytes = 0;
+            self.wal_identity = None;
+            self.transaction = TransactionState::Idle;
+            eprintln!(
+                "[wal] recoveryPending=false skipped={} bytes=0",
+                records.len()
+            );
+            return Ok(0);
         }
         self.wal_bytes = wal_raw.len() as u64;
-        let encoded = Self::encoded_wal_records(&replayable)?;
-        let digest = Self::digest_bytes(&encoded);
-        let (wal_device, wal_inode) = wal_identity.ok_or_else(|| {
-            io::Error::other("recovery WAL disappeared before entering recovery pending")
-        })?;
+        let digest = Self::digest_bytes(&wal_raw);
+        let (wal_device, wal_inode) = wal_identity;
         self.transaction = TransactionState::RecoveryPending {
             base_generation: generation,
             wal_digest: digest,
-            record_count: replayable.len(),
+            record_count: records.len(),
             wal_device,
             wal_inode,
         };
         eprintln!(
             "[wal] recoveryPending=true generation={} records={} skipped={} bytes={} digest={}",
             generation,
-            replayable.len(),
-            skipped,
+            records.len(),
+            0,
             self.wal_bytes,
             Self::digest_hex(&digest),
         );
-        Ok(replayable.len())
+        Ok(records.len())
     }
 
     fn discard_recovery(&mut self, params: &Value) -> Result<Value, AppError> {
@@ -3575,7 +3797,7 @@ impl Server {
                 }),
             );
         }
-        if matches!(self.transaction, TransactionState::RecoveryPending { .. })
+        if matches!(&self.transaction, TransactionState::RecoveryPending { .. })
             && !matches!(spec.classification, "health" | "recovery")
         {
             return self.response_for_result(
@@ -3587,7 +3809,7 @@ impl Server {
         }
         if is_mutation
             && !self.wal_replaying
-            && !matches!(self.transaction, TransactionState::Active { .. })
+            && !matches!(&self.transaction, TransactionState::Active { .. })
         {
             self.fatal = true;
             return self.response_for_result(
@@ -3632,12 +3854,13 @@ impl Server {
                         // it to publish a generation.  Legacy generation zero
                         // intentionally has no descriptor.
                         "vectorBlob": self.state.vector_blob.as_ref(),
-                        "state": match self.transaction {
+                        "state": match &self.transaction {
                             TransactionState::RecoveryPending { .. } => "recoveryPending",
                             TransactionState::Active { .. } => "active",
+                            TransactionState::Prepared { .. } => "prepared",
                             TransactionState::Idle => "idle",
                         },
-                        "recovery": match self.transaction {
+                        "recovery": match &self.transaction {
                             TransactionState::RecoveryPending { base_generation, wal_digest, record_count, .. } => Some(json!({
                                 "baseGeneration": base_generation,
                                 "walDigest": Self::digest_hex(&wal_digest),
@@ -3645,6 +3868,7 @@ impl Server {
                             })),
                             _ => None,
                         },
+                        "lastCommitEvidence": self.state.commit_evidence.as_ref(),
                         "limits": {
                             "vector": {
                                 "maxDimensions": MAX_VECTOR_DIMENSIONS,
@@ -3669,24 +3893,60 @@ impl Server {
                     Ok(protocol)
                 }
                 "batch_begin" => {
-                    if !matches!(self.transaction, TransactionState::Idle) {
+                    if !matches!(&self.transaction, TransactionState::Idle) {
                         Err(Self::execution_client_error(
                             "batch_begin requires an idle transaction".to_string(),
                         ))
                     } else {
+                        let transaction_nonce =
+                            Self::crypto_transaction_nonce().map_err(|error| {
+                                self.fatal = true;
+                                Self::execution_io_error(format!(
+                                    "generate transaction nonce failed: {error}"
+                                ))
+                            })?;
                         self.transaction = TransactionState::Active {
                             base_generation: self.state.generation,
+                            transaction_nonce: transaction_nonce.clone(),
                             mutation_seen: false,
                         };
-                        Ok(json!(null))
+                        Ok(json!({"transactionNonce": transaction_nonce}))
                     }
                 }
-                "batch_commit" => {
-                    let mutation_seen = match self.transaction {
-                        TransactionState::Active { mutation_seen, .. } => mutation_seen,
-                        TransactionState::Idle => {
+                "batch_prepare_commit" => {
+                    match &self.transaction {
+                        TransactionState::Active {
+                            mutation_seen: false,
+                            ..
+                        }
+                        | TransactionState::Idle => {
                             return Err(Self::execution_client_error(
-                                "batch_commit requires an active mutated batch".to_string(),
+                                "batch_prepare_commit requires an active mutated batch".to_string(),
+                            ));
+                        }
+                        TransactionState::RecoveryPending { .. } => {
+                            return Err(Self::execution_client_error(
+                                "batch_prepare_commit is unavailable during recovery".to_string(),
+                            ));
+                        }
+                        TransactionState::Active {
+                            mutation_seen: true,
+                            ..
+                        }
+                        | TransactionState::Prepared { .. } => {}
+                    }
+                    let evidence = self.prepare_commit().map_err(|error| {
+                        self.fatal = true;
+                        Self::execution_io_error(format!("batch prepare failed: {error}"))
+                    })?;
+                    Ok(Self::prepared_evidence_value(&evidence))
+                }
+                "batch_commit" => {
+                    match &self.transaction {
+                        TransactionState::Prepared { .. } => {}
+                        TransactionState::Idle | TransactionState::Active { .. } => {
+                            return Err(Self::execution_client_error(
+                                "batch_commit requires a prepared transaction".to_string(),
                             ));
                         }
                         TransactionState::RecoveryPending { .. } => {
@@ -3694,13 +3954,19 @@ impl Server {
                                 "batch_commit is unavailable during recovery".to_string(),
                             ));
                         }
+                    }
+                    let supplied_evidence = Self::prepared_evidence_from_params(&req.params)?;
+                    let prepared_evidence = match &self.transaction {
+                        TransactionState::Prepared { evidence, .. } => evidence,
+                        _ => unreachable!("prepared state checked above"),
                     };
-                    if !mutation_seen {
+                    if &supplied_evidence != prepared_evidence {
                         return Err(Self::execution_client_error(
-                            "batch_commit requires a successful mutation".to_string(),
+                            "batch_commit evidence does not match the prepared transaction"
+                                .to_string(),
                         ));
                     }
-                    let token = self.persist().map_err(|err| {
+                    let token = self.persist(&supplied_evidence).map_err(|err| {
                         self.fatal = true;
                         Self::execution_io_error(format!("batch_commit persist failed: {err}"))
                     })?;
@@ -4792,7 +5058,7 @@ fn run_normal(db_path: PathBuf) -> io::Result<()> {
         crash_tracker.set_last_request_id(req.id.to_string());
         let method_for_wal = Server::is_mutating_method(&req.method);
         let resp =
-            if method_for_wal && !matches!(server.transaction, TransactionState::Active { .. }) {
+            if method_for_wal && !matches!(&server.transaction, TransactionState::Active { .. }) {
                 // Admission must precede canonicalization: memory_save_file reads
                 // an external path and must do no I/O while idle or recovering.
                 server.handle_prepared(req)
@@ -5400,13 +5666,22 @@ mod tests {
         assert!(response.ok, "mutation failed: {response:?}");
     }
 
-    fn commit_batch(server: &mut Server) {
-        let response = server.handle(RpcRequest {
+    fn commit_batch(server: &mut Server) -> RpcResponse {
+        let prepared = server.handle(RpcRequest {
             id: 91,
-            method: "batch_commit".to_string(),
+            method: "batch_prepare_commit".to_string(),
             params: json!({}),
         });
+        assert!(prepared.ok, "batch_prepare_commit failed: {prepared:?}");
+        let response = server.handle(RpcRequest {
+            id: 92,
+            method: "batch_commit".to_string(),
+            params: json!({
+                "preparedCommitEvidence": prepared.result.expect("prepared evidence")
+            }),
+        });
         assert!(response.ok, "batch_commit failed: {response:?}");
+        response
     }
 
     #[test]
@@ -5540,12 +5815,7 @@ mod tests {
             }),
         };
         apply_mutation(&mut server, req);
-        let token_response = server.handle(RpcRequest {
-            id: 2,
-            method: "batch_commit".to_string(),
-            params: json!({}),
-        });
-        assert!(token_response.ok);
+        let token_response = commit_batch(&mut server);
         let token: DurableGenerationToken =
             serde_json::from_value(token_response.result.unwrap()).expect("generation token");
 
@@ -5775,6 +6045,7 @@ mod tests {
             "ping",
             "protocol_info",
             "batch_begin",
+            "batch_prepare_commit",
             "batch_commit",
             "recovery_discard",
             "upsert_nodes",
@@ -5820,6 +6091,7 @@ mod tests {
             if spec.wal {
                 server.transaction = TransactionState::Active {
                     base_generation: 0,
+                    transaction_nonce: "11".repeat(32),
                     mutation_seen: false,
                 };
             }
