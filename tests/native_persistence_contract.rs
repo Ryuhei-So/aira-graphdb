@@ -181,6 +181,10 @@ fn evidence_rejects_bypass_shapes_and_safe_integer_boundaries() {
 fn progress_policy_parses_only_the_exact_checked_in_artifact() {
     let raw = fixture("nativeProgressPolicy");
     let policy = NativeProgressPolicy::from_canonical_bytes(&raw).unwrap();
+    assert_eq!(
+        NativeProgressPolicy::checked_in_candidate().unwrap(),
+        policy
+    );
     assert_eq!(policy.canonical_bytes(), raw);
     assert_eq!(
         policy.sha256(),

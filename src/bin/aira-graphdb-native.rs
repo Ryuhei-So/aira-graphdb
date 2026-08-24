@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -24,7 +24,8 @@ use sha2::{Digest, Sha256};
 
 use aira_graphdb::graph::{InMemoryGraphStore, Properties, Value as GraphValue};
 use aira_graphdb::native_persistence_contract::{
-    COMMIT_EVIDENCE_SCHEMA, CommitEvidence, JSON_SAFE_INTEGER_MAX, PreparedCommitEvidence,
+    COMMIT_EVIDENCE_SCHEMA, CommitEvidence, JSON_SAFE_INTEGER_MAX, NativeProgressFrame,
+    NativeProgressPolicy, PreparedCommitEvidence, ProgressCounters,
 };
 use aira_graphdb::query::{CypherDialect, execute_query_with_dialect};
 
@@ -271,6 +272,52 @@ struct ArtifactEvidence {
     sha256: String,
 }
 
+struct ProgressWrite<'a, W> {
+    inner: W,
+    progress: &'a mut dyn CommitProgress,
+    bytes: u64,
+    reported_bytes: u64,
+}
+
+impl<'a, W> ProgressWrite<'a, W> {
+    fn new(inner: W, progress: &'a mut dyn CommitProgress) -> Self {
+        Self {
+            inner,
+            progress,
+            bytes: 0,
+            reported_bytes: 0,
+        }
+    }
+
+    fn finish(self) -> (W, u64) {
+        (self.inner, self.bytes)
+    }
+}
+
+impl<W: Write> Write for ProgressWrite<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.bytes = self
+            .bytes
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::other("progress byte count overflow"))?;
+        if self.bytes.saturating_sub(self.reported_bytes) >= 64 * 1024 {
+            self.progress.advance(0, None, self.bytes, None)?;
+            self.reported_bytes = self.bytes;
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()?;
+        if self.bytes != self.reported_bytes {
+            self.progress.advance(0, None, self.bytes, None)?;
+            self.reported_bytes = self.bytes;
+        }
+        Ok(())
+    }
+}
+
 impl<W> ArtifactHashWriter<W> {
     fn new(inner: W) -> Self {
         Self {
@@ -350,6 +397,27 @@ struct RpcRequest {
     method: String,
     #[serde(default)]
     params: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IncomingRpcRequest {
+    id: u64,
+    method: String,
+    #[serde(default)]
+    params: Value,
+    #[serde(default)]
+    progress_protocol_version: Option<u64>,
+}
+
+impl IncomingRpcRequest {
+    fn into_rpc(self) -> RpcRequest {
+        RpcRequest {
+            id: self.id,
+            method: self.method,
+            params: self.params,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -550,6 +618,53 @@ impl<R: BufRead> Read for StrictLfRecordReader<'_, R> {
             .ok_or_else(|| io::Error::other("WAL payload byte count overflow"))?;
         self.inner.consume(consumed);
         Ok(consumed)
+    }
+}
+
+struct ProgressRead<'a, R> {
+    inner: R,
+    progress: &'a mut dyn CommitProgress,
+    completed_units: u64,
+    completed_bytes: u64,
+    total_bytes: u64,
+}
+
+impl<'a, R> ProgressRead<'a, R> {
+    fn new(
+        inner: R,
+        progress: &'a mut dyn CommitProgress,
+        completed_units: u64,
+        completed_bytes: u64,
+        total_bytes: u64,
+    ) -> Self {
+        Self {
+            inner,
+            progress,
+            completed_units,
+            completed_bytes,
+            total_bytes,
+        }
+    }
+
+    fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for ProgressRead<'_, R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(output)?;
+        self.completed_bytes = self
+            .completed_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("WAL progress byte count overflow"))?;
+        self.progress.advance(
+            self.completed_units,
+            None,
+            self.completed_bytes,
+            Some(self.total_bytes),
+        )?;
+        Ok(read)
     }
 }
 
@@ -812,6 +927,255 @@ struct AppError {
     code: String,
     message: String,
     failure_class: Option<String>,
+}
+
+trait CommitProgress {
+    fn enter_phase(
+        &mut self,
+        phase: &str,
+        completed_units: u64,
+        total_units: Option<u64>,
+        completed_bytes: u64,
+        total_bytes: Option<u64>,
+    ) -> io::Result<()>;
+
+    fn advance(
+        &mut self,
+        completed_units: u64,
+        total_units: Option<u64>,
+        completed_bytes: u64,
+        total_bytes: Option<u64>,
+    ) -> io::Result<()>;
+}
+
+struct NoCommitProgress;
+
+impl CommitProgress for NoCommitProgress {
+    fn enter_phase(
+        &mut self,
+        _phase: &str,
+        _completed_units: u64,
+        _total_units: Option<u64>,
+        _completed_bytes: u64,
+        _total_bytes: Option<u64>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn advance(
+        &mut self,
+        _completed_units: u64,
+        _total_units: Option<u64>,
+        _completed_bytes: u64,
+        _total_bytes: Option<u64>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct NativeCommitProgress<'a, W: Write> {
+    output: &'a mut W,
+    policy: NativeProgressPolicy,
+    request_id: u64,
+    clock_ms: Box<dyn FnMut() -> io::Result<u64> + 'a>,
+    last_emitted_ms: u64,
+    phase_index: usize,
+    sequence: u64,
+    emitted_frames: u64,
+    completed_units: u64,
+    total_units: Option<u64>,
+    completed_bytes: u64,
+    total_bytes: Option<u64>,
+}
+
+impl<'a, W: Write> NativeCommitProgress<'a, W> {
+    fn start(output: &'a mut W, policy: NativeProgressPolicy, request_id: u64) -> io::Result<Self> {
+        let started = Instant::now();
+        Self::start_with_clock(
+            output,
+            policy,
+            request_id,
+            Box::new(move || {
+                u64::try_from(started.elapsed().as_millis())
+                    .map_err(|_| io::Error::other("progress monotonic elapsed time overflow"))
+            }),
+        )
+    }
+
+    fn start_with_clock(
+        output: &'a mut W,
+        policy: NativeProgressPolicy,
+        request_id: u64,
+        clock_ms: Box<dyn FnMut() -> io::Result<u64> + 'a>,
+    ) -> io::Result<Self> {
+        let mut progress = Self {
+            output,
+            policy,
+            request_id,
+            clock_ms,
+            last_emitted_ms: 0,
+            phase_index: 0,
+            sequence: 1,
+            emitted_frames: 0,
+            completed_units: 0,
+            total_units: None,
+            completed_bytes: 0,
+            total_bytes: None,
+        };
+        let admitted = NativeProgressFrame::admitted(request_id).map_err(io::Error::other)?;
+        progress.write_frame(admitted)?;
+        Ok(progress)
+    }
+
+    fn elapsed_ms(&mut self) -> io::Result<u64> {
+        (self.clock_ms)()
+    }
+
+    fn write_frame(&mut self, frame: NativeProgressFrame) -> io::Result<()> {
+        let raw = frame.canonical_bytes();
+        if raw.len() as u64 > self.policy.max_frame_bytes() {
+            return Err(io::Error::other("progress frame exceeds policy byte limit"));
+        }
+        let next_count = self
+            .emitted_frames
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("progress frame count overflow"))?;
+        if next_count > self.policy.max_frames() {
+            return Err(io::Error::other("progress frame count exceeds policy"));
+        }
+        self.output.write_all(&raw)?;
+        self.output.write_all(b"\n")?;
+        self.output.flush()?;
+        self.emitted_frames = next_count;
+        self.last_emitted_ms = self.elapsed_ms()?;
+        Ok(())
+    }
+
+    fn validate_counters(
+        &self,
+        completed_units: u64,
+        total_units: Option<u64>,
+        completed_bytes: u64,
+        total_bytes: Option<u64>,
+    ) -> io::Result<ProgressCounters> {
+        if completed_units < self.completed_units || completed_bytes < self.completed_bytes {
+            return Err(io::Error::other(
+                "progress counters regressed within a phase",
+            ));
+        }
+        if self.total_units.is_some() && total_units != self.total_units {
+            return Err(io::Error::other(
+                "progress unit total changed within a phase",
+            ));
+        }
+        if self.total_bytes.is_some() && total_bytes != self.total_bytes {
+            return Err(io::Error::other(
+                "progress byte total changed within a phase",
+            ));
+        }
+        ProgressCounters::new(completed_units, total_units, completed_bytes, total_bytes)
+            .map_err(io::Error::other)
+    }
+
+    fn remaining_reserve(&self, elapsed_ms: u64) -> io::Result<u64> {
+        let remaining_phases = self
+            .policy
+            .phases()
+            .len()
+            .saturating_sub(self.phase_index + 1) as u64;
+        let remaining_ms = self
+            .policy
+            .absolute_deadline_ms()
+            .saturating_sub(elapsed_ms);
+        let heartbeat = self.policy.heartbeat_interval_ms();
+        let remaining_heartbeats = remaining_ms
+            .checked_add(heartbeat - 1)
+            .and_then(|value| value.checked_div(heartbeat))
+            .ok_or_else(|| io::Error::other("progress reserve arithmetic overflow"))?;
+        remaining_phases
+            .checked_add(remaining_heartbeats)
+            .ok_or_else(|| io::Error::other("progress reserve arithmetic overflow"))
+    }
+}
+
+impl<W: Write> CommitProgress for NativeCommitProgress<'_, W> {
+    fn enter_phase(
+        &mut self,
+        phase: &str,
+        completed_units: u64,
+        total_units: Option<u64>,
+        completed_bytes: u64,
+        total_bytes: Option<u64>,
+    ) -> io::Result<()> {
+        let next_index = self
+            .phase_index
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("progress phase index overflow"))?;
+        if self.policy.phases().get(next_index).copied() != Some(phase) {
+            return Err(io::Error::other("progress phase skipped or regressed"));
+        }
+        let counters =
+            ProgressCounters::new(completed_units, total_units, completed_bytes, total_bytes)
+                .map_err(io::Error::other)?;
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("progress sequence overflow"))?;
+        let frame = NativeProgressFrame::progress(self.request_id, self.sequence, phase, counters)
+            .map_err(io::Error::other)?;
+        self.phase_index = next_index;
+        self.completed_units = completed_units;
+        self.total_units = total_units;
+        self.completed_bytes = completed_bytes;
+        self.total_bytes = total_bytes;
+        self.write_frame(frame)
+    }
+
+    fn advance(
+        &mut self,
+        completed_units: u64,
+        total_units: Option<u64>,
+        completed_bytes: u64,
+        total_bytes: Option<u64>,
+    ) -> io::Result<()> {
+        let counters =
+            self.validate_counters(completed_units, total_units, completed_bytes, total_bytes)?;
+        let unit_delta = completed_units.saturating_sub(self.completed_units);
+        let byte_delta = completed_bytes.saturating_sub(self.completed_bytes);
+        if unit_delta == 0 && byte_delta == 0 {
+            return Ok(());
+        }
+        let elapsed = self.elapsed_ms()?;
+        let since_last = elapsed.saturating_sub(self.last_emitted_ms);
+        let due_heartbeat = since_last >= self.policy.heartbeat_interval_ms();
+        let due_early = since_last >= self.policy.min_frame_interval_ms()
+            && (unit_delta >= self.policy.early_unit_delta()
+                || byte_delta >= self.policy.early_byte_delta());
+        if !due_heartbeat && !due_early {
+            return Ok(());
+        }
+        let reserve = self.remaining_reserve(elapsed)?;
+        if self
+            .emitted_frames
+            .checked_add(1)
+            .and_then(|count| count.checked_add(reserve))
+            .is_none_or(|required| required > self.policy.max_frames())
+        {
+            return Ok(());
+        }
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("progress sequence overflow"))?;
+        let phase = self.policy.phases()[self.phase_index];
+        let frame = NativeProgressFrame::progress(self.request_id, self.sequence, phase, counters)
+            .map_err(io::Error::other)?;
+        self.completed_units = completed_units;
+        self.total_units = total_units;
+        self.completed_bytes = completed_bytes;
+        self.total_bytes = total_bytes;
+        self.write_frame(frame)
+    }
 }
 
 #[derive(Clone)]
@@ -1914,9 +2278,10 @@ impl Server {
         result
     }
 
-    fn validate_blob_streaming(
+    fn validate_blob_streaming_progress(
         path: &Path,
         descriptor: &VectorBlobDescriptor,
+        progress: &mut dyn CommitProgress,
     ) -> io::Result<fs::File> {
         let mut file = Self::open_regular_nofollow(path)
             .map_err(|err| io::Error::other(format!("open vector blob failed: {err}")))?;
@@ -1934,6 +2299,7 @@ impl Server {
             prefix[prefix_used..prefix_used + copy].copy_from_slice(&buffer[..copy]);
             prefix_used += copy;
             writer.write_all(&buffer[..count])?;
+            progress.advance(0, None, writer.bytes, Some(descriptor.size))?;
         }
         let evidence = writer.finish();
         if prefix_used < Self::VECTOR_BLOB_MAGIC.len() + std::mem::size_of::<u16>() {
@@ -1965,31 +2331,70 @@ impl Server {
         db_path: &Path,
         vectors: &HashMap<String, VectorRecord>,
         vector_values: &HashMap<String, Vec<f64>>,
+        progress: &mut dyn CommitProgress,
     ) -> io::Result<(PathBuf, ArtifactEvidence, HashMap<String, VectorBlobRef>)> {
+        let total_units = u64::try_from(vectors.len())
+            .map_err(|_| io::Error::other("vector count does not fit progress counter"))?;
+        progress.enter_phase("prepare_refs", 0, Some(total_units), 0, None)?;
+        let mut keys: Vec<&String> = vectors.keys().collect();
+        keys.sort_unstable();
+        let mut offset = 0u64;
+        let mut refs = HashMap::with_capacity(vectors.len());
+        for (index, key) in keys.iter().enumerate() {
+            let vector = &vectors[*key];
+            let values = vector_values.get(*key).unwrap_or(&vector.values);
+            let len = u32::try_from(values.len())
+                .map_err(|_| io::Error::other("vector dimensions exceed u32"))?;
+            refs.insert((*key).clone(), VectorBlobRef { offset, len });
+            offset = offset
+                .checked_add((len as u64) * std::mem::size_of::<f64>() as u64)
+                .ok_or_else(|| io::Error::other("vector blob offset overflow"))?;
+            progress.advance(
+                u64::try_from(index + 1)
+                    .map_err(|_| io::Error::other("vector progress count overflow"))?,
+                Some(total_units),
+                offset,
+                None,
+            )?;
+        }
+        let header_bytes = u64::try_from(Self::VECTOR_BLOB_MAGIC.len() + 2)
+            .map_err(|_| io::Error::other("vector blob header size overflow"))?;
+        let total_bytes = header_bytes
+            .checked_add(offset)
+            .ok_or_else(|| io::Error::other("vector blob size overflow"))?;
         let (tmp_path, mut file) = Self::create_streaming_temp(db_path, "blob_temp_sync")?;
         let result = (|| {
+            progress.enter_phase("vector_write", 0, Some(total_units), 0, Some(total_bytes))?;
             Self::durability_failpoint("before_blob_temp_sync_write")?;
             let mut writer = ArtifactHashWriter::new(&mut file);
             writer.write_all(Self::VECTOR_BLOB_MAGIC)?;
             writer.write_all(&Self::VECTOR_BLOB_VERSION.to_le_bytes())?;
-            let mut offset = 0u64;
-            let mut refs = HashMap::with_capacity(vectors.len());
-            let mut keys: Vec<&String> = vectors.keys().collect();
-            keys.sort_unstable();
-            for key in keys {
-                let vector = &vectors[key];
-                let values = vector_values.get(key).unwrap_or(&vector.values);
-                let len = u32::try_from(values.len())
-                    .map_err(|_| io::Error::other("vector dimensions exceed u32"))?;
-                refs.insert(key.clone(), VectorBlobRef { offset, len });
+            let mut completed_bytes = header_bytes;
+            for (index, key) in keys.iter().enumerate() {
+                let vector = &vectors[*key];
+                let values = vector_values.get(*key).unwrap_or(&vector.values);
                 for value in values {
                     writer.write_all(&value.to_le_bytes())?;
                 }
-                offset = offset
-                    .checked_add((len as u64) * std::mem::size_of::<f64>() as u64)
-                    .ok_or_else(|| io::Error::other("vector blob offset overflow"))?;
+                completed_bytes = completed_bytes
+                    .checked_add((values.len() as u64) * std::mem::size_of::<f64>() as u64)
+                    .ok_or_else(|| io::Error::other("vector progress byte count overflow"))?;
+                progress.advance(
+                    u64::try_from(index + 1)
+                        .map_err(|_| io::Error::other("vector progress count overflow"))?,
+                    Some(total_units),
+                    completed_bytes,
+                    Some(total_bytes),
+                )?;
             }
             let evidence = writer.finish();
+            progress.enter_phase(
+                "vector_sync",
+                total_units,
+                Some(total_units),
+                evidence.bytes,
+                Some(total_bytes),
+            )?;
             Self::sync_streaming_temp(&mut file, &tmp_path, "blob_temp_sync")?;
             Ok::<_, io::Error>((evidence, refs))
         })();
@@ -2005,14 +2410,22 @@ impl Server {
     fn stream_canonical_temp(
         db_path: &Path,
         view: &PersistedStateView<'_>,
+        progress: &mut dyn CommitProgress,
     ) -> io::Result<(PathBuf, u64)> {
         let (tmp_path, mut file) = Self::create_streaming_temp(db_path, "json_temp_sync")?;
         let result = (|| {
+            progress.enter_phase("json_write", 0, None, 0, None)?;
             Self::durability_failpoint("before_json_temp_sync_write")?;
-            let mut writer = ArtifactHashWriter::new(&mut file);
-            serde_json::to_writer(&mut writer, view)
+            let writer = ArtifactHashWriter::new(&mut file);
+            let mut observed = ProgressWrite::new(writer, progress);
+            serde_json::to_writer(&mut observed, view)
                 .map_err(|err| io::Error::other(format!("serialize state failed: {err}")))?;
+            let (writer, observed_bytes) = observed.finish();
             let evidence = writer.finish();
+            if evidence.bytes != observed_bytes {
+                return Err(io::Error::other("JSON progress byte accounting diverged"));
+            }
+            progress.enter_phase("json_sync", 0, None, evidence.bytes, Some(evidence.bytes))?;
             Self::sync_streaming_temp(&mut file, &tmp_path, "json_temp_sync")?;
             Ok::<_, io::Error>(evidence.bytes)
         })();
@@ -2575,6 +2988,7 @@ impl Server {
     fn persist(
         &mut self,
         supplied_evidence: &PreparedCommitEvidence,
+        progress: &mut dyn CommitProgress,
     ) -> io::Result<DurableGenerationToken> {
         let start = std::time::Instant::now();
         let current_generation = self.state.generation;
@@ -2599,8 +3013,15 @@ impl Server {
         let next_generation = current_generation
             .checked_add(1)
             .ok_or_else(|| io::Error::other("generation overflow"))?;
+        progress.enter_phase(
+            "wal_verify",
+            0,
+            None,
+            0,
+            Some(prepared_evidence.wal_bytes()),
+        )?;
         let wal_evidence = self
-            .scan_wal_with_identity(false)?
+            .scan_wal_with_identity_progress(false, progress)?
             .ok_or_else(|| io::Error::other("durable WAL disappeared before publication"))?;
         if wal_evidence.base_generation != Some(current_generation) {
             return Err(io::Error::other(
@@ -2629,8 +3050,12 @@ impl Server {
         fs::create_dir_all(&parent)
             .map_err(|err| io::Error::other(format!("create database directory failed: {err}")))?;
 
-        let (blob_tmp, blob_evidence, prepared_vector_refs) =
-            Self::stream_vector_blob_temp(db_path, &self.state.vectors, &self.vector_values)?;
+        let (blob_tmp, blob_evidence, prepared_vector_refs) = Self::stream_vector_blob_temp(
+            db_path,
+            &self.state.vectors,
+            &self.vector_values,
+            progress,
+        )?;
         let blob_basename = format!(
             "{}.g{next_generation:020}.{}.vblob",
             db_path
@@ -2647,10 +3072,12 @@ impl Server {
         };
         let blob_path = parent.join(&blob_descriptor.basename);
 
+        progress.enter_phase("vector_publish", 0, None, 0, Some(blob_evidence.bytes))?;
         match fs::symlink_metadata(&blob_path) {
             Ok(metadata) => {
                 Self::require_regular_single_link(&blob_path, &metadata)?;
-                let file = Self::validate_blob_streaming(&blob_path, &blob_descriptor)?;
+                let file =
+                    Self::validate_blob_streaming_progress(&blob_path, &blob_descriptor, progress)?;
                 Self::durability_failpoint("blob_existing_sync")?;
                 file.sync_all().map_err(|err| {
                     io::Error::other(format!("sync existing vector blob failed: {err}"))
@@ -2669,13 +3096,20 @@ impl Server {
                     )));
                 }
                 Self::durability_failpoint("after_blob_rename")?;
-                Self::validate_blob_streaming(&blob_path, &blob_descriptor)?;
+                Self::validate_blob_streaming_progress(&blob_path, &blob_descriptor, progress)?;
             }
             Err(err) => {
                 let _ = fs::remove_file(&blob_tmp);
                 return Err(err);
             }
         }
+        progress.enter_phase(
+            "vector_dir_sync",
+            0,
+            None,
+            blob_evidence.bytes,
+            Some(blob_evidence.bytes),
+        )?;
         Self::durability_failpoint("before_blob_dir_fsync")?;
         Self::sync_parent_dir(&parent)?;
         Self::durability_failpoint("after_blob_dir_fsync")?;
@@ -2692,7 +3126,9 @@ impl Server {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
-        let (json_tmp, json_bytes) = Self::stream_canonical_temp(db_path, &persisted_state)?;
+        let (json_tmp, json_bytes) =
+            Self::stream_canonical_temp(db_path, &persisted_state, progress)?;
+        progress.enter_phase("json_publish", 0, None, json_bytes, Some(json_bytes))?;
         if let Err(err) = Self::durability_failpoint("before_json_rename") {
             let _ = fs::remove_file(&json_tmp);
             return Err(err);
@@ -2704,12 +3140,13 @@ impl Server {
             )));
         }
         Self::durability_failpoint("after_json_rename")?;
+        progress.enter_phase("json_dir_sync", 0, None, json_bytes, Some(json_bytes))?;
         Self::durability_failpoint("before_json_dir_fsync")?;
         Self::sync_parent_dir(&parent)?;
         Self::durability_failpoint("after_json_dir_fsync")?;
 
         Self::durability_failpoint("before_wal_retire")?;
-        self.retire_wal_exact(wal_evidence)
+        self.retire_wal_exact_progress(wal_evidence, progress)
             .map_err(|err| io::Error::other(format!("retire WAL failed: {err}")))?;
         Self::durability_failpoint("after_wal_retire")?;
 
@@ -2729,6 +3166,7 @@ impl Server {
         self.wal_bytes = 0;
         self.wal_record_count = 0;
         self.wal_hasher = Sha256::new();
+        progress.enter_phase("complete", 0, None, 0, None)?;
         let total_ms = start.elapsed().as_millis();
         eprintln!(
             "[persist] generation={} blobBytes={} blobSha256={} jsonBytes={} elapsedMs={total_ms}",
@@ -2802,21 +3240,43 @@ impl Server {
         file: &mut fs::File,
         allow_legacy_generation0: bool,
     ) -> io::Result<WalScanEvidence> {
-        Self::scan_wal_file_with_limits(
+        let mut progress = NoCommitProgress;
+        Self::scan_wal_file_with_limits_and_progress(
             file,
             allow_legacy_generation0,
             MAX_WAL_RECORD_BYTES,
             MAX_WAL_BYTES,
             MAX_WAL_RECORDS,
+            &mut progress,
         )
     }
 
+    #[cfg(test)]
     fn scan_wal_file_with_limits(
         file: &mut fs::File,
         allow_legacy_generation0: bool,
         record_limit: u64,
         wal_limit: u64,
         record_count_limit: u64,
+    ) -> io::Result<WalScanEvidence> {
+        let mut progress = NoCommitProgress;
+        Self::scan_wal_file_with_limits_and_progress(
+            file,
+            allow_legacy_generation0,
+            record_limit,
+            wal_limit,
+            record_count_limit,
+            &mut progress,
+        )
+    }
+
+    fn scan_wal_file_with_limits_and_progress(
+        file: &mut fs::File,
+        allow_legacy_generation0: bool,
+        record_limit: u64,
+        wal_limit: u64,
+        record_count_limit: u64,
+        progress: &mut dyn CommitProgress,
     ) -> io::Result<WalScanEvidence> {
         let before = file.metadata()?;
         let identity = Self::metadata_identity(&before);
@@ -2837,7 +3297,9 @@ impl Server {
             let record_reader =
                 StrictLfRecordReader::new(&mut source, record_limit, &mut wal_hasher);
             let guarded_record = GuardedJsonReader::new(record_reader);
-            let mut buffered_record = io::BufReader::with_capacity(64 * 1024, guarded_record);
+            let observed_record =
+                ProgressRead::new(guarded_record, progress, record_count, bytes, before.len());
+            let mut buffered_record = io::BufReader::with_capacity(64 * 1024, observed_record);
             let mut deserializer = serde_json::Deserializer::from_reader(&mut buffered_record);
             let envelope = ScannedWalEnvelope::deserialize(&mut deserializer)
                 .map_err(|error| io::Error::other(format!("parse WAL record failed: {error}")))?;
@@ -2845,7 +3307,7 @@ impl Server {
                 .end()
                 .map_err(|error| io::Error::other(format!("parse WAL record failed: {error}")))?;
             drop(deserializer);
-            let record_reader = buffered_record.into_inner().into_inner();
+            let record_reader = buffered_record.into_inner().into_inner().into_inner();
             let record_evidence = record_reader.finish()?;
             let (record_base_generation, request) = match envelope {
                 ScannedWalEnvelope {
@@ -2906,6 +3368,7 @@ impl Server {
             record_count = record_count
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("WAL aggregate record count overflow"))?;
+            progress.advance(record_count, None, bytes, Some(before.len()))?;
         }
         let after = source.get_ref().metadata()?;
         if Self::metadata_identity(&after) != identity
@@ -2928,6 +3391,15 @@ impl Server {
         &mut self,
         allow_legacy_generation0: bool,
     ) -> io::Result<Option<WalScanEvidence>> {
+        let mut progress = NoCommitProgress;
+        self.scan_wal_with_identity_progress(allow_legacy_generation0, &mut progress)
+    }
+
+    fn scan_wal_with_identity_progress(
+        &mut self,
+        allow_legacy_generation0: bool,
+        progress: &mut dyn CommitProgress,
+    ) -> io::Result<Option<WalScanEvidence>> {
         let wal_path = self.require_wal_path()?.to_path_buf();
         let mut file = match self.wal_file.take() {
             Some(file) => file,
@@ -2937,13 +3409,23 @@ impl Server {
                 Err(error) => return Err(io::Error::other(format!("open WAL failed: {error}"))),
             },
         };
-        let evidence = Self::scan_wal_file(&mut file, allow_legacy_generation0)?;
+        let evidence = Self::scan_wal_file_with_limits_and_progress(
+            &mut file,
+            allow_legacy_generation0,
+            MAX_WAL_RECORD_BYTES,
+            MAX_WAL_BYTES,
+            MAX_WAL_RECORDS,
+            progress,
+        )?;
         Self::validate_regular_path_identity(&wal_path, evidence.identity)?;
         self.wal_file = Some(file);
         Ok(Some(evidence))
     }
 
-    fn hash_wal_file(file: &mut fs::File) -> io::Result<((u64, u64), u64, [u8; 32])> {
+    fn hash_wal_file_progress(
+        file: &mut fs::File,
+        progress: &mut dyn CommitProgress,
+    ) -> io::Result<((u64, u64), u64, [u8; 32])> {
         let before = file.metadata()?;
         let identity = Self::metadata_identity(&before);
         if before.len() > MAX_WAL_BYTES {
@@ -2965,6 +3447,7 @@ impl Server {
                 return Err(io::Error::other("WAL exceeds aggregate byte limit"));
             }
             hasher.update(&buffer[..read]);
+            progress.advance(0, None, bytes, Some(before.len()))?;
         }
         let after = file.metadata()?;
         if Self::metadata_identity(&after) != identity
@@ -2977,6 +3460,15 @@ impl Server {
     }
 
     fn retire_wal_exact(&mut self, expected: WalScanEvidence) -> io::Result<()> {
+        let mut progress = NoCommitProgress;
+        self.retire_wal_exact_progress(expected, &mut progress)
+    }
+
+    fn retire_wal_exact_progress(
+        &mut self,
+        expected: WalScanEvidence,
+        progress: &mut dyn CommitProgress,
+    ) -> io::Result<()> {
         let wal_path = self.require_wal_path()?.to_path_buf();
         let mut held_wal = self
             .wal_file
@@ -2985,7 +3477,8 @@ impl Server {
         if Self::metadata_identity(&held_wal.metadata()?) != expected.identity {
             return Err(io::Error::other("WAL identity changed before retirement"));
         }
-        if Self::hash_wal_file(&mut held_wal)?
+        progress.enter_phase("wal_zero", 0, None, 0, Some(expected.bytes))?;
+        if Self::hash_wal_file_progress(&mut held_wal, progress)?
             != (expected.identity, expected.bytes, expected.digest)
         {
             return Err(io::Error::other("WAL content changed before retirement"));
@@ -2993,6 +3486,7 @@ impl Server {
         Self::durability_failpoint("before_wal_zero")?;
         held_wal.set_len(0)?;
         Self::durability_failpoint("after_wal_zero")?;
+        progress.enter_phase("wal_sync", 0, None, 0, Some(0))?;
         Self::durability_failpoint("before_wal_zero_sync")?;
         held_wal.sync_all()?;
         Self::durability_failpoint("after_wal_zero_sync")?;
@@ -4117,6 +4611,15 @@ impl Server {
     }
 
     fn handle_prepared(&mut self, req: RpcRequest) -> RpcResponse {
+        let mut progress = NoCommitProgress;
+        self.handle_prepared_with_progress(req, &mut progress)
+    }
+
+    fn handle_prepared_with_progress(
+        &mut self,
+        req: RpcRequest,
+        progress: &mut dyn CommitProgress,
+    ) -> RpcResponse {
         let is_mutation = Self::is_mutating_method(&req.method);
         let Some(spec) = Self::method_spec(&req.method) else {
             return self
@@ -4231,6 +4734,23 @@ impl Server {
                         if let Some(binding) = &handshake.legacy_binding_sha256 {
                             protocol["legacyBindingSha256"] = json!(binding);
                         }
+                    } else {
+                        let progress_policy = NativeProgressPolicy::checked_in_candidate()
+                            .map_err(|error| {
+                                Self::execution_io_error(format!(
+                                    "load native progress candidate failed: {error}"
+                                ))
+                            })?;
+                        let progress_policy_value: Value = serde_json::from_slice(
+                            &progress_policy.canonical_bytes(),
+                        )
+                        .map_err(|error| {
+                            Self::execution_io_error(format!(
+                                "parse native progress candidate failed: {error}"
+                            ))
+                        })?;
+                        protocol["progressPolicy"] = progress_policy_value;
+                        protocol["progressPolicySha256"] = json!(progress_policy.sha256());
                     }
                     Ok(protocol)
                 }
@@ -4348,7 +4868,7 @@ impl Server {
                                 .to_string(),
                         ));
                     }
-                    let token = self.persist(&supplied_evidence).map_err(|err| {
+                    let token = self.persist(&supplied_evidence, progress).map_err(|err| {
                         self.fatal = true;
                         Self::execution_io_error(format!("batch_commit persist failed: {err}"))
                     })?;
@@ -5397,7 +5917,7 @@ fn run_normal(db_path: PathBuf) -> io::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let req = match serde_json::from_str::<RpcRequest>(&line) {
+        let incoming = match serde_json::from_str::<IncomingRpcRequest>(&line) {
             Ok(req) => req,
             Err(err) => {
                 let _ = Server::append_request_audit_event_for_path(
@@ -5437,40 +5957,58 @@ fn run_normal(db_path: PathBuf) -> io::Result<()> {
                 continue;
             }
         };
+        let progress_protocol_version = incoming.progress_protocol_version;
+        let req = incoming.into_rpc();
         crash_tracker.set_last_request_id(req.id.to_string());
         let method_for_wal = Server::is_mutating_method(&req.method);
-        let resp =
-            if method_for_wal && !matches!(&server.transaction, TransactionState::Active { .. }) {
-                // Admission must precede canonicalization: memory_save_file reads
-                // an external path and must do no I/O while idle or recovering.
-                server.handle_prepared(req)
-            } else if method_for_wal {
-                match server.canonicalize_request(req.clone()) {
-                    Err(err) => {
+        let resp = if let Some(version) = progress_protocol_version {
+            if version != 1 || req.method != "batch_commit" {
+                server.fatal = true;
+                server.response_for_result(
+                    req.id,
+                    Err(Server::execution_client_error(
+                        "progressProtocolVersion 1 is reserved for batch_commit".to_string(),
+                    )),
+                )
+            } else {
+                let policy = NativeProgressPolicy::checked_in_candidate().map_err(|error| {
+                    io::Error::other(format!("load native progress candidate failed: {error}"))
+                })?;
+                let mut progress = NativeCommitProgress::start(&mut stdout, policy, req.id)?;
+                server.handle_prepared_with_progress(req, &mut progress)
+            }
+        } else if method_for_wal && !matches!(&server.transaction, TransactionState::Active { .. })
+        {
+            // Admission must precede canonicalization: memory_save_file reads
+            // an external path and must do no I/O while idle or recovering.
+            server.handle_prepared(req)
+        } else if method_for_wal {
+            match server.canonicalize_request(req.clone()) {
+                Err(err) => {
+                    server.fatal = true;
+                    server.response_for_result(req.id, Err(err))
+                }
+                Ok(canonical) => {
+                    let validation = server.validate_mutation_params(&canonical);
+                    if let Err(err) = validation {
                         server.fatal = true;
                         server.response_for_result(req.id, Err(err))
-                    }
-                    Ok(canonical) => {
-                        let validation = server.validate_mutation_params(&canonical);
-                        if let Err(err) = validation {
-                            server.fatal = true;
-                            server.response_for_result(req.id, Err(err))
-                        } else if let Err(err) = server.wal_append(&canonical) {
-                            server.fatal = true;
-                            server.response_for_result(
-                                req.id,
-                                Err(Server::execution_io_error(format!(
-                                    "durability failure: {err}"
-                                ))),
-                            )
-                        } else {
-                            server.handle_prepared(canonical)
-                        }
+                    } else if let Err(err) = server.wal_append(&canonical) {
+                        server.fatal = true;
+                        server.response_for_result(
+                            req.id,
+                            Err(Server::execution_io_error(format!(
+                                "durability failure: {err}"
+                            ))),
+                        )
+                    } else {
+                        server.handle_prepared(canonical)
                     }
                 }
-            } else {
-                server.handle_prepared(req)
-            };
+            }
+        } else {
+            server.handle_prepared(req)
+        };
         let payload = serde_json::to_string(&resp)
             .map_err(|err| io::Error::other(format!("serialize response failed: {err}")))?;
         if let Err(write_err) = stdout
@@ -5529,7 +6067,7 @@ fn run_descriptor_read(config: DescriptorReadConfig) -> io::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let req = match serde_json::from_str::<RpcRequest>(&line) {
+        let incoming = match serde_json::from_str::<IncomingRpcRequest>(&line) {
             Ok(req) => req,
             Err(err) => {
                 let response = RpcResponse {
@@ -5551,7 +6089,17 @@ fn run_descriptor_read(config: DescriptorReadConfig) -> io::Result<()> {
                 continue;
             }
         };
-        let response = server.handle_prepared(req);
+        let response = if incoming.progress_protocol_version.is_some() {
+            server.fatal = true;
+            server.response_for_result(
+                incoming.id,
+                Err(Server::execution_client_error(
+                    "progress is unavailable in descriptor read-only mode".to_string(),
+                )),
+            )
+        } else {
+            server.handle_prepared(incoming.into_rpc())
+        };
         let payload = serde_json::to_string(&response)
             .map_err(|err| io::Error::other(format!("serialize response failed: {err}")))?;
         output_bytes = account_descriptor_output(output_bytes, payload.len())?;
@@ -5628,8 +6176,10 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::BTreeSet;
     use std::io::BufReader;
+    use std::rc::Rc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(prefix: &str) -> PathBuf {
@@ -5660,6 +6210,115 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn progress_emitter_is_monotonic_cadenced_and_never_heartbeats_without_advance() {
+        let now = Rc::new(Cell::new(0u64));
+        let clock = Rc::clone(&now);
+        let policy = NativeProgressPolicy::checked_in_candidate().unwrap();
+        let mut output = Vec::new();
+        let mut progress = NativeCommitProgress::start_with_clock(
+            &mut output,
+            policy,
+            42,
+            Box::new(move || Ok(clock.get())),
+        )
+        .unwrap();
+        progress
+            .enter_phase("wal_verify", 0, None, 0, Some(200_000_000))
+            .unwrap();
+        let after_entries = progress.emitted_frames;
+
+        now.set(500);
+        progress
+            .advance(0, None, 67_108_863, Some(200_000_000))
+            .unwrap();
+        assert_eq!(progress.emitted_frames, after_entries);
+        progress
+            .advance(0, None, 67_108_864, Some(200_000_000))
+            .unwrap();
+        assert_eq!(progress.emitted_frames, after_entries + 1);
+
+        now.set(5_499);
+        progress
+            .advance(0, None, 67_108_865, Some(200_000_000))
+            .unwrap();
+        assert_eq!(progress.emitted_frames, after_entries + 1);
+        now.set(5_500);
+        progress
+            .advance(0, None, 67_108_866, Some(200_000_000))
+            .unwrap();
+        assert_eq!(progress.emitted_frames, after_entries + 2);
+
+        now.set(10_500);
+        progress
+            .advance(0, None, 67_108_866, Some(200_000_000))
+            .unwrap();
+        assert_eq!(progress.emitted_frames, after_entries + 2);
+        assert!(
+            progress
+                .advance(0, None, 67_108_865, Some(200_000_000))
+                .is_err()
+        );
+    }
+
+    struct FailAfterBytes {
+        remaining: usize,
+    }
+
+    impl Write for FailAfterBytes {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "closed progress pipe",
+                ));
+            }
+            let written = bytes.len().min(self.remaining);
+            self.remaining -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn progress_output_failure_is_fatal_to_the_emitter() {
+        let policy = NativeProgressPolicy::checked_in_candidate().unwrap();
+        let admitted_bytes = NativeProgressFrame::admitted(7)
+            .unwrap()
+            .canonical_bytes()
+            .len()
+            + 1;
+        let mut output = FailAfterBytes {
+            remaining: admitted_bytes,
+        };
+        let mut progress =
+            NativeCommitProgress::start_with_clock(&mut output, policy, 7, Box::new(|| Ok(0)))
+                .unwrap();
+        let error = progress
+            .enter_phase("wal_verify", 0, None, 0, Some(1))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn progress_negotiation_rejects_duplicates_without_tightening_legacy_unknown_fields() {
+        assert!(
+            serde_json::from_str::<IncomingRpcRequest>(
+                r#"{"id":1,"method":"batch_commit","params":{},"progressProtocolVersion":1,"progressProtocolVersion":1}"#,
+            )
+            .is_err()
+        );
+        let legacy = serde_json::from_str::<IncomingRpcRequest>(
+            r#"{"id":1,"method":"ping","params":{},"legacyIgnoredField":true}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.method, "ping");
+        assert_eq!(legacy.progress_protocol_version, None);
     }
 
     fn vector_record(id: &str, corpus_id: &str, namespace: &str) -> VectorRecord {

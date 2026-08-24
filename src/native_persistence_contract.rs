@@ -1,6 +1,10 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
+
+const NATIVE_PERSISTENCE_FIXTURES: &[u8] =
+    include_bytes!("../spec/contracts/native-persistence/canonical-fixtures.v1.json");
 
 pub const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
 pub const PREPARED_COMMIT_EVIDENCE_SCHEMA: &str = "PreparedCommitEvidence@1";
@@ -159,6 +163,22 @@ struct RawNativeProgressMethodPolicy {
 struct RawPhaseHardDeadline {
     phase: String,
     deadline_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativePersistenceFixtureManifest {
+    schema: String,
+    policy_purpose: String,
+    fixtures: Vec<NativePersistenceFixture>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativePersistenceFixture {
+    name: String,
+    canonical_base64: String,
+    sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -492,6 +512,33 @@ impl TryFrom<RawNativeProgressPolicy> for NativeProgressPolicy {
 }
 
 impl NativeProgressPolicy {
+    pub fn checked_in_candidate() -> Result<Self, String> {
+        let manifest: NativePersistenceFixtureManifest =
+            serde_json::from_slice(NATIVE_PERSISTENCE_FIXTURES)
+                .map_err(|error| error.to_string())?;
+        if manifest.schema != "NativePersistenceCanonicalFixtures@1"
+            || manifest.policy_purpose != "contract-only-unmeasured-not-production-policy"
+        {
+            return Err("native progress candidate manifest purpose is invalid".to_string());
+        }
+        let fixture = manifest
+            .fixtures
+            .iter()
+            .find(|fixture| fixture.name == "nativeProgressPolicy")
+            .ok_or_else(|| "native progress candidate fixture is missing".to_string())?;
+        let raw = STANDARD
+            .decode(&fixture.canonical_base64)
+            .map_err(|error| error.to_string())?;
+        let digest = Sha256::digest(&raw)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if digest != fixture.sha256 {
+            return Err("native progress candidate digest is invalid".to_string());
+        }
+        Self::from_canonical_bytes(&raw)
+    }
+
     pub fn from_canonical_bytes(raw: &[u8]) -> Result<Self, String> {
         let parsed: RawNativeProgressPolicy =
             serde_json::from_slice(raw).map_err(|error| error.to_string())?;
@@ -553,6 +600,38 @@ impl NativeProgressPolicy {
     pub fn sha256(&self) -> String {
         let digest = Sha256::digest(self.canonical_bytes());
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    pub fn phases(&self) -> &'static [&'static str] {
+        &BATCH_COMMIT_PHASES
+    }
+
+    pub fn min_frame_interval_ms(&self) -> u64 {
+        self.method.min_frame_interval_ms
+    }
+
+    pub fn heartbeat_interval_ms(&self) -> u64 {
+        self.method.heartbeat_interval_ms
+    }
+
+    pub fn absolute_deadline_ms(&self) -> u64 {
+        self.method.absolute_deadline_ms
+    }
+
+    pub fn early_byte_delta(&self) -> u64 {
+        self.method.early_byte_delta
+    }
+
+    pub fn early_unit_delta(&self) -> u64 {
+        self.method.early_unit_delta
+    }
+
+    pub fn max_frames(&self) -> u64 {
+        self.method.max_frames
+    }
+
+    pub fn max_frame_bytes(&self) -> u64 {
+        self.method.max_frame_bytes
     }
 }
 
