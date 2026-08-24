@@ -115,6 +115,26 @@ impl NativeProcess {
         stdin.flush().expect("flush request");
     }
 
+    fn prepare_commit(&mut self, id: u64) -> Value {
+        let response = self.send(json!({
+            "id": id,
+            "method": "batch_prepare_commit",
+            "params": {}
+        }));
+        assert_eq!(response["ok"], json!(true), "prepare failed: {response}");
+        response["result"].clone()
+    }
+
+    fn commit(&mut self, id: u64) -> Value {
+        let evidence = self.prepare_commit(id);
+        self.send(batch_commit(id, evidence))
+    }
+
+    fn send_commit_without_read(&mut self, id: u64) {
+        let evidence = self.prepare_commit(id);
+        self.send_without_read(batch_commit(id, evidence));
+    }
+
     fn finish(mut self) -> ExitStatus {
         self.stdin.take();
         self.child.wait().expect("native exits")
@@ -236,7 +256,15 @@ fn bulk_vector_upsert(id: u64, count: usize) -> Value {
     })
 }
 
-fn batch_commit(id: u64) -> Value {
+fn batch_commit(id: u64, evidence: Value) -> Value {
+    json!({
+        "id": id,
+        "method": "batch_commit",
+        "params": {"preparedCommitEvidence": evidence}
+    })
+}
+
+fn batch_commit_without_evidence(id: u64) -> Value {
     json!({"id": id, "method": "batch_commit", "params": {}})
 }
 
@@ -426,7 +454,7 @@ fn seed_vector(path: &Path) {
         native.send(vector_upsert(1, [1.0, 0.0], "old"))["ok"],
         json!(true)
     );
-    let commit = native.send(batch_commit(2));
+    let commit = native.commit(2);
     assert_eq!(commit["ok"], json!(true));
     assert_eq!(commit["result"]["generation"], json!(1));
     assert_eq!(native.finish().code(), Some(0));
@@ -477,7 +505,7 @@ fn committed_generation_has_sole_pointer_and_durable_blob_descriptor() {
         native.send(vector_upsert(1, [1.0, 0.0], "old"))["ok"],
         json!(true)
     );
-    let commit = native.send(batch_commit(2));
+    let commit = native.commit(2);
     assert_eq!(commit["result"]["generation"], json!(1));
     let descriptor = &commit["result"]["vectorBlob"];
     let basename = descriptor["basename"].as_str().expect("blob basename");
@@ -631,7 +659,7 @@ fn every_native_commit_kill_point_reopens_a_complete_vector_generation() {
             native.send(vector_upsert(3, [0.0, 1.0], "new"))["ok"],
             json!(true)
         );
-        native.send_without_read(batch_commit(4));
+        native.send_commit_without_read(4);
         assert_native_killed(native.finish(), stage);
         if stage == "after_json_dir_fsync" {
             assert!(
@@ -677,7 +705,7 @@ fn injected_write_sync_rename_and_directory_failures_never_return_a_token() {
                 native.send(vector_upsert(6, [0.0, 1.0], "new"))["ok"],
                 json!(true)
             );
-            let commit = native.send(batch_commit(7));
+            let commit = native.commit(7);
             assert_eq!(commit["ok"], json!(false), "failpoint {failpoint}");
             assert!(
                 commit.get("result").is_none(),
@@ -714,7 +742,7 @@ fn wal_retirement_substages_reopen_complete_generation_and_cleanup_orphan() {
             native.send(vector_upsert(3, [0.0, 1.0], "new"))["ok"],
             json!(true)
         );
-        native.send_without_read(batch_commit(4));
+        native.send_commit_without_read(4);
         assert_native_killed(native.finish(), stage);
         assert_eq!(generation(&db.path), 2, "{stage} must publish N+1 first");
 
@@ -753,7 +781,7 @@ fn injected_wal_retire_substage_failures_never_return_token() {
             native.send(vector_upsert(3, [0.0, 1.0], "new"))["ok"],
             json!(true)
         );
-        let commit = native.send(batch_commit(4));
+        let commit = native.commit(4);
         assert_eq!(commit["ok"], json!(false), "{stage}: {commit}");
         assert!(commit.get("result").is_none(), "{stage}: {commit}");
         assert_ne!(native.finish().code(), Some(0), "{stage} stayed alive");
@@ -1444,7 +1472,7 @@ fn empty_wal_after_before_write_failure_is_retired_before_fresh_commit() {
         let mut fresh = NativeProcess::spawn(&db.path, &[]);
         assert_eq!(fresh.send(batch_begin(4))["ok"], json!(true));
         assert_eq!(fresh.send(mutation)["ok"], json!(true));
-        let commit = fresh.send(batch_commit(5));
+        let commit = fresh.commit(5);
         assert_eq!(commit["ok"], json!(true), "{label} fresh commit: {commit}");
         assert_eq!(commit["result"]["generation"], json!(1));
         assert_eq!(fresh.finish().code(), Some(0));
@@ -1745,7 +1773,7 @@ fn valid_base_wal_enters_recovery_pending_without_exposing_or_replaying_data() {
         ))["ok"],
         json!(true)
     );
-    let commit = unrelated.send(batch_commit(108));
+    let commit = unrelated.commit(108);
     assert_eq!(
         commit["ok"],
         json!(true),
@@ -2072,9 +2100,21 @@ fn recovery_quarantine_killpoints_leave_a_recoverable_boundary() {
 }
 
 #[test]
-fn committed_wal_is_skipped_but_future_and_malformed_wal_fail_closed() {
+fn legacy_committed_wal_is_skipped_but_future_and_malformed_wal_fail_closed() {
     let skipped = TempDb::new("wal-skipped");
     seed_vector(&skipped.path);
+    let mut legacy: Value =
+        serde_json::from_slice(&std::fs::read(&skipped.path).expect("read committed canonical"))
+            .expect("parse committed canonical");
+    legacy
+        .as_object_mut()
+        .expect("canonical object")
+        .remove("commitEvidence");
+    std::fs::write(
+        &skipped.path,
+        serde_json::to_vec(&legacy).expect("encode legacy canonical"),
+    )
+    .expect("write legacy canonical");
     let already_committed = json!({
         "id": 7,
         "method": "memory_upsert",
@@ -2129,6 +2169,192 @@ fn committed_wal_is_skipped_but_future_and_malformed_wal_fail_closed() {
 }
 
 #[test]
+fn prepared_commit_is_idempotent_cas_bound_and_exposed_as_one_canonical_fact() {
+    let db = TempDb::new("prepared-commit-evidence");
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    let begin = native.send(batch_begin(1));
+    let nonce = begin["result"]["transactionNonce"]
+        .as_str()
+        .expect("transaction nonce");
+    assert_eq!(nonce.len(), 64);
+    assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(
+        native.send(vector_upsert(2, [1.0, 0.0], "evidence"))["ok"],
+        json!(true)
+    );
+
+    let prepared = native.prepare_commit(3);
+    assert_eq!(native.prepare_commit(4), prepared, "prepare is idempotent");
+    assert_eq!(prepared["transactionNonce"], json!(nonce));
+    assert_eq!(prepared["baseGeneration"], json!(0));
+    assert_eq!(prepared["generation"], json!(1));
+    assert!(prepared["walBytes"].as_u64().unwrap() > 0);
+    assert_eq!(prepared["walRecordCount"], json!(1));
+    let info = native.send(json!({"id":5,"method":"protocol_info","params":{}}));
+    assert_eq!(info["result"]["state"], json!("prepared"));
+    assert_eq!(info["result"]["lastCommitEvidence"], Value::Null);
+
+    let mut changed = prepared.clone();
+    changed["transactionNonce"] = json!("22".repeat(32));
+    let rejected = native.send(batch_commit(6, changed));
+    assert_eq!(rejected["ok"], json!(false));
+    assert_eq!(generation(&db.path), 0);
+
+    let committed = native.send(batch_commit(7, prepared.clone()));
+    assert_eq!(committed["ok"], json!(true));
+    let mut expected_commit = prepared;
+    expected_commit["schema"] = json!("CommitEvidence@1");
+    assert_eq!(committed["result"]["commitEvidence"], expected_commit);
+    assert_eq!(native.finish().code(), Some(0));
+
+    let canonical: Value = serde_json::from_slice(&std::fs::read(&db.path).unwrap()).unwrap();
+    assert_eq!(canonical["commitEvidence"], expected_commit);
+    let mut reopened = NativeProcess::spawn(&db.path, &[]);
+    let reopened_info = reopened.send(json!({"id":8,"method":"protocol_info","params":{}}));
+    assert_eq!(reopened_info["result"]["generation"], json!(1));
+    assert_eq!(
+        reopened_info["result"]["lastCommitEvidence"],
+        expected_commit
+    );
+    assert_eq!(reopened.finish().code(), Some(0));
+}
+
+#[test]
+fn different_transaction_evidence_cannot_publish_the_same_next_generation() {
+    let first = TempDb::new("first-same-generation-transaction");
+    let second = TempDb::new("second-same-generation-transaction");
+    let mut first_native = NativeProcess::spawn(&first.path, &[]);
+    let mut second_native = NativeProcess::spawn(&second.path, &[]);
+
+    for native in [&mut first_native, &mut second_native] {
+        assert_eq!(native.send(batch_begin(1))["ok"], json!(true));
+        assert_eq!(
+            native.send(vector_upsert(2, [1.0, 0.0], "same-wal"))["ok"],
+            json!(true)
+        );
+    }
+    let first_evidence = first_native.prepare_commit(3);
+    let second_evidence = second_native.prepare_commit(3);
+    assert_eq!(first_evidence["generation"], json!(1));
+    assert_eq!(second_evidence["generation"], json!(1));
+    assert_eq!(first_evidence["walSha256"], second_evidence["walSha256"]);
+    assert_ne!(
+        first_evidence["transactionNonce"],
+        second_evidence["transactionNonce"]
+    );
+
+    let rejected = second_native.send(batch_commit(4, first_evidence.clone()));
+    assert_eq!(rejected["ok"], json!(false));
+    assert_eq!(generation(&second.path), 0);
+    assert_eq!(
+        second_native.send(batch_commit(5, second_evidence))["ok"],
+        json!(true)
+    );
+    assert_eq!(
+        first_native.send(batch_commit(4, first_evidence))["ok"],
+        json!(true)
+    );
+    assert_eq!(first_native.finish().code(), Some(0));
+    assert_eq!(second_native.finish().code(), Some(0));
+}
+
+#[test]
+fn prepared_state_rejects_further_mutation_without_publishing() {
+    let db = TempDb::new("prepared-rejects-mutation");
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(native.send(batch_begin(1))["ok"], json!(true));
+    assert_eq!(
+        native.send(vector_upsert(2, [1.0, 0.0], "first"))["ok"],
+        json!(true)
+    );
+    native.prepare_commit(3);
+    let rejected = native.send(vector_upsert(4, [0.0, 1.0], "second"));
+    assert_eq!(rejected["ok"], json!(false));
+    assert_ne!(native.finish().code(), Some(0));
+    assert_eq!(generation(&db.path), 0);
+    assert!(db.path.with_extension("agdb.wal").exists());
+}
+
+#[test]
+fn commit_rejects_wal_content_or_identity_change_after_prepare() {
+    for replace_inode in [false, true] {
+        let db = TempDb::new(if replace_inode {
+            "prepared-wal-replaced"
+        } else {
+            "prepared-wal-appended"
+        });
+        let mut native = NativeProcess::spawn(&db.path, &[]);
+        assert_eq!(native.send(batch_begin(1))["ok"], json!(true));
+        assert_eq!(
+            native.send(vector_upsert(2, [1.0, 0.0], "first"))["ok"],
+            json!(true)
+        );
+        let prepared = native.prepare_commit(3);
+        let wal_path = db.path.with_extension("agdb.wal");
+        if replace_inode {
+            let original = db.dir.join("held-original.wal");
+            let bytes = std::fs::read(&wal_path).expect("read prepared WAL");
+            std::fs::rename(&wal_path, &original).expect("hold original WAL inode");
+            std::fs::write(&wal_path, bytes).expect("install same-byte replacement inode");
+        } else {
+            let mut wal = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&wal_path)
+                .expect("open prepared WAL");
+            wal.write_all(b" ").expect("append after prepare");
+            wal.sync_all().expect("sync appended WAL");
+        }
+        let rejected = native.send(batch_commit(4, prepared));
+        assert_eq!(rejected["ok"], json!(false));
+        assert_ne!(native.finish().code(), Some(0));
+        assert_eq!(generation(&db.path), 0);
+        assert!(wal_path.exists());
+    }
+}
+
+#[test]
+fn exact_committed_residue_retires_but_mismatched_residue_fails_closed() {
+    let exact = TempDb::new("exact-commit-residue");
+    seed_vector(&exact.path);
+    let exact_record = encoded_wal_record(0, &vector_upsert(1, [1.0, 0.0], "old"));
+    std::fs::write(exact.path.with_extension("agdb.wal"), &exact_record)
+        .expect("restore exact committed WAL residue");
+    let mut reopened = NativeProcess::spawn(&exact.path, &[]);
+    let info = reopened.send(json!({"id":1,"method":"protocol_info","params":{}}));
+    assert_eq!(info["result"]["state"], json!("idle"));
+    assert_eq!(info["result"]["generation"], json!(1));
+    assert_eq!(reopened.finish().code(), Some(0));
+    assert!(!exact.path.with_extension("agdb.wal").exists());
+
+    let mismatch = TempDb::new("mismatched-commit-residue");
+    seed_vector(&mismatch.path);
+    let canonical_before = std::fs::read(&mismatch.path).expect("canonical before mismatch");
+    let mismatched_record = encoded_wal_record(
+        0,
+        &vector_upsert_for_document(9, "other", "other-document", [0.0, 1.0], "other"),
+    );
+    let wal_path = mismatch.path.with_extension("agdb.wal");
+    std::fs::write(&wal_path, &mismatched_record).expect("write mismatched residue");
+    let failed = NativeProcess::spawn(&mismatch.path, &[]);
+    assert_ne!(failed.finish().code(), Some(0));
+    assert_eq!(std::fs::read(&mismatch.path).unwrap(), canonical_before);
+    assert_eq!(std::fs::read(&wal_path).unwrap(), mismatched_record);
+}
+
+#[test]
+fn invalid_canonical_commit_evidence_fails_closed_without_rewrite() {
+    let db = TempDb::new("invalid-canonical-evidence");
+    seed_vector(&db.path);
+    let mut canonical: Value = serde_json::from_slice(&std::fs::read(&db.path).unwrap()).unwrap();
+    canonical["commitEvidence"]["generation"] = json!(2);
+    let invalid = serde_json::to_vec(&canonical).expect("encode invalid evidence");
+    std::fs::write(&db.path, &invalid).expect("write invalid evidence");
+    let failed = NativeProcess::spawn(&db.path, &[]);
+    assert_ne!(failed.finish().code(), Some(0));
+    assert_eq!(std::fs::read(&db.path).unwrap(), invalid);
+}
+
+#[test]
 fn protocol_info_is_the_method_policy_and_unknown_is_not_a_read() {
     let db = TempDb::new("protocol");
     let mut native = NativeProcess::spawn(&db.path, &[]);
@@ -2160,6 +2386,7 @@ fn protocol_info_is_the_method_policy_and_unknown_is_not_a_read() {
         ("ping", "health", false),
         ("protocol_info", "health", false),
         ("batch_begin", "transaction", false),
+        ("batch_prepare_commit", "transaction", false),
         ("batch_commit", "commit", false),
         ("recovery_discard", "recovery", false),
         ("upsert_nodes", "mutation", true),
@@ -2236,15 +2463,15 @@ fn mutation_requires_explicit_active_batch_and_recovery_commit_requires_new_muta
         mid_batch.send(memory_save_file(3, &source))["ok"],
         json!(true)
     );
-    assert_eq!(mid_batch.send(batch_commit(4))["ok"], json!(true));
+    assert_eq!(mid_batch.commit(4)["ok"], json!(true));
     assert_eq!(mid_batch.finish().code(), Some(0));
     assert_eq!(generation(&db.path), 1);
 
     let mut bare = NativeProcess::spawn(&db.path, &[]);
-    let bare_commit = bare.send(batch_commit(5));
+    let bare_commit = bare.send(batch_commit_without_evidence(5));
     assert_eq!(bare_commit["ok"], json!(false));
     assert_eq!(bare.send(batch_begin(6))["ok"], json!(true));
-    let recovery_commit = bare.send(batch_commit(7));
+    let recovery_commit = bare.send(batch_commit_without_evidence(7));
     assert_eq!(recovery_commit["ok"], json!(false));
     assert_eq!(bare.finish().code(), Some(0));
     assert_eq!(generation(&db.path), 1);
@@ -2314,7 +2541,7 @@ fn memory_save_file_wal_is_self_contained_after_source_replacement() {
     )
     .expect("replace source after acknowledgement");
     std::fs::remove_file(&source).expect("delete source after replacement");
-    assert_eq!(native.send(batch_commit(3))["ok"], json!(true));
+    assert_eq!(native.commit(3)["ok"], json!(true));
     assert_eq!(native.finish().code(), Some(0));
 
     let mut reopened = NativeProcess::spawn(&db.path, &[]);
@@ -2442,9 +2669,7 @@ fn mutation_preflight_does_not_clone_the_server_or_dispatch_a_clone() {
 fn commit_path_has_no_output_sized_state_blob_or_json_buffers() {
     let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/aira-graphdb-native.rs");
     let source = std::fs::read_to_string(source_path).expect("native source");
-    let persist_start = source
-        .find("fn persist(&mut self)")
-        .expect("persist function");
+    let persist_start = source.find("fn persist(").expect("persist function");
     let persist_end = source[persist_start..]
         .find("fn persist_if_needed")
         .map(|offset| persist_start + offset)
@@ -2482,7 +2707,7 @@ fn repeated_small_mutations_have_delta_bounded_peak_rss_after_representative_sta
         seed.send(bulk_vector_upsert(1, REPRESENTATIVE_VECTOR_COUNT))["ok"],
         json!(true)
     );
-    assert_eq!(seed.send(batch_commit(2))["ok"], json!(true));
+    assert_eq!(seed.commit(2)["ok"], json!(true));
     assert_eq!(seed.finish().code(), Some(0));
 
     let state_bytes = std::fs::metadata(&db.path)
@@ -2524,7 +2749,8 @@ fn repeated_small_mutations_have_delta_bounded_peak_rss_after_representative_sta
         assert_eq!(response["ok"], json!(true), "small mutation {index}");
         mutation_peak = mutation_peak.max(request_peak);
     }
-    let (commit, _, commit_peak) = native.send_with_peak_rss(batch_commit(500));
+    let evidence = native.prepare_commit(500);
+    let (commit, _, commit_peak) = native.send_with_peak_rss(batch_commit(500, evidence));
     assert_eq!(
         commit["ok"],
         json!(true),
