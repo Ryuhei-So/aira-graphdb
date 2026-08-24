@@ -732,11 +732,13 @@ fn injected_write_sync_rename_and_directory_failures_never_return_a_token() {
         "blob_temp_sync_create",
         "blob_temp_sync_write",
         "blob_temp_sync_fsync",
+        "blob_temp_sync_cache_evict",
         "blob_rename",
         "blob_dir_fsync",
         "json_temp_sync_create",
         "json_temp_sync_write",
         "json_temp_sync_fsync",
+        "json_temp_sync_cache_evict",
         "json_rename",
         "json_dir_fsync",
         "wal_zero",
@@ -2887,9 +2889,14 @@ fn commit_path_has_no_output_sized_state_blob_or_json_buffers() {
             .find("\n    fn ")
             .map(|offset| function.len() + offset)
             .unwrap_or(body.len());
+        let stream = &body[..end];
         assert!(
-            body[..end].contains("buffered_artifact_writer(&mut file)"),
-            "{function} bypassed the bounded canonical publication writer"
+            stream.contains("bounded_publication_writer(&mut file"),
+            "{function} bypassed the bounded publication cache writer"
+        );
+        assert!(
+            stream.contains("buffered_artifact_writer(bounded)"),
+            "{function} bypassed the bounded canonical buffering/hash writer"
         );
     }
 }

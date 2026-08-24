@@ -273,11 +273,21 @@ struct ArtifactEvidence {
 }
 
 const STREAM_PUBLICATION_BUFFER_BYTES: usize = 1024 * 1024;
+const STREAM_PUBLICATION_CACHE_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
 
 // Buffer above the hasher so tiny encoder writes are coalesced before both
 // hashing and File I/O. `finish` is the only path that can return evidence.
 struct BufferedArtifactWriter<W: Write> {
     inner: BufWriter<ArtifactHashWriter<W>>,
+}
+
+struct BoundedPublicationWriter<'a> {
+    file: &'a mut fs::File,
+    written_bytes: u64,
+    released_bytes: u64,
+    window_bytes: u64,
+    stage: &'static str,
+    release_range: fn(&fs::File, u64, u64, &str) -> io::Result<()>,
 }
 
 struct ProgressWrite<'a, W> {
@@ -404,6 +414,75 @@ impl<W: Write> Write for BufferedArtifactWriter<W> {
 
 fn buffered_artifact_writer<W: Write>(inner: W) -> BufferedArtifactWriter<W> {
     BufferedArtifactWriter::new(inner)
+}
+
+impl<'a> BoundedPublicationWriter<'a> {
+    fn new(file: &'a mut fs::File, stage: &'static str) -> Self {
+        Self::with_window(file, stage, STREAM_PUBLICATION_CACHE_WINDOW_BYTES)
+    }
+
+    fn with_window(file: &'a mut fs::File, stage: &'static str, window_bytes: u64) -> Self {
+        Self::with_window_and_release(file, stage, window_bytes, Server::writeback_and_evict_range)
+    }
+
+    fn with_window_and_release(
+        file: &'a mut fs::File,
+        stage: &'static str,
+        window_bytes: u64,
+        release_range: fn(&fs::File, u64, u64, &str) -> io::Result<()>,
+    ) -> Self {
+        assert!(
+            window_bytes > 0,
+            "publication cache window must be positive"
+        );
+        Self {
+            file,
+            written_bytes: 0,
+            released_bytes: 0,
+            window_bytes,
+            stage,
+            release_range,
+        }
+    }
+
+    fn release_completed_windows(&mut self) -> io::Result<()> {
+        while self.written_bytes.saturating_sub(self.released_bytes) >= self.window_bytes {
+            (self.release_range)(
+                self.file,
+                self.released_bytes,
+                self.window_bytes,
+                self.stage,
+            )?;
+            self.released_bytes = self
+                .released_bytes
+                .checked_add(self.window_bytes)
+                .ok_or_else(|| io::Error::other("publication cache offset overflow"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Write for BoundedPublicationWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.file.write(bytes)?;
+        self.written_bytes = self
+            .written_bytes
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::other("publication byte offset overflow"))?;
+        self.release_completed_windows()?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn bounded_publication_writer<'a>(
+    file: &'a mut fs::File,
+    stage: &'static str,
+) -> BoundedPublicationWriter<'a> {
+    BoundedPublicationWriter::new(file, stage)
 }
 
 const MAX_VECTOR_SEARCH_WORKERS: usize = 8;
@@ -2324,12 +2403,93 @@ impl Server {
             Self::durability_failpoint(&format!("before_{sync_stage}_fsync"))?;
             file.sync_all()
                 .map_err(|err| io::Error::other(format!("sync temp file failed: {err}")))?;
-            Self::durability_failpoint(&format!("after_{sync_stage}_fsync"))
+            Self::durability_failpoint(&format!("after_{sync_stage}_fsync"))?;
+            let bytes = file.metadata()?.len();
+            Self::evict_clean_range(file, 0, bytes, sync_stage)
         })();
         if result.is_err() {
             let _ = fs::remove_file(tmp_path);
         }
         result
+    }
+
+    #[cfg(target_os = "linux")]
+    fn checked_cache_range(offset: u64, bytes: u64) -> io::Result<(libc::off64_t, libc::off64_t)> {
+        let end = offset
+            .checked_add(bytes)
+            .ok_or_else(|| io::Error::other("publication cache range overflow"))?;
+        if end > i64::MAX as u64 {
+            return Err(io::Error::other("publication cache range exceeds off64_t"));
+        }
+        let offset = libc::off64_t::try_from(offset)
+            .map_err(|_| io::Error::other("publication cache offset exceeds off64_t"))?;
+        let bytes = libc::off64_t::try_from(bytes)
+            .map_err(|_| io::Error::other("publication cache length exceeds off64_t"))?;
+        Ok((offset, bytes))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn writeback_and_evict_range(
+        file: &fs::File,
+        offset: u64,
+        bytes: u64,
+        stage: &str,
+    ) -> io::Result<()> {
+        let (offset, bytes) = Self::checked_cache_range(offset, bytes)?;
+        Self::durability_failpoint(&format!("before_{stage}_cache_writeback"))?;
+        let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
+            | libc::SYNC_FILE_RANGE_WRITE
+            | libc::SYNC_FILE_RANGE_WAIT_AFTER;
+        let result = unsafe { libc::sync_file_range(file.as_raw_fd(), offset, bytes, flags) };
+        if result != 0 {
+            return Err(io::Error::other(format!(
+                "write back publication cache range failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        Self::durability_failpoint(&format!("after_{stage}_cache_writeback"))?;
+        Self::evict_clean_range(file, offset as u64, bytes as u64, stage)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn writeback_and_evict_range(
+        _file: &fs::File,
+        _offset: u64,
+        _bytes: u64,
+        _stage: &str,
+    ) -> io::Result<()> {
+        // Correctness and final fsync ordering are portable. The production
+        // cgroup cache bound is Linux-only and must not be inferred here.
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn evict_clean_range(file: &fs::File, offset: u64, bytes: u64, stage: &str) -> io::Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let (offset, bytes) = Self::checked_cache_range(offset, bytes)?;
+        Self::durability_failpoint(&format!("before_{stage}_cache_evict"))?;
+        let result = unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), offset, bytes, libc::POSIX_FADV_DONTNEED)
+        };
+        if result != 0 {
+            return Err(io::Error::other(format!(
+                "evict publication cache range failed: {}",
+                io::Error::from_raw_os_error(result)
+            )));
+        }
+        Self::durability_failpoint(&format!("after_{stage}_cache_evict"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn evict_clean_range(
+        _file: &fs::File,
+        _offset: u64,
+        _bytes: u64,
+        _stage: &str,
+    ) -> io::Result<()> {
+        Ok(())
     }
 
     fn validate_blob_streaming_progress(
@@ -2344,6 +2504,7 @@ impl Server {
         let mut prefix = [0u8; 10];
         let mut prefix_used = 0usize;
         let mut buffer = [0u8; 64 * 1024];
+        let mut released_bytes = 0u64;
         loop {
             let count = file.read(&mut buffer)?;
             if count == 0 {
@@ -2354,8 +2515,27 @@ impl Server {
             prefix_used += copy;
             writer.write_all(&buffer[..count])?;
             progress.advance(0, None, writer.bytes, Some(descriptor.size))?;
+            while writer.bytes.saturating_sub(released_bytes)
+                >= STREAM_PUBLICATION_CACHE_WINDOW_BYTES
+            {
+                Self::evict_clean_range(
+                    &file,
+                    released_bytes,
+                    STREAM_PUBLICATION_CACHE_WINDOW_BYTES,
+                    "blob_validation",
+                )?;
+                released_bytes = released_bytes
+                    .checked_add(STREAM_PUBLICATION_CACHE_WINDOW_BYTES)
+                    .ok_or_else(|| io::Error::other("validation cache offset overflow"))?;
+            }
         }
         let evidence = writer.finish()?;
+        Self::evict_clean_range(
+            &file,
+            released_bytes,
+            evidence.bytes.saturating_sub(released_bytes),
+            "blob_validation",
+        )?;
         if prefix_used < Self::VECTOR_BLOB_MAGIC.len() + std::mem::size_of::<u16>() {
             return Err(io::Error::other("vector blob file is truncated"));
         }
@@ -2420,7 +2600,8 @@ impl Server {
         let result = (|| {
             progress.enter_phase("vector_write", 0, Some(total_units), 0, Some(total_bytes))?;
             Self::durability_failpoint("before_blob_temp_sync_write")?;
-            let mut writer = buffered_artifact_writer(&mut file);
+            let bounded = bounded_publication_writer(&mut file, "blob_publication");
+            let mut writer = buffered_artifact_writer(bounded);
             writer.write_all(Self::VECTOR_BLOB_MAGIC)?;
             writer.write_all(&Self::VECTOR_BLOB_VERSION.to_le_bytes())?;
             let mut completed_bytes = header_bytes;
@@ -2470,7 +2651,8 @@ impl Server {
         let result = (|| {
             progress.enter_phase("json_write", 0, None, 0, None)?;
             Self::durability_failpoint("before_json_temp_sync_write")?;
-            let writer = buffered_artifact_writer(&mut file);
+            let bounded = bounded_publication_writer(&mut file, "json_publication");
+            let writer = buffered_artifact_writer(bounded);
             let mut observed = ProgressWrite::new(writer, progress);
             serde_json::to_writer(&mut observed, view)
                 .map_err(|err| io::Error::other(format!("serialize state failed: {err}")))?;
@@ -6338,6 +6520,71 @@ mod tests {
         let state = state.borrow();
         assert_eq!(state.bytes, b"canonical bytes pending flush");
         assert_eq!(state.flushes, 1);
+    }
+
+    #[test]
+    fn bounded_publication_writer_preserves_bytes_across_multiple_cache_windows() {
+        let path = temp_path("bounded-publication-cache-windows");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let payload = vec![0x5au8; 10 * 1024 + 37];
+        {
+            let mut writer =
+                BoundedPublicationWriter::with_window(&mut file, "unit_publication", 4 * 1024);
+            for chunk in payload.chunks(137) {
+                writer.write_all(chunk).unwrap();
+            }
+            writer.flush().unwrap();
+            assert_eq!(writer.written_bytes, payload.len() as u64);
+            assert_eq!(writer.released_bytes, 8 * 1024);
+        }
+        file.sync_all().unwrap();
+        drop(file);
+        assert_eq!(fs::read(&path).unwrap(), payload);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn bounded_publication_writer_propagates_cache_release_failure() {
+        fn reject_release(
+            _file: &fs::File,
+            _offset: u64,
+            _bytes: u64,
+            _stage: &str,
+        ) -> io::Result<()> {
+            Err(io::Error::other("injected cache release failure"))
+        }
+
+        let path = temp_path("bounded-publication-cache-failure");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let error = {
+            let mut writer = BoundedPublicationWriter::with_window_and_release(
+                &mut file,
+                "unit_publication",
+                4 * 1024,
+                reject_release,
+            );
+            writer.write_all(&vec![0x5au8; 8 * 1024]).unwrap_err()
+        };
+        assert_eq!(error.to_string(), "injected cache release failure");
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_cache_ranges_reject_off64_overflow() {
+        assert!(Server::checked_cache_range(i64::MAX as u64 - 1, 1).is_ok());
+        assert!(Server::checked_cache_range(i64::MAX as u64, 1).is_err());
+        assert!(Server::checked_cache_range(i64::MAX as u64 + 1, 1).is_err());
+        assert!(Server::checked_cache_range(0, i64::MAX as u64 + 1).is_err());
+        assert!(Server::checked_cache_range(u64::MAX, 1).is_err());
     }
 
     #[test]
