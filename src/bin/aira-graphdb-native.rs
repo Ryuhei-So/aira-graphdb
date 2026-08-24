@@ -16,8 +16,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(target_os = "linux")]
 use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
+use serde::de::IgnoredAny;
 use serde::ser::{SerializeMap, SerializeStruct};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -308,6 +309,8 @@ const MAX_VECTOR_SEARCH_WORKERS: usize = 8;
 const MAX_VECTOR_DIMENSIONS: usize = 4_096;
 const MAX_VECTOR_SEARCH_TOP_K: usize = 10_000;
 const MAX_WAL_RECORD_BYTES: u64 = 536_870_912;
+const MAX_WAL_BYTES: u64 = 17_179_869_184;
+const MAX_WAL_RECORDS: u64 = 1_000_000;
 
 #[derive(Debug)]
 struct ScoredVector {
@@ -349,6 +352,7 @@ struct RpcRequest {
     params: Value,
 }
 
+#[cfg(test)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct WalRecord {
@@ -359,14 +363,12 @@ struct WalRecord {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
 struct WalRecordRef<'a> {
     version: u16,
     base_generation: u64,
     request: &'a RpcRequest,
 }
 
-#[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
 struct LimitedHashWriter<W> {
     inner: W,
     bytes: u64,
@@ -375,7 +377,6 @@ struct LimitedHashWriter<W> {
     wal_hasher: Option<Sha256>,
 }
 
-#[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
 struct WalWriteEvidence<W> {
     inner: W,
     bytes: u64,
@@ -384,13 +385,61 @@ struct WalWriteEvidence<W> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Passed to the semantic WAL visitor in the next checkpoint.
 struct WalRecordReadEvidence {
     bytes: u64,
     digest: [u8; 32],
 }
 
-#[allow(dead_code)] // Wired only after the semantic WAL visitor checkpoint.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScannedWalEnvelope {
+    #[serde(default, deserialize_with = "deserialize_present")]
+    version: Present<u16>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    base_generation: Present<u64>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    request: Present<ScannedRpcRequest>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    id: Present<u64>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    method: Present<String>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    params: Present<IgnoredAny>,
+}
+
+#[derive(Debug, Default)]
+enum Present<T> {
+    #[default]
+    Missing,
+    Value(T),
+}
+
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Present<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Present::Value)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScannedRpcRequest {
+    id: u64,
+    method: String,
+    params: IgnoredAny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalScanEvidence {
+    identity: (u64, u64),
+    bytes: u64,
+    record_count: u64,
+    digest: [u8; 32],
+    base_generation: Option<u64>,
+    legacy_raw: bool,
+}
+
 struct StrictLfRecordReader<'a, R: BufRead> {
     inner: &'a mut R,
     limit: u64,
@@ -401,7 +450,6 @@ struct StrictLfRecordReader<'a, R: BufRead> {
     finished: bool,
 }
 
-#[allow(dead_code)] // Wired only after the semantic WAL visitor checkpoint.
 impl<'a, R: BufRead> StrictLfRecordReader<'a, R> {
     fn new(inner: &'a mut R, limit: u64, wal_hasher: &'a mut Sha256) -> Self {
         Self {
@@ -505,7 +553,181 @@ impl<R: BufRead> Read for StrictLfRecordReader<'_, R> {
     }
 }
 
-#[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
+#[derive(Debug)]
+struct JsonGuardFrame {
+    object: bool,
+    expect_key: bool,
+    pending_method: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedStringRole {
+    Other,
+    EnvelopeKey,
+    MethodValue,
+}
+
+struct GuardedJsonReader<R> {
+    inner: R,
+    frames: Vec<JsonGuardFrame>,
+    in_string: bool,
+    escaped: bool,
+    role: BoundedStringRole,
+    bounded_raw: Vec<u8>,
+}
+
+impl<R> GuardedJsonReader<R> {
+    const MAX_NESTING: usize = 128;
+    const MAX_ENVELOPE_STRING_BYTES: usize = 64;
+    const MAX_ESCAPED_ENVELOPE_BYTES: usize = Self::MAX_ENVELOPE_STRING_BYTES * 6;
+
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            frames: Vec::new(),
+            in_string: false,
+            escaped: false,
+            role: BoundedStringRole::Other,
+            bounded_raw: Vec::with_capacity(Self::MAX_ESCAPED_ENVELOPE_BYTES),
+        }
+    }
+
+    fn finish_bounded_string(&mut self) -> io::Result<()> {
+        if self.role == BoundedStringRole::Other {
+            return Ok(());
+        }
+        let mut encoded = Vec::with_capacity(self.bounded_raw.len() + 2);
+        encoded.push(b'"');
+        encoded.extend_from_slice(&self.bounded_raw);
+        encoded.push(b'"');
+        let decoded: String = serde_json::from_slice(&encoded)
+            .map_err(|error| io::Error::other(format!("invalid bounded JSON string: {error}")))?;
+        if decoded.len() > Self::MAX_ENVELOPE_STRING_BYTES {
+            return Err(io::Error::other(
+                "WAL envelope key or method exceeds 64 UTF-8 bytes",
+            ));
+        }
+        if self.role == BoundedStringRole::EnvelopeKey {
+            let frame = self
+                .frames
+                .last_mut()
+                .expect("envelope key occurs inside an object");
+            frame.expect_key = false;
+            frame.pending_method = decoded == "method";
+        }
+        Ok(())
+    }
+
+    fn account(&mut self, bytes: &[u8]) -> io::Result<()> {
+        for byte in bytes {
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                    if self.role != BoundedStringRole::Other {
+                        self.bounded_raw.push(*byte);
+                    }
+                    continue;
+                }
+                match *byte {
+                    b'\\' => {
+                        self.escaped = true;
+                        if self.role != BoundedStringRole::Other {
+                            self.bounded_raw.push(*byte);
+                        }
+                    }
+                    b'"' => {
+                        self.finish_bounded_string()?;
+                        self.in_string = false;
+                        self.role = BoundedStringRole::Other;
+                        self.bounded_raw.clear();
+                    }
+                    _ => {
+                        if self.role != BoundedStringRole::Other {
+                            self.bounded_raw.push(*byte);
+                        }
+                    }
+                }
+                if self.bounded_raw.len() > Self::MAX_ESCAPED_ENVELOPE_BYTES {
+                    return Err(io::Error::other(
+                        "WAL escaped envelope key or method exceeds bounded input",
+                    ));
+                }
+                continue;
+            }
+
+            match *byte {
+                b'"' => {
+                    let depth = self.frames.len();
+                    let role = self
+                        .frames
+                        .last()
+                        .map_or(BoundedStringRole::Other, |frame| {
+                            if frame.object && frame.expect_key && depth <= 2 {
+                                BoundedStringRole::EnvelopeKey
+                            } else if frame.object && frame.pending_method && depth <= 2 {
+                                BoundedStringRole::MethodValue
+                            } else {
+                                BoundedStringRole::Other
+                            }
+                        });
+                    if role != BoundedStringRole::EnvelopeKey {
+                        if let Some(frame) = self.frames.last_mut() {
+                            frame.pending_method = false;
+                        }
+                    }
+                    self.in_string = true;
+                    self.escaped = false;
+                    self.role = role;
+                    self.bounded_raw.clear();
+                }
+                b'{' | b'[' => {
+                    if let Some(frame) = self.frames.last_mut() {
+                        frame.pending_method = false;
+                    }
+                    if self.frames.len() >= Self::MAX_NESTING {
+                        return Err(io::Error::other("WAL JSON nesting exceeds 128"));
+                    }
+                    self.frames.push(JsonGuardFrame {
+                        object: *byte == b'{',
+                        expect_key: *byte == b'{',
+                        pending_method: false,
+                    });
+                }
+                b'}' | b']' => {
+                    self.frames.pop();
+                }
+                b',' => {
+                    if let Some(frame) = self.frames.last_mut() {
+                        if frame.object {
+                            frame.expect_key = true;
+                            frame.pending_method = false;
+                        }
+                    }
+                }
+                byte if !byte.is_ascii_whitespace() && byte != b':' => {
+                    if let Some(frame) = self.frames.last_mut() {
+                        frame.pending_method = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for GuardedJsonReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(output)?;
+        self.account(&output[..read])?;
+        Ok(read)
+    }
+}
+
 impl<W> LimitedHashWriter<W> {
     fn new(inner: W, limit: u64, wal_hasher: Option<Sha256>) -> Self {
         Self {
@@ -527,7 +749,6 @@ impl<W> LimitedHashWriter<W> {
     }
 }
 
-#[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
 impl<W: Write> Write for LimitedHashWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let requested = u64::try_from(buf.len())
@@ -632,6 +853,9 @@ struct Server {
     transaction: TransactionState,
     wal_path: Option<PathBuf>,
     wal_bytes: u64,
+    wal_record_count: u64,
+    wal_hasher: Sha256,
+    wal_file: Option<fs::File>,
     wal_identity: Option<(u64, u64)>,
     wal_replaying: bool,
     last_persist_bytes: u64,
@@ -1005,24 +1229,6 @@ impl Server {
         Ok(raw)
     }
 
-    fn read_regular_nofollow_with_identity(path: &Path) -> io::Result<(Vec<u8>, (u64, u64))> {
-        let path_metadata = fs::symlink_metadata(path)?;
-        Self::require_regular_single_link(path, &path_metadata)?;
-        let mut file = Self::open_regular_nofollow(path)?;
-        let file_metadata = file.metadata()?;
-        let path_identity = Self::metadata_identity(&path_metadata);
-        let file_identity = Self::metadata_identity(&file_metadata);
-        if path_identity != file_identity {
-            return Err(io::Error::other(format!(
-                "{} changed while being opened",
-                path.display()
-            )));
-        }
-        let mut raw = Vec::new();
-        file.read_to_end(&mut raw)?;
-        Ok((raw, file_identity))
-    }
-
     fn validate_regular_path_identity(path: &Path, expected: (u64, u64)) -> io::Result<()> {
         let path_metadata = fs::symlink_metadata(path)?;
         Self::require_regular_single_link(path, &path_metadata)?;
@@ -1084,6 +1290,9 @@ impl Server {
             wal_bytes: fs::metadata(db_path.with_extension("agdb.wal"))
                 .map(|metadata| metadata.len())
                 .unwrap_or(0),
+            wal_record_count: 0,
+            wal_hasher: Sha256::new(),
+            wal_file: None,
             wal_identity: None,
             wal_replaying: false,
             last_persist_bytes: fs::metadata(&db_path)
@@ -1564,12 +1773,11 @@ impl Server {
         }
         let mut held = Self::open_regular_nofollow(path)?;
         let identity = Self::metadata_identity(&held.metadata()?);
-        let mut raw = Vec::new();
-        held.read_to_end(&mut raw)?;
-        let records = Self::parse_wal_records(&raw, current_generation)?;
-        if records
-            .iter()
-            .any(|record| record.base_generation >= current_generation)
+        let evidence = Self::scan_wal_file(&mut held, false)?;
+        if evidence.identity != identity
+            || evidence
+                .base_generation
+                .is_some_and(|base| base >= current_generation)
         {
             return Err(io::Error::other(
                 "retired WAL contains a current or future generation",
@@ -1581,10 +1789,7 @@ impl Server {
         Self::durability_pausepoint("after_startup_wal_retire_claim")?;
         Self::durability_failpoint("after_startup_wal_retire_claim")?;
         Self::validate_regular_path_identity(&claimed, identity)?;
-        held.seek(SeekFrom::Start(0))?;
-        let mut claimed_raw = Vec::new();
-        held.read_to_end(&mut claimed_raw)?;
-        if claimed_raw != raw {
+        if Self::scan_wal_file(&mut held, false)? != evidence {
             return Err(io::Error::other(
                 "retired WAL content changed during startup cleanup",
             ));
@@ -2153,6 +2358,9 @@ impl Server {
             transaction: TransactionState::Idle,
             wal_path: None,
             wal_bytes: 0,
+            wal_record_count: 0,
+            wal_hasher: Sha256::new(),
+            wal_file: None,
             wal_identity: None,
             wal_replaying: false,
             last_persist_bytes: canonical_raw.len() as u64,
@@ -2316,33 +2524,34 @@ impl Server {
                 "active batch base generation does not match canonical generation",
             ));
         }
-        let (records, identity, raw) = self.read_wal_records_with_identity()?;
-        let identity = identity.ok_or_else(|| io::Error::other("durable WAL is missing"))?;
-        if self.wal_identity != Some(identity) || self.wal_bytes != raw.len() as u64 {
+        let wal_path = self.require_wal_path()?;
+        let file = self
+            .wal_file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("durable WAL descriptor is missing"))?;
+        let metadata = file.metadata()?;
+        let identity = Self::metadata_identity(&metadata);
+        Self::validate_regular_path_identity(wal_path, identity)?;
+        if self.wal_identity != Some(identity) || self.wal_bytes != metadata.len() {
             return Err(io::Error::other(
                 "durable WAL identity or byte count changed before prepare",
             ));
         }
-        if records.is_empty()
-            || records
-                .iter()
-                .any(|record| record.base_generation != base_generation)
-        {
+        if self.wal_bytes == 0 || self.wal_record_count == 0 {
             return Err(io::Error::other(
                 "prepare requires one non-empty canonical WAL generation",
             ));
         }
-        let record_count = u64::try_from(records.len())
-            .map_err(|_| io::Error::other("WAL record count overflow"))?;
+        let digest: [u8; 32] = self.wal_hasher.clone().finalize().into();
         let evidence = PreparedCommitEvidence::new(
             transaction_nonce,
             base_generation,
             base_generation
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("generation overflow"))?,
-            Self::digest_hex(&Self::digest_bytes(&raw)),
-            raw.len() as u64,
-            record_count,
+            Self::digest_hex(&digest),
+            self.wal_bytes,
+            self.wal_record_count,
         )
         .map_err(io::Error::other)?;
         self.transaction = TransactionState::Prepared {
@@ -2379,26 +2588,23 @@ impl Server {
         let next_generation = current_generation
             .checked_add(1)
             .ok_or_else(|| io::Error::other("generation overflow"))?;
-        let (wal_records, wal_identity, wal_raw) = self.read_wal_records_with_identity()?;
-        if wal_records
-            .iter()
-            .any(|record| record.base_generation != current_generation)
-        {
+        let wal_evidence = self
+            .scan_wal_with_identity(false)?
+            .ok_or_else(|| io::Error::other("durable WAL disappeared before publication"))?;
+        if wal_evidence.base_generation != Some(current_generation) {
             return Err(io::Error::other(
                 "cannot commit with WAL records from a different generation",
             ));
         }
-        if wal_records.is_empty() {
+        if wal_evidence.record_count == 0 {
             return Err(io::Error::other(
                 "cannot publish a generation without a durable WAL mutation",
             ));
         }
-        let wal_identity = wal_identity
-            .ok_or_else(|| io::Error::other("durable WAL disappeared before publication"))?;
-        if wal_identity != prepared_identity
-            || wal_raw.len() as u64 != prepared_evidence.wal_bytes()
-            || wal_records.len() as u64 != prepared_evidence.wal_record_count()
-            || Self::digest_hex(&Self::digest_bytes(&wal_raw)) != prepared_evidence.wal_sha256()
+        if wal_evidence.identity != prepared_identity
+            || wal_evidence.bytes != prepared_evidence.wal_bytes()
+            || wal_evidence.record_count != prepared_evidence.wal_record_count()
+            || Self::digest_hex(&wal_evidence.digest) != prepared_evidence.wal_sha256()
         {
             return Err(io::Error::other(
                 "durable WAL does not match prepared commit evidence",
@@ -2492,7 +2698,7 @@ impl Server {
         Self::durability_failpoint("after_json_dir_fsync")?;
 
         Self::durability_failpoint("before_wal_retire")?;
-        self.retire_wal_exact(wal_identity, &wal_raw)
+        self.retire_wal_exact(wal_evidence)
             .map_err(|err| io::Error::other(format!("retire WAL failed: {err}")))?;
         Self::durability_failpoint("after_wal_retire")?;
         Self::durability_failpoint("before_final_dir_fsync")?;
@@ -2513,6 +2719,8 @@ impl Server {
         }
         self.last_persist_bytes = json_bytes;
         self.wal_bytes = 0;
+        self.wal_record_count = 0;
+        self.wal_hasher = Sha256::new();
         self.wal_identity = None;
         let total_ms = start.elapsed().as_millis();
         eprintln!(
@@ -2583,114 +2791,205 @@ impl Server {
         Self::method_spec(method).is_some_and(|spec| spec.wal)
     }
 
-    fn parse_wal_records(raw: &[u8], generation: u64) -> io::Result<Vec<WalRecord>> {
-        let content = std::str::from_utf8(raw)
-            .map_err(|err| io::Error::other(format!("WAL is not UTF-8: {err}")))?;
-        let mut records = Vec::new();
-        for (line_number, line) in content.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
+    fn scan_wal_file(
+        file: &mut fs::File,
+        allow_legacy_generation0: bool,
+    ) -> io::Result<WalScanEvidence> {
+        Self::scan_wal_file_with_limits(
+            file,
+            allow_legacy_generation0,
+            MAX_WAL_RECORD_BYTES,
+            MAX_WAL_BYTES,
+            MAX_WAL_RECORDS,
+        )
+    }
+
+    fn scan_wal_file_with_limits(
+        file: &mut fs::File,
+        allow_legacy_generation0: bool,
+        record_limit: u64,
+        wal_limit: u64,
+        record_count_limit: u64,
+    ) -> io::Result<WalScanEvidence> {
+        let before = file.metadata()?;
+        let identity = Self::metadata_identity(&before);
+        if before.len() > wal_limit {
+            return Err(io::Error::other("WAL exceeds aggregate byte limit"));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut source = io::BufReader::new(file);
+        let mut wal_hasher = Sha256::new();
+        let mut bytes = 0u64;
+        let mut record_count = 0u64;
+        let mut base_generation = None;
+        let mut legacy_raw = false;
+        while !source.fill_buf()?.is_empty() {
+            if record_count >= record_count_limit {
+                return Err(io::Error::other("WAL exceeds aggregate record limit"));
             }
-            let record = match serde_json::from_str::<WalRecord>(line) {
-                Ok(record) => record,
-                Err(versioned_error) if generation == 0 => {
-                    // The pre-generation WAL was a raw RpcRequest. It is only
-                    // safe to interpret it while the canonical state is still
-                    // the legacy generation zero snapshot.
-                    let legacy_value = serde_json::from_str::<Value>(line).map_err(|_| {
-                        io::Error::other(format!(
-                            "malformed WAL record at line {}: {versioned_error}",
-                            line_number + 1
-                        ))
-                    })?;
-                    if legacy_value.as_object().is_none_or(|object| {
-                        object.contains_key("version")
-                            || object.contains_key("baseGeneration")
-                            || object.contains_key("request")
-                    }) {
+            let record_reader =
+                StrictLfRecordReader::new(&mut source, record_limit, &mut wal_hasher);
+            let guarded_record = GuardedJsonReader::new(record_reader);
+            let mut buffered_record = io::BufReader::with_capacity(64 * 1024, guarded_record);
+            let mut deserializer = serde_json::Deserializer::from_reader(&mut buffered_record);
+            let envelope = ScannedWalEnvelope::deserialize(&mut deserializer)
+                .map_err(|error| io::Error::other(format!("parse WAL record failed: {error}")))?;
+            deserializer
+                .end()
+                .map_err(|error| io::Error::other(format!("parse WAL record failed: {error}")))?;
+            drop(deserializer);
+            let record_reader = buffered_record.into_inner().into_inner();
+            let record_evidence = record_reader.finish()?;
+            let (record_base_generation, request) = match envelope {
+                ScannedWalEnvelope {
+                    version: Present::Value(version),
+                    base_generation: Present::Value(base_generation),
+                    request: Present::Value(request),
+                    id: Present::Missing,
+                    method: Present::Missing,
+                    params: Present::Missing,
+                } => {
+                    if version != Self::WAL_VERSION {
                         return Err(io::Error::other(format!(
-                            "malformed WAL record at line {}: {versioned_error}",
-                            line_number + 1
+                            "unsupported WAL version {version}"
                         )));
                     }
-                    let request = serde_json::from_str::<RpcRequest>(line).map_err(|_| {
-                        io::Error::other(format!(
-                            "malformed WAL record at line {}: {versioned_error}",
-                            line_number + 1
-                        ))
-                    })?;
-                    WalRecord {
-                        version: Self::WAL_VERSION,
-                        base_generation: 0,
-                        request,
+                    if legacy_raw {
+                        return Err(io::Error::other("WAL mixes legacy and v2 records"));
                     }
+                    (base_generation, request)
                 }
-                Err(err) => {
-                    return Err(io::Error::other(format!(
-                        "malformed WAL record at line {}: {err}",
-                        line_number + 1
-                    )));
+                ScannedWalEnvelope {
+                    version: Present::Missing,
+                    base_generation: Present::Missing,
+                    request: Present::Missing,
+                    id: Present::Value(id),
+                    method: Present::Value(method),
+                    params: Present::Value(params),
+                } if allow_legacy_generation0
+                    && base_generation.is_none_or(|base| base == 0)
+                    && (record_count == 0 || legacy_raw) =>
+                {
+                    legacy_raw = true;
+                    (0, ScannedRpcRequest { id, method, params })
                 }
+                _ => return Err(io::Error::other("WAL record has an invalid envelope shape")),
             };
-            if record.version != Self::WAL_VERSION {
-                return Err(io::Error::other(format!(
-                    "unsupported WAL version {}",
-                    record.version
-                )));
-            }
-            if !Self::is_mutating_method(&record.request.method) {
+            if !Self::is_mutating_method(&request.method) {
                 return Err(io::Error::other(
                     "WAL record contains a non-mutating method",
                 ));
             }
-            if record.request.method == "memory_save_file" {
+            if request.method == "memory_save_file" {
                 return Err(io::Error::other(
                     "WAL record contains a non-canonical memory_save_file request",
                 ));
             }
-            records.push(record);
-        }
-        Ok(records)
-    }
-
-    fn read_wal_records_with_identity(
-        &self,
-    ) -> io::Result<(Vec<WalRecord>, Option<(u64, u64)>, Vec<u8>)> {
-        let wal_path = self.require_wal_path()?;
-        let (raw, identity) = match Self::read_regular_nofollow_with_identity(wal_path) {
-            Ok(result) => result,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Ok((Vec::new(), None, Vec::new()));
+            if base_generation.is_some_and(|base| base != record_base_generation) {
+                return Err(io::Error::other("WAL contains mixed base generations"));
             }
-            Err(err) => return Err(io::Error::other(format!("read WAL failed: {err}"))),
-        };
-        let records = Self::parse_wal_records(&raw, self.state.generation)?;
-        Ok((records, Some(identity), raw))
+            base_generation = Some(record_base_generation);
+            let _ = (request.id, request.params);
+            bytes = bytes
+                .checked_add(record_evidence.bytes)
+                .ok_or_else(|| io::Error::other("WAL aggregate byte count overflow"))?;
+            if bytes > wal_limit {
+                return Err(io::Error::other("WAL exceeds aggregate byte limit"));
+            }
+            record_count = record_count
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("WAL aggregate record count overflow"))?;
+        }
+        let after = source.get_ref().metadata()?;
+        if Self::metadata_identity(&after) != identity
+            || after.len() != before.len()
+            || bytes != before.len()
+        {
+            return Err(io::Error::other("WAL changed during bounded scan"));
+        }
+        Ok(WalScanEvidence {
+            identity,
+            bytes,
+            record_count,
+            digest: wal_hasher.finalize().into(),
+            base_generation,
+            legacy_raw,
+        })
     }
 
-    fn retire_wal_exact(
-        &self,
-        expected_identity: (u64, u64),
-        expected_raw: &[u8],
-    ) -> io::Result<()> {
-        let wal_path = self.require_wal_path()?;
-        let parent = Self::parent_dir(wal_path);
-        let mut held_wal = Self::open_regular_nofollow(wal_path)?;
-        if Self::metadata_identity(&held_wal.metadata()?) != expected_identity {
+    fn scan_wal_with_identity(
+        &mut self,
+        allow_legacy_generation0: bool,
+    ) -> io::Result<Option<WalScanEvidence>> {
+        let wal_path = self.require_wal_path()?.to_path_buf();
+        let mut file = match self.wal_file.take() {
+            Some(file) => file,
+            None => match Self::open_regular_nofollow(&wal_path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(io::Error::other(format!("open WAL failed: {error}"))),
+            },
+        };
+        let evidence = Self::scan_wal_file(&mut file, allow_legacy_generation0)?;
+        Self::validate_regular_path_identity(&wal_path, evidence.identity)?;
+        self.wal_file = Some(file);
+        Ok(Some(evidence))
+    }
+
+    fn hash_wal_file(file: &mut fs::File) -> io::Result<((u64, u64), u64, [u8; 32])> {
+        let before = file.metadata()?;
+        let identity = Self::metadata_identity(&before);
+        if before.len() > MAX_WAL_BYTES {
+            return Err(io::Error::other("WAL exceeds aggregate byte limit"));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut hasher = Sha256::new();
+        let mut bytes = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            bytes = bytes
+                .checked_add(read as u64)
+                .ok_or_else(|| io::Error::other("WAL aggregate byte count overflow"))?;
+            if bytes > MAX_WAL_BYTES {
+                return Err(io::Error::other("WAL exceeds aggregate byte limit"));
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let after = file.metadata()?;
+        if Self::metadata_identity(&after) != identity
+            || after.len() != before.len()
+            || bytes != before.len()
+        {
+            return Err(io::Error::other("WAL changed during bounded hash"));
+        }
+        Ok((identity, bytes, hasher.finalize().into()))
+    }
+
+    fn retire_wal_exact(&mut self, expected: WalScanEvidence) -> io::Result<()> {
+        let wal_path = self.require_wal_path()?.to_path_buf();
+        let parent = Self::parent_dir(&wal_path);
+        let mut held_wal = self
+            .wal_file
+            .take()
+            .ok_or_else(|| io::Error::other("held WAL descriptor is missing"))?;
+        if Self::metadata_identity(&held_wal.metadata()?) != expected.identity {
             return Err(io::Error::other("WAL identity changed before retirement"));
         }
-        let mut held_before = Vec::new();
-        held_wal.read_to_end(&mut held_before)?;
-        if held_before != expected_raw {
+        if Self::hash_wal_file(&mut held_wal)?
+            != (expected.identity, expected.bytes, expected.digest)
+        {
             return Err(io::Error::other("WAL content changed before retirement"));
         }
-        let retired = Self::temporary_path(wal_path, "wal_retire")?;
-        Self::rename_noreplace(wal_path, &retired)?;
-        Self::validate_regular_path_identity(&retired, expected_identity)?;
-        held_wal.seek(SeekFrom::Start(0))?;
-        let mut held_after = Vec::new();
-        held_wal.read_to_end(&mut held_after)?;
-        if held_after != expected_raw {
+        let retired = Self::temporary_path(&wal_path, "wal_retire")?;
+        Self::rename_noreplace(&wal_path, &retired)?;
+        Self::validate_regular_path_identity(&retired, expected.identity)?;
+        if Self::hash_wal_file(&mut held_wal)?
+            != (expected.identity, expected.bytes, expected.digest)
+        {
             return Err(io::Error::other("WAL content changed during retirement"));
         }
         Self::durability_failpoint("after_wal_retire_rename")?;
@@ -2703,17 +3002,7 @@ impl Server {
         Self::sync_parent_dir(&parent)
     }
 
-    fn encoded_wal_records(records: &[WalRecord]) -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        for record in records {
-            let encoded = serde_json::to_vec(record)
-                .map_err(|err| io::Error::other(format!("serialize WAL failed: {err}")))?;
-            bytes.extend_from_slice(&encoded);
-            bytes.push(b'\n');
-        }
-        Ok(bytes)
-    }
-
+    #[cfg(test)]
     fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
         Sha256::digest(bytes).into()
     }
@@ -2722,7 +3011,6 @@ impl Server {
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
-    #[allow(dead_code)] // Wired only after the strict reader/held-FD checkpoint.
     fn stream_wal_record<W: Write>(
         writer: W,
         base_generation: u64,
@@ -2778,7 +3066,7 @@ impl Server {
                 Ok(path_metadata) => {
                     Self::require_regular_single_link(wal_path, &path_metadata)?;
                     let mut options = fs::OpenOptions::new();
-                    options.write(true).append(true);
+                    options.read(true).write(true).append(true);
                     #[cfg(unix)]
                     options.custom_flags(libc::O_NOFOLLOW);
                     let file = options.open(wal_path)?;
@@ -2802,7 +3090,7 @@ impl Server {
                         return Err(io::Error::other("active WAL disappeared before append"));
                     }
                     let mut options = fs::OpenOptions::new();
-                    options.write(true).append(true).create_new(true);
+                    options.read(true).write(true).append(true).create_new(true);
                     #[cfg(unix)]
                     options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
                     match options.open(wal_path) {
@@ -2825,21 +3113,57 @@ impl Server {
     }
 
     fn wal_append(&mut self, request: &RpcRequest) -> io::Result<()> {
-        let record = WalRecord {
-            version: Self::WAL_VERSION,
-            base_generation: self.state.generation,
-            request: request.clone(),
-        };
-        let encoded = serde_json::to_vec(&record)
-            .map_err(|err| io::Error::other(format!("serialize WAL record failed: {err}")))?;
-        let wal_path = self.require_wal_path()?;
-        let parent = Self::parent_dir(wal_path);
+        let measured = Self::stream_wal_record(io::sink(), self.state.generation, request, None)?;
+        let next_bytes = self
+            .wal_bytes
+            .checked_add(measured.bytes)
+            .ok_or_else(|| io::Error::other("WAL aggregate byte count overflow"))?;
+        if next_bytes > MAX_WAL_BYTES {
+            return Err(io::Error::other("WAL exceeds aggregate byte limit"));
+        }
+        let next_record_count = self
+            .wal_record_count
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("WAL aggregate record count overflow"))?;
+        if next_record_count > MAX_WAL_RECORDS {
+            return Err(io::Error::other("WAL exceeds aggregate record limit"));
+        }
+        let wal_path = self.require_wal_path()?.to_path_buf();
+        let parent = Self::parent_dir(&wal_path);
         fs::create_dir_all(&parent)?;
-        let (mut file, wal_created, wal_identity) = self.open_wal_for_append()?;
+        let (file, wal_created, wal_identity) = match self.wal_file.take() {
+            Some(file) => {
+                let identity = Self::metadata_identity(&file.metadata()?);
+                if self.wal_identity != Some(identity) {
+                    return Err(io::Error::other("held WAL identity changed before append"));
+                }
+                Self::validate_regular_path_identity(&wal_path, identity)?;
+                (file, false, identity)
+            }
+            None => self.open_wal_for_append()?,
+        };
+        if file.metadata()?.len() != self.wal_bytes {
+            return Err(io::Error::other("WAL byte count changed before append"));
+        }
         Self::durability_failpoint("before_wal_write")?;
-        file.write_all(&encoded)?;
-        file.write_all(b"\n")?;
-        file.flush()?;
+        let buffered_file = io::BufWriter::with_capacity(64 * 1024, file);
+        let written = Self::stream_wal_record(
+            buffered_file,
+            self.state.generation,
+            request,
+            Some(self.wal_hasher.clone()),
+        )?;
+        Self::require_same_wal_record(&measured, &written)?;
+        let WalWriteEvidence {
+            inner: mut buffered_file,
+            bytes: _,
+            record_digest: _,
+            wal_hasher,
+        } = written;
+        buffered_file.flush()?;
+        let file = buffered_file
+            .into_inner()
+            .map_err(|error| error.into_error())?;
         Self::durability_failpoint("after_wal_write")?;
         Self::durability_failpoint("before_wal_sync")?;
         file.sync_data()?;
@@ -2850,53 +3174,62 @@ impl Server {
             Self::durability_failpoint("after_wal_dir_fsync")?;
         }
         Self::durability_pausepoint("after_wal_sync_before_identity_check")?;
-        Self::validate_regular_path_identity(wal_path, wal_identity)?;
+        Self::validate_regular_path_identity(&wal_path, wal_identity)?;
+        if file.metadata()?.len() != next_bytes {
+            return Err(io::Error::other("WAL byte count changed after append"));
+        }
         self.wal_identity = Some(wal_identity);
-        self.wal_bytes += encoded.len() as u64 + 1;
+        self.wal_bytes = next_bytes;
+        self.wal_record_count = next_record_count;
+        self.wal_hasher = wal_hasher.expect("WAL append always carries rolling hash state");
+        self.wal_file = Some(file);
         Ok(())
     }
 
     fn replay_wal(&mut self) -> io::Result<usize> {
-        let (records, wal_identity, wal_raw) = self.read_wal_records_with_identity()?;
         let generation = self.state.generation;
-        if records.is_empty() {
-            if let Some(identity) = wal_identity {
+        let wal_evidence = self.scan_wal_with_identity(generation == 0)?;
+        let Some(wal_evidence) = wal_evidence else {
+            self.wal_bytes = 0;
+            self.wal_record_count = 0;
+            self.wal_hasher = Sha256::new();
+            self.wal_identity = None;
+            self.transaction = TransactionState::Idle;
+            eprintln!("[wal] recoveryPending=false skipped=0 bytes=0");
+            return Ok(0);
+        };
+        if wal_evidence.record_count == 0 {
+            if wal_evidence.bytes == 0 {
                 Self::durability_failpoint("before_wal_rewrite_retire")?;
-                self.retire_wal_exact(identity, &wal_raw)?;
+                self.retire_wal_exact(wal_evidence)?;
                 Self::durability_failpoint("after_wal_rewrite_retire")?;
             }
             self.wal_bytes = 0;
+            self.wal_record_count = 0;
+            self.wal_hasher = Sha256::new();
             self.wal_identity = None;
             self.transaction = TransactionState::Idle;
             eprintln!("[wal] recoveryPending=false skipped=0 bytes=0");
             return Ok(0);
         }
-        let wal_base_generation = records[0].base_generation;
-        if records
-            .iter()
-            .any(|record| record.base_generation != wal_base_generation)
-        {
-            return Err(io::Error::other("WAL contains mixed base generations"));
-        }
+        let wal_base_generation = wal_evidence
+            .base_generation
+            .expect("non-empty scanned WAL has a base generation");
         if wal_base_generation > generation {
             return Err(io::Error::other(format!(
                 "WAL base generation {wal_base_generation} is newer than canonical generation {generation}",
             )));
         }
-        let wal_identity = wal_identity
-            .ok_or_else(|| io::Error::other("non-empty WAL has no durable identity"))?;
         if wal_base_generation < generation {
             if let Some(stored) = self.state.commit_evidence.as_ref() {
                 let evidence = stored.validate().map_err(|error| {
                     io::Error::other(format!("invalid canonical commit evidence: {error}"))
                 })?;
-                let record_count = u64::try_from(records.len())
-                    .map_err(|_| io::Error::other("WAL record count overflow"))?;
                 if wal_base_generation != evidence.base_generation()
                     || generation != evidence.generation()
-                    || wal_raw.len() as u64 != evidence.wal_bytes()
-                    || record_count != evidence.wal_record_count()
-                    || Self::digest_hex(&Self::digest_bytes(&wal_raw)) != evidence.wal_sha256()
+                    || wal_evidence.bytes != evidence.wal_bytes()
+                    || wal_evidence.record_count != evidence.wal_record_count()
+                    || Self::digest_hex(&wal_evidence.digest) != evidence.wal_sha256()
                 {
                     return Err(io::Error::other(
                         "committed WAL residue does not match canonical commit evidence",
@@ -2904,36 +3237,41 @@ impl Server {
                 }
             }
             Self::durability_failpoint("before_wal_rewrite_retire")?;
-            self.retire_wal_exact(wal_identity, &wal_raw)?;
+            self.retire_wal_exact(wal_evidence)?;
             Self::durability_failpoint("after_wal_rewrite_retire")?;
             self.wal_bytes = 0;
+            self.wal_record_count = 0;
+            self.wal_hasher = Sha256::new();
             self.wal_identity = None;
             self.transaction = TransactionState::Idle;
             eprintln!(
                 "[wal] recoveryPending=false skipped={} bytes=0",
-                records.len()
+                wal_evidence.record_count
             );
             return Ok(0);
         }
-        self.wal_bytes = wal_raw.len() as u64;
-        let digest = Self::digest_bytes(&wal_raw);
-        let (wal_device, wal_inode) = wal_identity;
+        self.wal_bytes = wal_evidence.bytes;
+        self.wal_record_count = wal_evidence.record_count;
+        let digest = wal_evidence.digest;
+        let (wal_device, wal_inode) = wal_evidence.identity;
         self.transaction = TransactionState::RecoveryPending {
             base_generation: generation,
             wal_digest: digest,
-            record_count: records.len(),
+            record_count: usize::try_from(wal_evidence.record_count)
+                .map_err(|_| io::Error::other("WAL record count does not fit usize"))?,
             wal_device,
             wal_inode,
         };
         eprintln!(
             "[wal] recoveryPending=true generation={} records={} skipped={} bytes={} digest={}",
             generation,
-            records.len(),
+            wal_evidence.record_count,
             0,
             self.wal_bytes,
             Self::digest_hex(&digest),
         );
-        Ok(records.len())
+        usize::try_from(wal_evidence.record_count)
+            .map_err(|_| io::Error::other("WAL record count does not fit usize"))
     }
 
     fn discard_recovery(&mut self, params: &Value) -> Result<Value, AppError> {
@@ -2966,24 +3304,18 @@ impl Server {
                 "recovery compare-and-swap failed".to_string(),
             ));
         }
-        let (current_records, current_identity, current_raw) = self
-            .read_wal_records_with_identity()
+        let current = self
+            .scan_wal_with_identity(base_generation == 0)
             .map_err(|err| Self::execution_io_error(format!("revalidate recovery WAL: {err}")))?;
-        let Some((current_device, current_inode)) = current_identity else {
+        let Some(current) = current else {
             return Err(Self::execution_io_error(
                 "recovery WAL disappeared before quarantine".to_string(),
             ));
         };
-        let current_encoded = Self::encoded_wal_records(&current_records)
-            .map_err(|err| Self::execution_io_error(format!("canonicalize recovery WAL: {err}")))?;
-        let current_digest = Self::digest_bytes(&current_encoded);
-        if current_device != wal_device
-            || current_inode != wal_inode
-            || current_digest != wal_digest
-            || current_records.len() != record_count
-            || current_records
-                .iter()
-                .any(|record| record.base_generation != base_generation)
+        if current.identity != (wal_device, wal_inode)
+            || current.digest != wal_digest
+            || current.record_count != record_count as u64
+            || current.base_generation != Some(base_generation)
         {
             return Err(Self::execution_io_error(
                 "recovery WAL changed before quarantine".to_string(),
@@ -2991,9 +3323,10 @@ impl Server {
         }
         let wal_path = self
             .require_wal_path()
-            .map_err(|err| Self::execution_io_error(err.to_string()))?;
-        let mut held_wal = Self::open_regular_nofollow(wal_path).map_err(|err| {
-            Self::execution_io_error(format!("hold recovery WAL for quarantine: {err}"))
+            .map_err(|err| Self::execution_io_error(err.to_string()))?
+            .to_path_buf();
+        let mut held_wal = self.wal_file.take().ok_or_else(|| {
+            Self::execution_io_error("held recovery WAL descriptor is missing".to_string())
         })?;
         let held_metadata = held_wal
             .metadata()
@@ -3003,16 +3336,15 @@ impl Server {
                 "recovery WAL changed before quarantine hold".to_string(),
             ));
         }
-        let mut held_before = Vec::new();
-        held_wal
-            .read_to_end(&mut held_before)
-            .map_err(|err| Self::execution_io_error(format!("read held recovery WAL: {err}")))?;
-        if held_before != current_raw {
+        if Self::scan_wal_file(&mut held_wal, current.legacy_raw)
+            .map_err(|err| Self::execution_io_error(format!("scan held recovery WAL: {err}")))?
+            != current
+        {
             return Err(Self::execution_io_error(
                 "recovery WAL changed before quarantine rename".to_string(),
             ));
         }
-        let parent = Self::parent_dir(wal_path);
+        let parent = Self::parent_dir(&wal_path);
         let nonce = Self::crypto_nonce().map_err(|err| {
             Self::execution_io_error(format!("create recovery nonce failed: {err}"))
         })?;
@@ -3029,7 +3361,7 @@ impl Server {
         Self::durability_failpoint("before_recovery_quarantine_rename").map_err(|err| {
             Self::execution_io_error(format!("quarantine recovery WAL failed: {err}"))
         })?;
-        Self::rename_noreplace(wal_path, &quarantine).map_err(|err| {
+        Self::rename_noreplace(&wal_path, &quarantine).map_err(|err| {
             Self::execution_io_error(format!("quarantine recovery WAL failed: {err}"))
         })?;
         let quarantine_metadata = Self::open_regular_nofollow(&quarantine)
@@ -3042,14 +3374,10 @@ impl Server {
                 "recovery WAL changed during quarantine".to_string(),
             ));
         }
-        held_wal.seek(SeekFrom::Start(0)).map_err(|err| {
-            Self::execution_io_error(format!("rewind quarantined recovery WAL: {err}"))
-        })?;
-        let mut held_after = Vec::new();
-        held_wal.read_to_end(&mut held_after).map_err(|err| {
-            Self::execution_io_error(format!("re-read quarantined recovery WAL: {err}"))
-        })?;
-        if held_after != current_raw {
+        if Self::scan_wal_file(&mut held_wal, current.legacy_raw).map_err(|err| {
+            Self::execution_io_error(format!("re-scan quarantined recovery WAL: {err}"))
+        })? != current
+        {
             return Err(Self::execution_io_error(
                 "recovery WAL changed during quarantine".to_string(),
             ));
@@ -3067,6 +3395,8 @@ impl Server {
             Self::execution_io_error(format!("sync recovery quarantine failed: {err}"))
         })?;
         self.wal_bytes = 0;
+        self.wal_record_count = 0;
+        self.wal_hasher = Sha256::new();
         self.wal_identity = None;
         self.transaction = TransactionState::Idle;
         Ok(json!({
@@ -3870,6 +4200,11 @@ impl Server {
                         },
                         "lastCommitEvidence": self.state.commit_evidence.as_ref(),
                         "limits": {
+                            "wal": {
+                                "maxRecordBytes": MAX_WAL_RECORD_BYTES,
+                                "maxBytes": MAX_WAL_BYTES,
+                                "maxRecords": MAX_WAL_RECORDS,
+                            },
                             "vector": {
                                 "maxDimensions": MAX_VECTOR_DIMENSIONS,
                                 "maxSearchTopK": MAX_VECTOR_SEARCH_TOP_K,
@@ -3898,6 +4233,17 @@ impl Server {
                             "batch_begin requires an idle transaction".to_string(),
                         ))
                     } else {
+                        if self.wal_bytes != 0
+                            || self.wal_record_count != 0
+                            || self.wal_file.is_some()
+                            || self.wal_identity.is_some()
+                        {
+                            self.fatal = true;
+                            return Err(Self::execution_io_error(
+                                "idle transaction retains WAL evidence".to_string(),
+                            ));
+                        }
+                        self.wal_hasher = Sha256::new();
                         let transaction_nonce =
                             Self::crypto_transaction_nonce().map_err(|error| {
                                 self.fatal = true;
@@ -5453,6 +5799,104 @@ mod tests {
         assert!(frame(b"\n", 1).is_err(), "blank record");
     }
 
+    #[test]
+    fn semantic_wal_scanner_is_strict_for_v2_and_generation_zero_legacy() {
+        fn scan(raw: &[u8], allow_legacy: bool) -> io::Result<WalScanEvidence> {
+            let path = temp_path("semantic-wal-scan");
+            fs::write(&path, raw)?;
+            let mut file = Server::open_regular_nofollow(&path)?;
+            let result = Server::scan_wal_file(&mut file, allow_legacy);
+            fs::remove_file(path)?;
+            result
+        }
+
+        fn scan_limits(
+            raw: &[u8],
+            record_limit: u64,
+            wal_limit: u64,
+            record_count_limit: u64,
+        ) -> io::Result<WalScanEvidence> {
+            let path = temp_path("semantic-wal-scan-limits");
+            fs::write(&path, raw)?;
+            let mut file = Server::open_regular_nofollow(&path)?;
+            let result = Server::scan_wal_file_with_limits(
+                &mut file,
+                false,
+                record_limit,
+                wal_limit,
+                record_count_limit,
+            );
+            fs::remove_file(path)?;
+            result
+        }
+
+        let request = RpcRequest {
+            id: 23,
+            method: "memory_save".to_string(),
+            params: json!({"snapshot":{"corpusId":"corpus","facts":[]}}),
+        };
+        let v2 = Server::stream_wal_record(Vec::new(), 9, &request, None)
+            .unwrap()
+            .inner;
+        let evidence = scan(&v2, false).unwrap();
+        assert_eq!(evidence.bytes, v2.len() as u64);
+        assert_eq!(evidence.record_count, 1);
+        assert_eq!(evidence.base_generation, Some(9));
+        assert!(!evidence.legacy_raw);
+        assert!(scan_limits(&v2, v2.len() as u64, v2.len() as u64, 1).is_ok());
+        assert!(scan_limits(&v2, v2.len() as u64 - 1, v2.len() as u64, 1).is_err());
+        assert!(scan_limits(&v2, v2.len() as u64, v2.len() as u64 - 1, 1).is_err());
+        let mut two_records = v2.clone();
+        two_records.extend_from_slice(&v2);
+        assert!(scan_limits(&two_records, v2.len() as u64, two_records.len() as u64, 1,).is_err());
+
+        let legacy = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&request).unwrap(),
+            serde_json::to_string(&request).unwrap()
+        );
+        let evidence = scan(legacy.as_bytes(), true).unwrap();
+        assert_eq!(evidence.record_count, 2);
+        assert_eq!(evidence.base_generation, Some(0));
+        assert!(evidence.legacy_raw);
+        assert!(scan(legacy.as_bytes(), false).is_err());
+
+        let invalid: [&[u8]; 4] = [
+            b"{\"version\":null,\"baseGeneration\":0,\"request\":{\"id\":1,\"method\":\"memory_save\",\"params\":{}}}\n",
+            b"{\"version\":2,\"baseGeneration\":0,\"request\":{\"id\":1,\"method\":\"memory_save\",\"params\":{}},\"id\":1,\"method\":\"memory_save\",\"params\":{}}\n",
+            b"{\"version\":2,\"baseGeneration\":0,\"request\":{\"id\":1,\"method\":\"memory_save\",\"params\":{}},\"unknown\":1}\n",
+            b"{\"version\":2,\"baseGeneration\":0,\"request\":{\"id\":1,\"method\":\"memory_save\",\"params\":{}}}",
+        ];
+        for raw in invalid {
+            assert!(
+                scan(raw, true).is_err(),
+                "accepted {}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+
+        let oversized_key = format!(
+            "{{\"{}\":1,\"version\":2,\"baseGeneration\":0,\"request\":{{\"id\":1,\"method\":\"memory_save\",\"params\":{{}}}}}}\n",
+            "k".repeat(65)
+        );
+        assert!(scan(oversized_key.as_bytes(), false).is_err());
+        let oversized_method = format!(
+            "{{\"version\":2,\"baseGeneration\":0,\"request\":{{\"id\":1,\"method\":\"{}\",\"params\":{{}}}}}}\n",
+            "m".repeat(65)
+        );
+        assert!(scan(oversized_method.as_bytes(), false).is_err());
+        let large_param = format!(
+            "{{\"version\":2,\"baseGeneration\":0,\"request\":{{\"id\":1,\"method\":\"memory_save\",\"params\":{{\"payload\":\"{}\"}}}}}}\n",
+            "p".repeat(1_048_576)
+        );
+        assert!(scan(large_param.as_bytes(), false).is_ok());
+        let nested = format!(
+            "{{\"version\":2,\"baseGeneration\":0,\"request\":{{\"id\":1,\"method\":\"memory_save\",\"params\":{}}}}}\n",
+            "[".repeat(127) + &"]".repeat(127)
+        );
+        assert!(scan(nested.as_bytes(), false).is_err());
+    }
+
     fn reference_cosine(query: &[f64], vector: &[f64]) -> f64 {
         let mut dot = 0.0;
         let mut query_norm = 0.0;
@@ -5702,6 +6146,14 @@ mod tests {
         assert_eq!(
             protocol.result.as_ref().unwrap()["limits"]["vector"]["maxSearchTopK"],
             json!(MAX_VECTOR_SEARCH_TOP_K)
+        );
+        assert_eq!(
+            protocol.result.as_ref().unwrap()["limits"]["wal"],
+            json!({
+                "maxRecordBytes": MAX_WAL_RECORD_BYTES,
+                "maxBytes": MAX_WAL_BYTES,
+                "maxRecords": MAX_WAL_RECORDS,
+            })
         );
 
         let boundary = server.handle(RpcRequest {

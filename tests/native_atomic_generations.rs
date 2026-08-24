@@ -455,7 +455,7 @@ fn seed_vector(path: &Path) {
         json!(true)
     );
     let commit = native.commit(2);
-    assert_eq!(commit["ok"], json!(true));
+    assert_eq!(commit["ok"], json!(true), "seed commit failed: {commit}");
     assert_eq!(commit["result"]["generation"], json!(1));
     assert_eq!(native.finish().code(), Some(0));
 }
@@ -2691,6 +2691,52 @@ fn commit_path_has_no_output_sized_state_blob_or_json_buffers() {
             "commit path bypassed the streaming publication authority: {required}"
         );
     }
+}
+
+#[test]
+fn prepare_and_commit_use_rolling_and_streamed_wal_evidence() {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/aira-graphdb-native.rs");
+    let source = std::fs::read_to_string(source_path).expect("native source");
+    let prepare_start = source.find("fn prepare_commit(").expect("prepare function");
+    let prepare_end = source[prepare_start..]
+        .find("fn persist(")
+        .map(|offset| prepare_start + offset)
+        .expect("prepare boundary");
+    let prepare = &source[prepare_start..prepare_end];
+    assert!(prepare.contains("self.wal_hasher.clone().finalize()"));
+    for forbidden in [
+        "scan_wal_",
+        "read_to_end",
+        "Vec<WalRecord>",
+        "serde_json::from_",
+    ] {
+        assert!(
+            !prepare.contains(forbidden),
+            "prepare regained WAL materialization via {forbidden}"
+        );
+    }
+
+    let append_start = source.find("fn wal_append(").expect("append function");
+    let append_end = source[append_start..]
+        .find("fn replay_wal(")
+        .map(|offset| append_start + offset)
+        .expect("append boundary");
+    let append = &source[append_start..append_end];
+    assert!(append.contains("stream_wal_record"));
+    assert!(append.contains("BufWriter::with_capacity"));
+    assert!(append.contains("self.wal_file.take()"));
+    assert!(append.contains("self.wal_file = Some(file)"));
+    assert!(!append.contains("serde_json::to_vec"));
+
+    let persist_start = source.find("fn persist(").expect("persist function");
+    let persist_end = source[persist_start..]
+        .find("fn persist_if_needed")
+        .map(|offset| persist_start + offset)
+        .expect("persist boundary");
+    let persist = &source[persist_start..persist_end];
+    assert!(persist.contains("scan_wal_with_identity(false)"));
+    assert!(!persist.contains("Vec<WalRecord>"));
+    assert!(!persist.contains("wal_raw"));
 }
 
 #[cfg(target_os = "linux")]
