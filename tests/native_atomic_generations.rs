@@ -2877,6 +2877,21 @@ fn commit_path_has_no_output_sized_state_blob_or_json_buffers() {
             "commit path bypassed the streaming publication authority: {required}"
         );
     }
+
+    for function in ["fn stream_vector_blob_temp(", "fn stream_canonical_temp("] {
+        let start = source
+            .find(function)
+            .expect("streaming publication function");
+        let body = &source[start..];
+        let end = body[function.len()..]
+            .find("\n    fn ")
+            .map(|offset| function.len() + offset)
+            .unwrap_or(body.len());
+        assert!(
+            body[..end].contains("buffered_artifact_writer(&mut file)"),
+            "{function} bypassed the bounded canonical publication writer"
+        );
+    }
 }
 
 #[test]

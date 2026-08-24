@@ -1,7 +1,7 @@
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs;
-use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufWriter, Read, Seek, SeekFrom, Write};
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -272,6 +272,14 @@ struct ArtifactEvidence {
     sha256: String,
 }
 
+const STREAM_PUBLICATION_BUFFER_BYTES: usize = 1024 * 1024;
+
+// Buffer above the hasher so tiny encoder writes are coalesced before both
+// hashing and File I/O. `finish` is the only path that can return evidence.
+struct BufferedArtifactWriter<W: Write> {
+    inner: BufWriter<ArtifactHashWriter<W>>,
+}
+
 struct ProgressWrite<'a, W> {
     inner: W,
     progress: &'a mut dyn CommitProgress,
@@ -327,7 +335,15 @@ impl<W> ArtifactHashWriter<W> {
         }
     }
 
-    fn finish(self) -> ArtifactEvidence {
+    fn finish(mut self) -> io::Result<ArtifactEvidence>
+    where
+        W: Write,
+    {
+        self.inner.flush()?;
+        Ok(self.into_evidence())
+    }
+
+    fn into_evidence(self) -> ArtifactEvidence {
         let digest = self.hasher.finalize();
         ArtifactEvidence {
             bytes: self.bytes,
@@ -350,6 +366,44 @@ impl<W: Write> Write for ArtifactHashWriter<W> {
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
     }
+}
+
+impl<W: Write> BufferedArtifactWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner: BufWriter::with_capacity(
+                STREAM_PUBLICATION_BUFFER_BYTES,
+                ArtifactHashWriter::new(inner),
+            ),
+        }
+    }
+
+    fn finish(mut self) -> io::Result<ArtifactEvidence> {
+        self.inner.flush()?;
+        let (writer, buffered) = self.inner.into_parts();
+        let buffered = buffered
+            .map_err(|_| io::Error::other("artifact writer panicked with buffered bytes"))?;
+        if !buffered.is_empty() {
+            return Err(io::Error::other(
+                "artifact writer retained bytes after successful flush",
+            ));
+        }
+        Ok(writer.into_evidence())
+    }
+}
+
+impl<W: Write> Write for BufferedArtifactWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.inner.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn buffered_artifact_writer<W: Write>(inner: W) -> BufferedArtifactWriter<W> {
+    BufferedArtifactWriter::new(inner)
 }
 
 const MAX_VECTOR_SEARCH_WORKERS: usize = 8;
@@ -2301,7 +2355,7 @@ impl Server {
             writer.write_all(&buffer[..count])?;
             progress.advance(0, None, writer.bytes, Some(descriptor.size))?;
         }
-        let evidence = writer.finish();
+        let evidence = writer.finish()?;
         if prefix_used < Self::VECTOR_BLOB_MAGIC.len() + std::mem::size_of::<u16>() {
             return Err(io::Error::other("vector blob file is truncated"));
         }
@@ -2366,7 +2420,7 @@ impl Server {
         let result = (|| {
             progress.enter_phase("vector_write", 0, Some(total_units), 0, Some(total_bytes))?;
             Self::durability_failpoint("before_blob_temp_sync_write")?;
-            let mut writer = ArtifactHashWriter::new(&mut file);
+            let mut writer = buffered_artifact_writer(&mut file);
             writer.write_all(Self::VECTOR_BLOB_MAGIC)?;
             writer.write_all(&Self::VECTOR_BLOB_VERSION.to_le_bytes())?;
             let mut completed_bytes = header_bytes;
@@ -2387,7 +2441,7 @@ impl Server {
                     Some(total_bytes),
                 )?;
             }
-            let evidence = writer.finish();
+            let evidence = writer.finish()?;
             progress.enter_phase(
                 "vector_sync",
                 total_units,
@@ -2416,12 +2470,12 @@ impl Server {
         let result = (|| {
             progress.enter_phase("json_write", 0, None, 0, None)?;
             Self::durability_failpoint("before_json_temp_sync_write")?;
-            let writer = ArtifactHashWriter::new(&mut file);
+            let writer = buffered_artifact_writer(&mut file);
             let mut observed = ProgressWrite::new(writer, progress);
             serde_json::to_writer(&mut observed, view)
                 .map_err(|err| io::Error::other(format!("serialize state failed: {err}")))?;
             let (writer, observed_bytes) = observed.finish();
-            let evidence = writer.finish();
+            let evidence = writer.finish()?;
             if evidence.bytes != observed_bytes {
                 return Err(io::Error::other("JSON progress byte accounting diverged"));
             }
@@ -6176,7 +6230,7 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
     use std::io::BufReader;
     use std::rc::Rc;
@@ -6210,6 +6264,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[derive(Default)]
+    struct SharedSinkState {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+        fail_flush: bool,
+    }
+
+    struct SharedSink(Rc<RefCell<SharedSinkState>>);
+
+    impl Write for SharedSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut state = self.0.borrow_mut();
+            state.writes += 1;
+            state.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let mut state = self.0.borrow_mut();
+            state.flushes += 1;
+            if state.fail_flush {
+                return Err(io::Error::other("injected artifact flush failure"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn buffered_artifact_writer_preserves_bytes_hash_and_bounds_inner_writes() {
+        let state = Rc::new(RefCell::new(SharedSinkState::default()));
+        let mut writer = buffered_artifact_writer(SharedSink(Rc::clone(&state)));
+        let payload_len = STREAM_PUBLICATION_BUFFER_BYTES * 2 + 137;
+        let payload: Vec<u8> = (0..payload_len).map(|index| (index % 251) as u8).collect();
+        for chunk in payload.chunks(8) {
+            writer.write_all(chunk).unwrap();
+        }
+        let evidence = writer.finish().unwrap();
+
+        let state = state.borrow();
+        assert_eq!(state.bytes, payload);
+        assert_eq!(evidence.bytes, payload_len as u64);
+        assert_eq!(evidence.sha256, Server::sha256_hex(&payload));
+        assert!(
+            state.writes <= 3,
+            "fixed-capacity buffering emitted {} inner writes for {} eight-byte chunks",
+            state.writes,
+            payload_len.div_ceil(8)
+        );
+        assert_eq!(state.flushes, 1);
+    }
+
+    #[test]
+    fn artifact_evidence_is_not_returned_when_final_flush_fails() {
+        let state = Rc::new(RefCell::new(SharedSinkState {
+            fail_flush: true,
+            ..SharedSinkState::default()
+        }));
+        let mut writer = buffered_artifact_writer(SharedSink(Rc::clone(&state)));
+        writer.write_all(b"canonical bytes pending flush").unwrap();
+        let error = match writer.finish() {
+            Ok(_) => panic!("flush failure returned artifact evidence"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("injected artifact flush failure")
+        );
+        let state = state.borrow();
+        assert_eq!(state.bytes, b"canonical bytes pending flush");
+        assert_eq!(state.flushes, 1);
     }
 
     #[test]
