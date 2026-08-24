@@ -1222,6 +1222,17 @@ impl Server {
         Ok(file)
     }
 
+    fn open_wal_readwrite_nofollow(path: &Path) -> io::Result<fs::File> {
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).append(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        Self::require_regular_single_link(path, &metadata)?;
+        Ok(file)
+    }
+
     fn read_regular_nofollow(path: &Path) -> io::Result<Vec<u8>> {
         let mut file = Self::open_regular_nofollow(path)?;
         let mut raw = Vec::new();
@@ -2701,9 +2712,6 @@ impl Server {
         self.retire_wal_exact(wal_evidence)
             .map_err(|err| io::Error::other(format!("retire WAL failed: {err}")))?;
         Self::durability_failpoint("after_wal_retire")?;
-        Self::durability_failpoint("before_final_dir_fsync")?;
-        Self::sync_parent_dir(&parent)?;
-        Self::durability_failpoint("after_final_dir_fsync")?;
 
         self.state.generation = next_generation;
         self.state.vector_blob = Some(blob_descriptor.clone());
@@ -2721,7 +2729,6 @@ impl Server {
         self.wal_bytes = 0;
         self.wal_record_count = 0;
         self.wal_hasher = Sha256::new();
-        self.wal_identity = None;
         let total_ms = start.elapsed().as_millis();
         eprintln!(
             "[persist] generation={} blobBytes={} blobSha256={} jsonBytes={} elapsedMs={total_ms}",
@@ -2924,7 +2931,7 @@ impl Server {
         let wal_path = self.require_wal_path()?.to_path_buf();
         let mut file = match self.wal_file.take() {
             Some(file) => file,
-            None => match Self::open_regular_nofollow(&wal_path) {
+            None => match Self::open_wal_readwrite_nofollow(&wal_path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(io::Error::other(format!("open WAL failed: {error}"))),
@@ -2971,7 +2978,6 @@ impl Server {
 
     fn retire_wal_exact(&mut self, expected: WalScanEvidence) -> io::Result<()> {
         let wal_path = self.require_wal_path()?.to_path_buf();
-        let parent = Self::parent_dir(&wal_path);
         let mut held_wal = self
             .wal_file
             .take()
@@ -2984,22 +2990,24 @@ impl Server {
         {
             return Err(io::Error::other("WAL content changed before retirement"));
         }
-        let retired = Self::temporary_path(&wal_path, "wal_retire")?;
-        Self::rename_noreplace(&wal_path, &retired)?;
-        Self::validate_regular_path_identity(&retired, expected.identity)?;
-        if Self::hash_wal_file(&mut held_wal)?
-            != (expected.identity, expected.bytes, expected.digest)
-        {
-            return Err(io::Error::other("WAL content changed during retirement"));
+        Self::durability_failpoint("before_wal_zero")?;
+        held_wal.set_len(0)?;
+        Self::durability_failpoint("after_wal_zero")?;
+        Self::durability_failpoint("before_wal_zero_sync")?;
+        held_wal.sync_all()?;
+        Self::durability_failpoint("after_wal_zero_sync")?;
+        Self::durability_failpoint("before_wal_zero_validate")?;
+        let metadata = held_wal.metadata()?;
+        if Self::metadata_identity(&metadata) != expected.identity || metadata.len() != 0 {
+            return Err(io::Error::other(
+                "held WAL did not reach the exact durable zero state",
+            ));
         }
-        Self::durability_failpoint("after_wal_retire_rename")?;
-        Self::durability_failpoint("before_wal_retire_dir_fsync")?;
-        Self::sync_parent_dir(&parent)?;
-        Self::durability_failpoint("after_wal_retire_dir_fsync")?;
-        Self::durability_failpoint("before_wal_retire_unlink")?;
-        fs::remove_file(&retired)?;
-        Self::durability_failpoint("after_wal_retire_unlink")?;
-        Self::sync_parent_dir(&parent)
+        Self::validate_regular_path_identity(&wal_path, expected.identity)?;
+        Self::durability_failpoint("after_wal_zero_validate")?;
+        self.wal_identity = Some(expected.identity);
+        self.wal_file = Some(held_wal);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -3199,15 +3207,15 @@ impl Server {
             return Ok(0);
         };
         if wal_evidence.record_count == 0 {
-            if wal_evidence.bytes == 0 {
-                Self::durability_failpoint("before_wal_rewrite_retire")?;
-                self.retire_wal_exact(wal_evidence)?;
-                Self::durability_failpoint("after_wal_rewrite_retire")?;
+            if wal_evidence.bytes != 0 {
+                return Err(io::Error::other(
+                    "zero-record WAL has nonzero durable bytes",
+                ));
             }
             self.wal_bytes = 0;
             self.wal_record_count = 0;
             self.wal_hasher = Sha256::new();
-            self.wal_identity = None;
+            self.wal_identity = Some(wal_evidence.identity);
             self.transaction = TransactionState::Idle;
             eprintln!("[wal] recoveryPending=false skipped=0 bytes=0");
             return Ok(0);
@@ -3242,7 +3250,6 @@ impl Server {
             self.wal_bytes = 0;
             self.wal_record_count = 0;
             self.wal_hasher = Sha256::new();
-            self.wal_identity = None;
             self.transaction = TransactionState::Idle;
             eprintln!(
                 "[wal] recoveryPending=false skipped={} bytes=0",
@@ -4233,15 +4240,44 @@ impl Server {
                             "batch_begin requires an idle transaction".to_string(),
                         ))
                     } else {
-                        if self.wal_bytes != 0
-                            || self.wal_record_count != 0
-                            || self.wal_file.is_some()
-                            || self.wal_identity.is_some()
-                        {
+                        if self.wal_bytes != 0 || self.wal_record_count != 0 {
                             self.fatal = true;
                             return Err(Self::execution_io_error(
                                 "idle transaction retains WAL evidence".to_string(),
                             ));
+                        }
+                        match (self.wal_file.as_ref(), self.wal_identity) {
+                            (None, None) => {}
+                            (Some(file), Some(identity)) => {
+                                let metadata = file.metadata().map_err(|error| {
+                                    self.fatal = true;
+                                    Self::execution_io_error(format!(
+                                        "inspect idle WAL descriptor failed: {error}"
+                                    ))
+                                })?;
+                                if Self::metadata_identity(&metadata) != identity
+                                    || metadata.len() != 0
+                                    || Self::validate_regular_path_identity(
+                                        self.require_wal_path().map_err(|error| {
+                                            Self::execution_io_error(error.to_string())
+                                        })?,
+                                        identity,
+                                    )
+                                    .is_err()
+                                {
+                                    self.fatal = true;
+                                    return Err(Self::execution_io_error(
+                                        "idle WAL descriptor is not the exact zero-length pathname authority"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                            _ => {
+                                self.fatal = true;
+                                return Err(Self::execution_io_error(
+                                    "idle WAL descriptor and identity disagree".to_string(),
+                                ));
+                            }
                         }
                         self.wal_hasher = Sha256::new();
                         let transaction_nonce =

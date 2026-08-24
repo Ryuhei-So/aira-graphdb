@@ -12,6 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::fs::hard_link;
 #[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::fs::symlink;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -420,6 +422,13 @@ fn recognized_wal_retire_paths(db: &TempDb) -> Vec<PathBuf> {
         .collect()
 }
 
+fn assert_zero_wal(path: &Path, context: &str) {
+    let wal_path = path.with_extension("agdb.wal");
+    let metadata = std::fs::metadata(&wal_path)
+        .unwrap_or_else(|error| panic!("{context}: zero WAL is missing: {error}"));
+    assert_eq!(metadata.len(), 0, "{context}: WAL is not zero-length");
+}
+
 fn rename_probe_paths(db: &TempDb) -> Vec<PathBuf> {
     std::fs::read_dir(&db.dir)
         .expect("read database directory")
@@ -648,8 +657,10 @@ fn every_native_commit_kill_point_reopens_a_complete_vector_generation() {
         "after_json_temp_sync_fsync",
         "after_json_rename",
         "after_json_dir_fsync",
+        "after_wal_zero",
+        "after_wal_zero_sync",
+        "after_wal_zero_validate",
         "after_wal_retire",
-        "after_final_dir_fsync",
     ] {
         let db = TempDb::new(stage);
         seed_vector(&db.path);
@@ -669,10 +680,7 @@ fn every_native_commit_kill_point_reopens_a_complete_vector_generation() {
         }
         probe_vector_pair(&db.path);
         if stage == "after_json_dir_fsync" {
-            assert!(
-                !db.path.with_extension("agdb.wal").exists(),
-                "reopen must retire WAL already included by JSON"
-            );
+            assert_zero_wal(&db.path, "reopen must zero WAL already included by JSON");
         }
     }
 }
@@ -690,8 +698,10 @@ fn injected_write_sync_rename_and_directory_failures_never_return_a_token() {
         "json_temp_sync_fsync",
         "json_rename",
         "json_dir_fsync",
+        "wal_zero",
+        "wal_zero_sync",
+        "wal_zero_validate",
         "wal_retire",
-        "final_dir_fsync",
     ] {
         for phase in ["before", "after"] {
             let failpoint = format!("{phase}_{stage}");
@@ -728,11 +738,11 @@ fn injected_write_sync_rename_and_directory_failures_never_return_a_token() {
 }
 
 #[test]
-fn wal_retirement_substages_reopen_complete_generation_and_cleanup_orphan() {
+fn wal_zero_substages_reopen_one_complete_generation() {
     for stage in [
-        "after_wal_retire_rename",
-        "after_wal_retire_dir_fsync",
-        "after_wal_retire_unlink",
+        "after_wal_zero",
+        "after_wal_zero_sync",
+        "after_wal_zero_validate",
     ] {
         let db = TempDb::new(stage);
         seed_vector(&db.path);
@@ -746,12 +756,8 @@ fn wal_retirement_substages_reopen_complete_generation_and_cleanup_orphan() {
         assert_native_killed(native.finish(), stage);
         assert_eq!(generation(&db.path), 2, "{stage} must publish N+1 first");
 
-        let retired = recognized_wal_retire_paths(&db);
-        if stage == "after_wal_retire_unlink" {
-            assert!(retired.is_empty(), "{stage} must unlink the retired WAL");
-        } else {
-            assert_eq!(retired.len(), 1, "{stage} must leave a recognized orphan");
-        }
+        assert_zero_wal(&db.path, stage);
+        assert!(recognized_wal_retire_paths(&db).is_empty());
         probe_vector_pair(&db.path);
         assert_eq!(
             generation(&db.path),
@@ -766,11 +772,11 @@ fn wal_retirement_substages_reopen_complete_generation_and_cleanup_orphan() {
 }
 
 #[test]
-fn injected_wal_retire_substage_failures_never_return_token() {
+fn injected_wal_zero_substage_failures_never_return_token() {
     for stage in [
-        "after_wal_retire_rename",
-        "after_wal_retire_dir_fsync",
-        "after_wal_retire_unlink",
+        "after_wal_zero",
+        "after_wal_zero_sync",
+        "after_wal_zero_validate",
     ] {
         let db = TempDb::new(&format!("fail-{stage}"));
         seed_vector(&db.path);
@@ -812,7 +818,7 @@ fn startup_retires_only_empty_or_already_published_wal_artifacts() {
         seed_vector(&db.path);
         let retired = recognized_wal_retire_path(&db, 7);
         std::fs::write(&retired, &wal_bytes).expect("write recognized retired orphan");
-        assert!(!db.path.with_extension("agdb.wal").exists());
+        assert_zero_wal(&db.path, "seeded canonical idle WAL");
 
         let mut native = NativeProcess::spawn(&db.path, &[]);
         let info = native.send(json!({"id":1,"method":"protocol_info","params":{}}));
@@ -850,7 +856,7 @@ fn unsupported_noreplace_fails_before_loading_or_mutating_canonical_state() {
     assert_ne!(native.finish().code(), Some(0));
     assert_eq!(std::fs::read(&db.path).unwrap(), canonical_before);
     assert_eq!(generation_blob_paths(&db), blobs_before);
-    assert!(!db.path.with_extension("agdb.wal").exists());
+    assert_zero_wal(&db.path, "noreplace preflight preserves idle WAL");
     assert!(rename_probe_paths(&db).is_empty());
 }
 
@@ -1334,6 +1340,8 @@ fn idle_mutation_rejects_wal_aliases_and_replacement_without_touching_payload() 
         assert_eq!(info["result"]["state"], json!("idle"));
         assert_eq!(info["result"]["generation"], json!(1));
         assert_eq!(native.send(batch_begin(2))["ok"], json!(true));
+        let original = db.dir.join(format!("held-original-{kind}.wal"));
+        std::fs::rename(&wal_path, &original).expect("move held zero WAL out of pathname");
 
         match kind {
             "symlink" => symlink(&sentinel, &wal_path).expect("install WAL symlink attack"),
@@ -1428,7 +1436,7 @@ fn wal_sync_failure_returns_failure_and_stops_request_service() {
 }
 
 #[test]
-fn empty_wal_after_before_write_failure_is_retired_before_fresh_commit() {
+fn empty_wal_after_before_write_failure_is_reused_by_fresh_commit() {
     for (label, variable, expect_kill) in [
         ("kill", "AGDB_NATIVE_KILL_POINT", true),
         ("failure", "AGDB_NATIVE_FAIL_POINT", false),
@@ -1466,7 +1474,11 @@ fn empty_wal_after_before_write_failure_is_retired_before_fresh_commit() {
             "{label} restart state"
         );
         assert_eq!(info["result"]["generation"], json!(0));
-        assert!(!wal_path.exists(), "{label} restart must retire empty WAL");
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            0,
+            "{label} restart must preserve a reusable zero WAL"
+        );
         assert_eq!(recovery.finish().code(), Some(0));
 
         let mut fresh = NativeProcess::spawn(&db.path, &[]);
@@ -1476,9 +1488,10 @@ fn empty_wal_after_before_write_failure_is_retired_before_fresh_commit() {
         assert_eq!(commit["ok"], json!(true), "{label} fresh commit: {commit}");
         assert_eq!(commit["result"]["generation"], json!(1));
         assert_eq!(fresh.finish().code(), Some(0));
-        assert!(
-            !wal_path.exists(),
-            "{label} successful commit must retire WAL"
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            0,
+            "{label} successful commit must zero WAL"
         );
 
         let mut reader = NativeProcess::spawn(&db.path, &[]);
@@ -1488,6 +1501,39 @@ fn empty_wal_after_before_write_failure_is_retired_before_fresh_commit() {
         assert_eq!(search["result"][0]["id"], json!(format!("fresh-v-{label}")));
         assert_eq!(reader.finish().code(), Some(0));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn committed_zero_wal_reuses_the_same_inode_without_parent_directory_fsync() {
+    let db = TempDb::new("held-zero-wal-reuse");
+    seed_vector(&db.path);
+    let wal_path = db.path.with_extension("agdb.wal");
+    let before = std::fs::metadata(&wal_path).expect("seeded zero WAL metadata");
+    assert_eq!(before.len(), 0);
+
+    let mut native = NativeProcess::spawn(
+        &db.path,
+        &[("AGDB_NATIVE_FAIL_POINT", "before_wal_dir_fsync")],
+    );
+    assert_eq!(native.send(batch_begin(2))["ok"], json!(true));
+    assert_eq!(
+        native.send(vector_upsert(3, [0.0, 1.0], "reused"))["ok"],
+        json!(true)
+    );
+    let commit = native.commit(4);
+    assert_eq!(
+        commit["ok"],
+        json!(true),
+        "existing WAL required create-path fsync"
+    );
+    assert_eq!(commit["result"]["generation"], json!(2));
+    assert_eq!(native.finish().code(), Some(0));
+
+    let after = std::fs::metadata(&wal_path).expect("reused zero WAL metadata");
+    assert_eq!(after.len(), 0);
+    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+    assert!(recognized_wal_retire_paths(&db).is_empty());
 }
 
 #[cfg(unix)]
@@ -2136,7 +2182,7 @@ fn legacy_committed_wal_is_skipped_but_future_and_malformed_wal_fail_closed() {
     assert_eq!(info["result"]["generation"], json!(1));
     assert_eq!(info["result"]["state"], json!("idle"));
     assert_eq!(native.finish().code(), Some(0));
-    assert!(!skipped.path.with_extension("agdb.wal").exists());
+    assert_zero_wal(&skipped.path, "legacy committed residue");
     let mut skipped_read = NativeProcess::spawn(&skipped.path, &[]);
     let memory = skipped_read.send(json!({
         "id":2,
@@ -2324,7 +2370,7 @@ fn exact_committed_residue_retires_but_mismatched_residue_fails_closed() {
     assert_eq!(info["result"]["state"], json!("idle"));
     assert_eq!(info["result"]["generation"], json!(1));
     assert_eq!(reopened.finish().code(), Some(0));
-    assert!(!exact.path.with_extension("agdb.wal").exists());
+    assert_zero_wal(&exact.path, "exact committed residue");
 
     let mismatch = TempDb::new("mismatched-commit-residue");
     seed_vector(&mismatch.path);
@@ -2552,7 +2598,7 @@ fn memory_save_file_wal_is_self_contained_after_source_replacement() {
     }));
     assert_eq!(snapshot["result"], original);
     assert_eq!(reopened.finish().code(), Some(0));
-    assert!(!db.path.with_extension("agdb.wal").exists());
+    assert_zero_wal(&db.path, "committed self-contained memory WAL");
 }
 
 #[test]
@@ -2737,6 +2783,37 @@ fn prepare_and_commit_use_rolling_and_streamed_wal_evidence() {
     assert!(persist.contains("scan_wal_with_identity(false)"));
     assert!(!persist.contains("Vec<WalRecord>"));
     assert!(!persist.contains("wal_raw"));
+}
+
+#[test]
+fn wal_retirement_zeros_and_syncs_the_held_descriptor_without_path_replacement() {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/aira-graphdb-native.rs");
+    let source = std::fs::read_to_string(source_path).expect("native source");
+    let retire_start = source
+        .find("fn retire_wal_exact(")
+        .expect("WAL retirement function");
+    let retire_end = source[retire_start..]
+        .find("fn digest_bytes(")
+        .map(|offset| retire_start + offset)
+        .expect("WAL retirement boundary");
+    let retire = &source[retire_start..retire_end];
+
+    for required in [
+        "held_wal.set_len(0)",
+        "held_wal.sync_all()",
+        "self.wal_file = Some(held_wal)",
+    ] {
+        assert!(
+            retire.contains(required),
+            "held-descriptor retirement lost {required}"
+        );
+    }
+    for forbidden in ["rename_noreplace", "remove_file", "sync_parent_dir"] {
+        assert!(
+            !retire.contains(forbidden),
+            "WAL retirement regained pathname mutation via {forbidden}"
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
