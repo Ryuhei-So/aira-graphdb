@@ -484,7 +484,6 @@ fn committed_generation_has_sole_pointer_and_durable_blob_descriptor() {
     assert!(!Path::new(basename).is_absolute());
     assert!(!basename.contains('/'));
     assert_eq!(descriptor["format"], json!(1));
-    assert_eq!(native.finish().code(), Some(0));
 
     let state_raw = std::fs::read_to_string(&db.path).expect("canonical JSON");
     let state: Value = serde_json::from_str(&state_raw).expect("canonical JSON parses");
@@ -498,7 +497,96 @@ fn committed_generation_has_sole_pointer_and_durable_blob_descriptor() {
     assert_eq!(descriptor["size"], json!(blob.len()));
     assert_eq!(descriptor["sha256"], json!(digest_hex));
     assert!(!db.dir.join("state.vblob").exists());
+
+    let protocol = native.send(json!({
+        "id": 3,
+        "method": "protocol_info",
+        "params": {}
+    }));
+    assert_eq!(protocol["result"]["generation"], json!(1));
+    assert_eq!(protocol["result"]["vectorBlob"], *descriptor);
+    assert_eq!(native.finish().code(), Some(0));
     probe_vector_pair(&db.path);
+}
+
+#[test]
+fn protocol_info_reports_the_canonical_descriptor_across_runtime_states() {
+    let db = TempDb::new("protocol-descriptor-states");
+    let mut legacy = NativeProcess::spawn(&db.path, &[]);
+    let legacy_info = legacy.send(json!({
+        "id": 1,
+        "method": "protocol_info",
+        "params": {}
+    }));
+    assert_eq!(legacy_info["result"]["generation"], json!(0));
+    assert_eq!(legacy_info["result"]["vectorBlob"], Value::Null);
+    assert_eq!(legacy.finish().code(), Some(0));
+
+    seed_vector(&db.path);
+    let canonical: Value =
+        serde_json::from_slice(&std::fs::read(&db.path).expect("read canonical generation"))
+            .expect("parse canonical generation");
+    let descriptor = canonical["vectorBlob"].clone();
+
+    let mut active = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(active.send(batch_begin(10))["ok"], json!(true));
+    let active_info = active.send(json!({
+        "id": 11,
+        "method": "protocol_info",
+        "params": {}
+    }));
+    assert_eq!(active_info["result"]["state"], json!("active"));
+    assert_eq!(active_info["result"]["generation"], json!(1));
+    assert_eq!(active_info["result"]["vectorBlob"], descriptor);
+    assert_eq!(active.finish().code(), Some(0));
+
+    let request = vector_upsert_for_document(
+        12,
+        "pending-vector",
+        "pending-document",
+        [0.0, 1.0],
+        "pending",
+    );
+    write_wal_record(&db.path, 1, &request);
+    let mut recovery = NativeProcess::spawn(&db.path, &[]);
+    let recovery_info = recovery.send(json!({
+        "id": 13,
+        "method": "protocol_info",
+        "params": {}
+    }));
+    assert_eq!(recovery_info["result"]["state"], json!("recoveryPending"));
+    assert_eq!(recovery_info["result"]["generation"], json!(1));
+    assert_eq!(recovery_info["result"]["vectorBlob"], descriptor);
+    assert_eq!(recovery.finish().code(), Some(0));
+    let after_recovery: Value =
+        serde_json::from_slice(&std::fs::read(&db.path).expect("read canonical after recovery"))
+            .expect("parse canonical after recovery");
+    assert_eq!(after_recovery["generation"], json!(1));
+    assert_eq!(after_recovery["vectorBlob"], descriptor);
+    assert!(
+        db.path.with_extension("agdb.wal").exists(),
+        "observing recovery metadata must not retire its WAL"
+    );
+}
+
+#[test]
+fn normal_startup_rejects_a_generation_zero_descriptor() {
+    let db = TempDb::new("generation-zero-descriptor");
+    seed_vector(&db.path);
+    let mut canonical: Value = serde_json::from_slice(
+        &std::fs::read(&db.path).expect("read positive canonical generation"),
+    )
+    .expect("parse positive canonical generation");
+    canonical["generation"] = json!(0);
+    let invalid = serde_json::to_vec(&canonical).expect("encode invalid generation zero");
+    std::fs::write(&db.path, &invalid).expect("write invalid generation zero");
+
+    let native = NativeProcess::spawn(&db.path, &[]);
+    assert_ne!(native.finish().code(), Some(0));
+    assert_eq!(
+        std::fs::read(&db.path).expect("canonical remains after rejection"),
+        invalid
+    );
 }
 
 #[test]

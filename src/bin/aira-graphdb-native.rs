@@ -1552,6 +1552,11 @@ impl Server {
         db_path: &Path,
         legacy_blob_path: &Path,
     ) -> io::Result<HashMap<String, Vec<f64>>> {
+        if state.generation == 0 && state.vector_blob.is_some() {
+            return Err(io::Error::other(
+                "legacy generation zero must not contain a vector blob descriptor",
+            ));
+        }
         if state.generation > 0 && state.vector_blob.is_none() {
             return Err(io::Error::other(
                 "committed generation is missing its vector blob descriptor",
@@ -3366,6 +3371,12 @@ impl Server {
                     let mut protocol = json!({
                         "protocolVersion": "native-method-policy@1",
                         "generation": self.state.generation,
+                        // This is the exact descriptor selected by the
+                        // already-validated canonical generation.  It is a
+                        // recovery fact only: callers cannot supply it or use
+                        // it to publish a generation.  Legacy generation zero
+                        // intentionally has no descriptor.
+                        "vectorBlob": self.state.vector_blob.as_ref(),
                         "state": match self.transaction {
                             TransactionState::RecoveryPending { .. } => "recoveryPending",
                             TransactionState::Active { .. } => "active",
