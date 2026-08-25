@@ -1,5 +1,5 @@
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufWriter, Read, Seek, SeekFrom, Write};
 use std::panic;
@@ -578,6 +578,11 @@ struct LimitedHashWriter<W> {
     wal_hasher: Option<Sha256>,
 }
 
+struct LimitedCountingWriter {
+    bytes: u64,
+    limit: u64,
+}
+
 struct WalWriteEvidence<W> {
     inner: W,
     bytes: u64,
@@ -1028,6 +1033,36 @@ impl<W: Write> Write for LimitedHashWriter<W> {
     }
 }
 
+impl LimitedCountingWriter {
+    fn new(limit: u64) -> Self {
+        Self { bytes: 0, limit }
+    }
+
+    fn finish(self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Write for LimitedCountingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let requested = u64::try_from(buf.len())
+            .map_err(|_| io::Error::other("serialized byte count does not fit u64"))?;
+        let next = self
+            .bytes
+            .checked_add(requested)
+            .ok_or_else(|| io::Error::other("serialized byte count overflow"))?;
+        if next > self.limit {
+            return Err(io::Error::other("serialized value exceeds its byte limit"));
+        }
+        self.bytes = next;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DurableGenerationToken {
@@ -1354,6 +1389,7 @@ struct Server {
     wal_hasher: Sha256,
     wal_file: Option<fs::File>,
     wal_identity: Option<(u64, u64)>,
+    active_mutation_request_ids: HashSet<u64>,
     wal_replaying: bool,
     last_persist_bytes: u64,
     fatal: bool,
@@ -1402,188 +1438,265 @@ const MAX_DESCRIPTOR_VECTOR_BLOB_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_DESCRIPTOR_PROTOCOL_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DESCRIPTOR_PROTOCOL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DESCRIPTOR_PROTOCOL_FRAMES: u64 = 4096;
+const INDEXING_MEMORY_PROTOCOL_SCHEMA: &str = "native-indexing-memory@1";
+// The normal protocol retains the existing full-snapshot compatibility lane,
+// while still preventing an unterminated stdin frame from allocating without
+// a ceiling. Indexing-memory requests have the much smaller independent cap
+// below and are rejected before WAL append or dispatch.
+const MAX_NORMAL_REQUEST_FRAME_BYTES: usize = MAX_WAL_RECORD_BYTES as usize;
+const MAX_INDEXING_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_INDEXING_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_INDEXING_SCHEMA_IDS: usize = 4096;
+const MAX_INDEXING_ACTIVE_FACTS: usize = 100;
+const MAX_INDEXING_DELTA_ITEMS_PER_SECTION: usize = 4096;
+const MAX_INDEXING_DOMAIN_ID_BYTES: usize = 4096;
+const MAX_INDEXING_CORPUS_ID_BYTES: usize = 1024;
+const MAX_INDEXING_UPDATED_AT_BYTES: usize = 128;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MethodWireProfile {
+    Normal,
+    BoundedIndexing,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct MethodSpec {
     name: &'static str,
     classification: &'static str,
     wal: bool,
+    wire_profile: MethodWireProfile,
 }
 
-// This table is the one policy authority used both by protocol_info and WAL
-// admission. Unknown methods deliberately have no read classification.
+// This table is the one policy authority used by protocol_info, WAL admission,
+// and method-specific wire limits. Unknown methods deliberately have no read
+// classification or bounded-indexing profile.
 const METHOD_SPECS: &[MethodSpec] = &[
     MethodSpec {
         name: "ping",
         classification: "health",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "protocol_info",
         classification: "health",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "batch_begin",
         classification: "transaction",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "batch_prepare_commit",
         classification: "transaction",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "batch_commit",
         classification: "commit",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "recovery_discard",
         classification: "recovery",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "upsert_nodes",
         classification: "mutation",
         wal: true,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "upsert_edges",
         classification: "mutation",
         wal: true,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "get_node",
         classification: "read",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "get_nodes",
         classification: "read",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "get_edges",
         classification: "read",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "get_adjacent",
         classification: "read",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "delete_nodes",
         classification: "mutation",
         wal: true,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "delete_edges",
         classification: "mutation",
         wal: true,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "delete_by_document",
         classification: "mutation",
         wal: true,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "delete_by_corpus",
         classification: "mutation",
         wal: true,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "vector_upsert",
         classification: "mutation",
         wal: true,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "vector_search",
         classification: "read",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "vector_delete_by_document",
         classification: "mutation",
         wal: true,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "memory_upsert",
         classification: "mutation",
         wal: true,
+        wire_profile: MethodWireProfile::BoundedIndexing,
     },
     MethodSpec {
         name: "memory_save",
         classification: "mutation",
         wal: true,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "memory_save_file",
         classification: "mutation",
         wal: true,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "memory_load",
         classification: "read",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
+    },
+    MethodSpec {
+        name: "memory_get_schemas_by_ids",
+        classification: "read",
+        wal: false,
+        wire_profile: MethodWireProfile::BoundedIndexing,
+    },
+    MethodSpec {
+        name: "memory_get_active_facts",
+        classification: "read",
+        wal: false,
+        wire_profile: MethodWireProfile::BoundedIndexing,
+    },
+    // This exact method name is durable WAL intent. A pre-capability binary
+    // cannot scan it, so any admitted record must be resolved or quarantined
+    // with the current binary before rolling back to that older binary.
+    MethodSpec {
+        name: "memory_activate_facts_by_schema_ids",
+        classification: "mutation",
+        wal: true,
+        wire_profile: MethodWireProfile::BoundedIndexing,
     },
     MethodSpec {
         name: "memory_save_checkpoint",
         classification: "mutation",
         wal: true,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "memory_load_checkpoint",
         classification: "read",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "memory_validate_integrity",
         classification: "read",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "projection_get_transitions",
         classification: "read",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "projection_get_dangling_nodes",
         classification: "read",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "projection_get_node_count",
         classification: "read",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "lexical_index_passages",
         classification: "mutation",
         wal: true,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "lexical_search",
         classification: "read",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "lexical_delete_by_document",
         classification: "mutation",
         wal: true,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "cypher_query",
         classification: "read",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
         name: "__debug_force_panic__",
         classification: "debug",
         wal: false,
+        wire_profile: MethodWireProfile::Normal,
     },
 ];
 
@@ -1802,6 +1915,7 @@ impl Server {
             wal_hasher: Sha256::new(),
             wal_file: None,
             wal_identity: None,
+            active_mutation_request_ids: HashSet::new(),
             wal_replaying: false,
             last_persist_bytes: fs::metadata(&db_path)
                 .map(|metadata| metadata.len())
@@ -3022,6 +3136,7 @@ impl Server {
             wal_hasher: Sha256::new(),
             wal_file: None,
             wal_identity: None,
+            active_mutation_request_ids: HashSet::new(),
             wal_replaying: false,
             last_persist_bytes: canonical_raw.len() as u64,
             fatal: false,
@@ -3426,6 +3541,11 @@ impl Server {
         METHOD_SPECS.iter().find(|spec| spec.name == method)
     }
 
+    fn is_indexing_memory_method(method: &str) -> bool {
+        Self::method_spec(method)
+            .is_some_and(|spec| spec.wire_profile == MethodWireProfile::BoundedIndexing)
+    }
+
     fn require_db_path(&self) -> io::Result<&Path> {
         self.db_path.as_deref().ok_or_else(|| {
             io::Error::other("filesystem database path is unavailable in descriptor mode")
@@ -3470,6 +3590,15 @@ impl Server {
     /// methods are not treated as reads and therefore never enter the WAL.
     fn is_mutating_method(method: &str) -> bool {
         Self::method_spec(method).is_some_and(|spec| spec.wal)
+    }
+
+    fn validate_new_mutation_request_id(&self, request_id: u64) -> Result<(), AppError> {
+        if self.active_mutation_request_ids.contains(&request_id) {
+            return Err(Self::execution_client_error(
+                "mutation request id is already present in the active transaction".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn scan_wal_file(
@@ -3851,6 +3980,12 @@ impl Server {
     }
 
     fn wal_append(&mut self, request: &RpcRequest) -> io::Result<()> {
+        if self.active_mutation_request_ids.contains(&request.id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "duplicate mutation request id reached WAL append",
+            ));
+        }
         let measured = Self::stream_wal_record(io::sink(), self.state.generation, request, None)?;
         let next_bytes = self
             .wal_bytes
@@ -3921,6 +4056,11 @@ impl Server {
         self.wal_record_count = next_record_count;
         self.wal_hasher = wal_hasher.expect("WAL append always carries rolling hash state");
         self.wal_file = Some(file);
+        let inserted = self.active_mutation_request_ids.insert(request.id);
+        debug_assert!(
+            inserted,
+            "mutation request id was checked before WAL append"
+        );
         Ok(())
     }
 
@@ -4135,6 +4275,7 @@ impl Server {
         self.wal_record_count = 0;
         self.wal_hasher = Sha256::new();
         self.wal_identity = None;
+        self.active_mutation_request_ids.clear();
         self.transaction = TransactionState::Idle;
         Ok(json!({
             "baseGeneration": base_generation,
@@ -4464,6 +4605,14 @@ impl Server {
         }
     }
 
+    fn params_object<'a>(
+        params: &'a Value,
+    ) -> Result<&'a serde_json::Map<String, Value>, AppError> {
+        params
+            .as_object()
+            .ok_or_else(|| Self::execution_client_error("params must be an object".to_string()))
+    }
+
     fn mutation_params_object<'a>(
         params: &'a Value,
     ) -> Result<&'a serde_json::Map<String, Value>, AppError> {
@@ -4520,6 +4669,346 @@ impl Server {
             }
         }
         Ok(())
+    }
+
+    fn require_exact_params(
+        params: &serde_json::Map<String, Value>,
+        allowed: &[&str],
+    ) -> Result<(), AppError> {
+        if params.len() != allowed.len()
+            || params.keys().any(|key| !allowed.contains(&key.as_str()))
+        {
+            return Err(Self::execution_client_error(format!(
+                "params must contain exactly {}",
+                allowed.join(",")
+            )));
+        }
+        Ok(())
+    }
+
+    fn reject_unknown_params(
+        params: &serde_json::Map<String, Value>,
+        allowed: &[&str],
+    ) -> Result<(), AppError> {
+        if params.keys().any(|key| !allowed.contains(&key.as_str())) {
+            // Do not reflect an attacker-controlled key into the bounded
+            // response or audit stream.
+            return Err(Self::execution_client_error(
+                "params contain an unknown field".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn bounded_unique_ids<'a>(
+        params: &'a serde_json::Map<String, Value>,
+        name: &str,
+        maximum: usize,
+        allow_empty: bool,
+    ) -> Result<Vec<&'a str>, AppError> {
+        let items = Self::optional_array(params, name)?
+            .ok_or_else(|| Self::execution_client_error(format!("missing {name}")))?;
+        if (!allow_empty && items.is_empty()) || items.len() > maximum {
+            let lower = usize::from(!allow_empty);
+            return Err(Self::execution_client_error(format!(
+                "{name} length must be in [{lower}, {maximum}]"
+            )));
+        }
+        let mut seen = HashSet::with_capacity(items.len());
+        let mut ids = Vec::with_capacity(items.len());
+        for item in items {
+            let id = item
+                .as_str()
+                .filter(|value| {
+                    !value.is_empty() && value.len() <= MAX_INDEXING_DOMAIN_ID_BYTES
+                })
+                .ok_or_else(|| {
+                    Self::execution_client_error(format!(
+                        "{name} must contain only non-empty strings of at most {MAX_INDEXING_DOMAIN_ID_BYTES} bytes"
+                    ))
+                })?;
+            if !seen.insert(id) {
+                return Err(Self::execution_client_error(format!(
+                    "{name} must not contain duplicate IDs"
+                )));
+            }
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    fn bounded_required_string<'a>(
+        params: &'a serde_json::Map<String, Value>,
+        name: &str,
+        maximum_bytes: usize,
+    ) -> Result<&'a str, AppError> {
+        let value = Self::required_string(params, name)?;
+        if value.is_empty() || value.len() > maximum_bytes {
+            return Err(Self::execution_client_error(format!(
+                "{name} must contain between 1 and {maximum_bytes} bytes"
+            )));
+        }
+        Ok(value)
+    }
+
+    fn bounded_serialized_bytes<T: Serialize>(
+        value: &T,
+        limit: u64,
+        error_message: &'static str,
+    ) -> Result<u64, AppError> {
+        let writer = LimitedCountingWriter::new(limit);
+        let mut serializer = serde_json::Serializer::new(writer);
+        value
+            .serialize(&mut serializer)
+            .map_err(|_| Self::execution_client_error(error_message.to_string()))?;
+        Ok(serializer.into_inner().finish())
+    }
+
+    fn validate_indexing_request_size(req: &RpcRequest) -> Result<(), AppError> {
+        Self::bounded_serialized_bytes(
+            req,
+            MAX_INDEXING_REQUEST_BYTES,
+            "bounded indexing request exceeds its byte limit",
+        )?;
+        Ok(())
+    }
+
+    fn indexing_result_array_limit(request_id: u64) -> Result<u64, AppError> {
+        let empty_response = RpcResponse {
+            id: request_id,
+            ok: true,
+            result: Some(Value::Array(Vec::new())),
+            error: None,
+        };
+        let empty_bytes = Self::bounded_serialized_bytes(
+            &empty_response,
+            MAX_INDEXING_RESPONSE_BYTES,
+            "bounded indexing response exceeds its byte limit",
+        )?;
+        let envelope_bytes = empty_bytes.checked_sub(2).ok_or_else(|| {
+            Self::execution_client_error(
+                "bounded indexing response envelope accounting failed".to_string(),
+            )
+        })?;
+        MAX_INDEXING_RESPONSE_BYTES
+            .checked_sub(envelope_bytes)
+            .ok_or_else(|| {
+                Self::execution_client_error(
+                    "bounded indexing response envelope exceeds its byte limit".to_string(),
+                )
+            })
+    }
+
+    fn add_bounded_indexing_response_item(
+        accumulated: u64,
+        item: &Value,
+        has_previous_item: bool,
+        array_limit: u64,
+    ) -> Result<u64, AppError> {
+        // `accumulated` starts with the two result-array brackets. The caller
+        // derives `array_limit` from the exact response envelope for this
+        // request ID, so no fixed-size envelope estimate can drift.
+        let accumulated = accumulated
+            .checked_add(u64::from(has_previous_item))
+            .ok_or_else(|| {
+                Self::execution_client_error(
+                    "bounded indexing response byte count overflow".to_string(),
+                )
+            })?;
+        let remaining = array_limit.checked_sub(accumulated).ok_or_else(|| {
+            Self::execution_client_error(
+                "bounded indexing response exceeds its byte limit".to_string(),
+            )
+        })?;
+        let writer = LimitedCountingWriter::new(remaining);
+        let mut writer = serde_json::Serializer::new(writer);
+        item.serialize(&mut writer).map_err(|_| {
+            Self::execution_client_error(
+                "bounded indexing response exceeds its byte limit".to_string(),
+            )
+        })?;
+        let measured = writer.into_inner().finish();
+        accumulated.checked_add(measured).ok_or_else(|| {
+            Self::execution_client_error(
+                "bounded indexing response byte count overflow".to_string(),
+            )
+        })
+    }
+
+    fn validate_indexing_response_size(response: &RpcResponse) -> Result<(), AppError> {
+        Self::bounded_serialized_bytes(
+            response,
+            MAX_INDEXING_RESPONSE_BYTES,
+            "bounded indexing response exceeds its byte limit",
+        )?;
+        Ok(())
+    }
+
+    fn validate_embedded_corpus(
+        item: &serde_json::Map<String, Value>,
+        corpus_id: &str,
+        label: &str,
+    ) -> Result<(), AppError> {
+        match item.get("corpusId") {
+            None => {}
+            Some(Value::String(embedded)) if embedded == corpus_id => {}
+            Some(Value::String(_)) => {
+                return Err(Self::execution_client_error(format!(
+                    "{label}.corpusId does not match corpusId"
+                )));
+            }
+            Some(_) => {
+                return Err(Self::execution_client_error(format!(
+                    "{label}.corpusId must be a string"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn stored_snapshot_section<'a>(
+        &'a self,
+        corpus_id: &str,
+        section: &str,
+    ) -> Result<Option<&'a Vec<Value>>, AppError> {
+        let Some(snapshot) = self.state.snapshots.get(corpus_id) else {
+            return Ok(None);
+        };
+        let object = snapshot.as_object().ok_or_else(|| {
+            Self::execution_client_error("stored memory snapshot must be an object".to_string())
+        })?;
+        match object.get("corpusId") {
+            Some(Value::String(stored)) if stored == corpus_id => {}
+            Some(Value::String(_)) => {
+                return Err(Self::execution_client_error(
+                    "stored memory snapshot corpusId does not match its key".to_string(),
+                ));
+            }
+            _ => {
+                return Err(Self::execution_client_error(
+                    "stored memory snapshot has no string corpusId".to_string(),
+                ));
+            }
+        }
+        match object.get(section) {
+            None => Ok(None),
+            Some(Value::Array(items)) => Ok(Some(items)),
+            Some(_) => Err(Self::execution_client_error(format!(
+                "stored {section} must be an array"
+            ))),
+        }
+    }
+
+    fn validate_stored_section_item(
+        item: &Value,
+        corpus_id: &str,
+        section: &str,
+        id_key: &str,
+    ) -> Result<(), AppError> {
+        let object = item.as_object().ok_or_else(|| {
+            Self::execution_client_error(format!("stored {section} must contain only objects"))
+        })?;
+        Self::validate_embedded_corpus(object, corpus_id, &format!("stored {section}"))?;
+        object
+            .get(id_key)
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= MAX_INDEXING_DOMAIN_ID_BYTES)
+            .ok_or_else(|| {
+                Self::execution_client_error(format!(
+                    "stored {section} has no bounded string {id_key}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn validate_stored_snapshot_for_upsert(&self, corpus_id: &str) -> Result<(), AppError> {
+        for (section, id_key) in [
+            ("passages", "passageId"),
+            ("facts", "factId"),
+            ("schemas", "schemaId"),
+        ] {
+            if let Some(items) = self.stored_snapshot_section(corpus_id, section)? {
+                for item in items {
+                    Self::validate_stored_section_item(item, corpus_id, section, id_key)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_stored_fact_item<'a>(
+        fact: &'a Value,
+        corpus_id: &str,
+    ) -> Result<&'a serde_json::Map<String, Value>, AppError> {
+        Self::validate_stored_section_item(fact, corpus_id, "facts", "factId")?;
+        let object = fact
+            .as_object()
+            .expect("stored fact object validated above");
+        Self::validate_fact_schema_and_state(object, "stored fact")?;
+        Ok(object)
+    }
+
+    fn validate_fact_schema_and_state(
+        object: &serde_json::Map<String, Value>,
+        label: &str,
+    ) -> Result<(), AppError> {
+        for field in ["schemaId", "state"] {
+            if !object
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| {
+                    !value.is_empty() && value.len() <= MAX_INDEXING_DOMAIN_ID_BYTES
+                })
+            {
+                return Err(Self::execution_client_error(format!(
+                    "{label} has no bounded string {field}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_stored_facts_for_activation(&self, corpus_id: &str) -> Result<(), AppError> {
+        let facts = self
+            .stored_snapshot_section(corpus_id, "facts")?
+            .into_iter()
+            .flatten();
+        for fact in facts {
+            Self::validate_stored_fact_item(fact, corpus_id)?;
+        }
+        Ok(())
+    }
+
+    fn merge_snapshot_section(existing: &mut Vec<Value>, incoming: Vec<Value>, id_key: &str) {
+        // Index only the request delta. Scanning existing in reverse preserves
+        // the legacy behavior of replacing the last pre-existing duplicate ID
+        // without allocating an O(corpus) lookup table.
+        let mut incoming = incoming.into_iter().map(Some).collect::<Vec<_>>();
+        let incoming_index = incoming
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let id = item
+                    .as_ref()
+                    .and_then(|value| value.get(id_key))
+                    .and_then(Value::as_str)
+                    .expect("validated memory upsert item has an ID");
+                (id.to_string(), index)
+            })
+            .collect::<HashMap<_, _>>();
+        for item in existing.iter_mut().rev() {
+            let Some(index) = item
+                .get(id_key)
+                .and_then(Value::as_str)
+                .and_then(|id| incoming_index.get(id))
+            else {
+                continue;
+            };
+            if let Some(replacement) = incoming[*index].take() {
+                *item = replacement;
+            }
+        }
+        existing.extend(incoming.into_iter().flatten());
     }
 
     fn validate_mutation_params(&self, req: &RpcRequest) -> Result<(), AppError> {
@@ -4586,7 +5075,16 @@ impl Server {
                 let _ = Self::optional_string(params, "documentId")?;
             }
             "memory_upsert" => {
-                Self::required_string(params, "corpusId")?;
+                Self::validate_indexing_request_size(req)?;
+                Self::reject_unknown_params(
+                    params,
+                    &["corpusId", "passages", "facts", "schemas", "exportedAt"],
+                )?;
+                let corpus_id = Self::bounded_required_string(
+                    params,
+                    "corpusId",
+                    MAX_INDEXING_CORPUS_ID_BYTES,
+                )?;
                 for (section, id_key) in [
                     ("passages", "passageId"),
                     ("facts", "factId"),
@@ -4595,6 +5093,12 @@ impl Server {
                     let Some(items) = Self::optional_array(params, section)? else {
                         continue;
                     };
+                    if items.len() > MAX_INDEXING_DELTA_ITEMS_PER_SECTION {
+                        return Err(Self::execution_client_error(format!(
+                            "{section} length must not exceed {MAX_INDEXING_DELTA_ITEMS_PER_SECTION}"
+                        )));
+                    }
+                    let mut seen = HashSet::with_capacity(items.len());
                     for item in items {
                         let object = item.as_object().ok_or_else(|| {
                             Self::execution_client_error(format!("{section} items must be objects"))
@@ -4602,20 +5106,57 @@ impl Server {
                         let id = object.get(id_key).and_then(Value::as_str).ok_or_else(|| {
                             Self::execution_client_error(format!("missing {section}.{id_key}"))
                         })?;
-                        if id.is_empty() {
+                        if id.is_empty() || id.len() > MAX_INDEXING_DOMAIN_ID_BYTES {
                             return Err(Self::execution_client_error(format!(
-                                "{section}.{id_key} must not be empty"
+                                "{section}.{id_key} must contain between 1 and {MAX_INDEXING_DOMAIN_ID_BYTES} bytes"
                             )));
+                        }
+                        if !seen.insert(id) {
+                            return Err(Self::execution_client_error(format!(
+                                "{section} must not contain duplicate {id_key} values"
+                            )));
+                        }
+                        Self::validate_embedded_corpus(object, corpus_id, section)?;
+                        if section == "facts" {
+                            Self::validate_fact_schema_and_state(object, "facts item")?;
                         }
                     }
                 }
                 if let Some(exported_at) = params.get("exportedAt") {
-                    if !exported_at.is_string() {
-                        return Err(Self::execution_client_error(
-                            "exportedAt must be a string".to_string(),
-                        ));
+                    if !exported_at
+                        .as_str()
+                        .is_some_and(|value| value.len() <= MAX_INDEXING_UPDATED_AT_BYTES)
+                    {
+                        return Err(Self::execution_client_error(format!(
+                            "exportedAt must contain at most {MAX_INDEXING_UPDATED_AT_BYTES} bytes"
+                        )));
                     }
                 }
+                // Validate the complete stored merge target before WAL append.
+                // The later reverse scan may then mutate without discovering a
+                // deterministic shape/corpus error after durability evidence
+                // has already been written.
+                self.validate_stored_snapshot_for_upsert(corpus_id)?;
+            }
+            "memory_activate_facts_by_schema_ids" => {
+                Self::validate_indexing_request_size(req)?;
+                Self::require_exact_params(params, &["corpusId", "schemaIds", "updatedAt"])?;
+                let corpus_id = Self::bounded_required_string(
+                    params,
+                    "corpusId",
+                    MAX_INDEXING_CORPUS_ID_BYTES,
+                )?;
+                let _ =
+                    Self::bounded_unique_ids(params, "schemaIds", MAX_INDEXING_SCHEMA_IDS, false)?;
+                let _ = Self::bounded_required_string(
+                    params,
+                    "updatedAt",
+                    MAX_INDEXING_UPDATED_AT_BYTES,
+                )?;
+                // This validation runs before WAL append. A deterministic
+                // compatibility/corpus error must never create an
+                // unreplayable recovery record.
+                self.validate_stored_facts_for_activation(corpus_id)?;
             }
             "memory_save" => {
                 let snapshot = params
@@ -4898,6 +5439,8 @@ impl Server {
         let result: Result<Value, AppError> = (|| {
             if is_mutation {
                 self.validate_mutation_params(&req)?;
+            } else if Self::is_indexing_memory_method(&req.method) {
+                Self::validate_indexing_request_size(&req)?;
             }
             match req.method.as_str() {
                 "ping" => Ok(json!({"pong": true})),
@@ -4946,14 +5489,29 @@ impl Server {
                         },
                         "lastCommitEvidence": self.state.commit_evidence.as_ref(),
                         "limits": {
+                            "wire": {
+                                "maxNormalRequestFrameBytes": MAX_NORMAL_REQUEST_FRAME_BYTES,
+                            },
                             "wal": {
                                 "maxRecordBytes": MAX_WAL_RECORD_BYTES,
                                 "maxBytes": MAX_WAL_BYTES,
                                 "maxRecords": MAX_WAL_RECORDS,
+                                "mutationRequestIdUniqueness": "activeTransaction",
                             },
                             "vector": {
                                 "maxDimensions": MAX_VECTOR_DIMENSIONS,
                                 "maxSearchTopK": MAX_VECTOR_SEARCH_TOP_K,
+                            },
+                            "indexingMemory": {
+                                "schema": INDEXING_MEMORY_PROTOCOL_SCHEMA,
+                                "maxRequestBytes": MAX_INDEXING_REQUEST_BYTES,
+                                "maxResponseBytes": MAX_INDEXING_RESPONSE_BYTES,
+                                "maxSchemaIds": MAX_INDEXING_SCHEMA_IDS,
+                                "maxActiveFacts": MAX_INDEXING_ACTIVE_FACTS,
+                                "maxDeltaItemsPerSection": MAX_INDEXING_DELTA_ITEMS_PER_SECTION,
+                                "maxDomainIdBytes": MAX_INDEXING_DOMAIN_ID_BYTES,
+                                "maxCorpusIdBytes": MAX_INDEXING_CORPUS_ID_BYTES,
+                                "maxUpdatedAtBytes": MAX_INDEXING_UPDATED_AT_BYTES,
                             }
                         },
                         "methods": methods,
@@ -5035,6 +5593,12 @@ impl Server {
                                 ));
                             }
                         }
+                        if !self.active_mutation_request_ids.is_empty() {
+                            self.fatal = true;
+                            return Err(Self::execution_io_error(
+                                "idle transaction retains mutation request IDs".to_string(),
+                            ));
+                        }
                         self.wal_hasher = Sha256::new();
                         let transaction_nonce =
                             Self::crypto_transaction_nonce().map_err(|error| {
@@ -5108,6 +5672,7 @@ impl Server {
                         self.fatal = true;
                         Self::execution_io_error(format!("batch_commit persist failed: {err}"))
                     })?;
+                    self.active_mutation_request_ids.clear();
                     self.transaction = TransactionState::Idle;
                     Ok(serde_json::to_value(token).unwrap_or(Value::Null))
                 }
@@ -5592,25 +6157,7 @@ impl Server {
                         };
                         let existing = snapshot.get_mut(section).and_then(Value::as_array_mut);
                         if let Some(existing) = existing {
-                            let mut index: HashMap<String, usize> = HashMap::new();
-                            for (i, item) in existing.iter().enumerate() {
-                                if let Some(id) = item.get(id_key).and_then(Value::as_str) {
-                                    index.insert(id.to_string(), i);
-                                }
-                            }
-                            for item in incoming {
-                                let id = item
-                                    .get(id_key)
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string();
-                                if let Some(&i) = index.get(&id) {
-                                    existing[i] = item;
-                                } else {
-                                    index.insert(id, existing.len());
-                                    existing.push(item);
-                                }
-                            }
+                            Self::merge_snapshot_section(existing, incoming, id_key);
                         } else {
                             snapshot[section] = Value::Array(incoming);
                         }
@@ -5668,6 +6215,171 @@ impl Server {
                                 })
                             });
                     Ok(snapshot)
+                }
+                "memory_get_schemas_by_ids" => {
+                    let params = Self::params_object(&req.params)?;
+                    Self::require_exact_params(params, &["corpusId", "schemaIds"])?;
+                    let corpus_id = Self::bounded_required_string(
+                        params,
+                        "corpusId",
+                        MAX_INDEXING_CORPUS_ID_BYTES,
+                    )?;
+                    let schema_ids = Self::bounded_unique_ids(
+                        params,
+                        "schemaIds",
+                        MAX_INDEXING_SCHEMA_IDS,
+                        true,
+                    )?;
+                    if schema_ids.is_empty() {
+                        return Ok(json!([]));
+                    }
+                    let requested = schema_ids.iter().copied().collect::<HashSet<_>>();
+                    let mut found = HashMap::with_capacity(schema_ids.len());
+                    let mut response_bytes = 2_u64;
+                    let response_limit = Self::indexing_result_array_limit(req.id)?;
+                    let schemas = self
+                        .stored_snapshot_section(corpus_id, "schemas")?
+                        .into_iter()
+                        .flatten();
+                    for schema in schemas {
+                        Self::validate_stored_section_item(
+                            schema, corpus_id, "schemas", "schemaId",
+                        )?;
+                        let object = schema.as_object().ok_or_else(|| {
+                            Self::execution_client_error(
+                                "stored schemas must contain only objects".to_string(),
+                            )
+                        })?;
+                        let schema_id = object
+                            .get("schemaId")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .ok_or_else(|| {
+                                Self::execution_client_error(
+                                    "stored schema has no non-empty schemaId".to_string(),
+                                )
+                            })?;
+                        if requested.contains(schema_id) {
+                            if found.contains_key(schema_id) {
+                                return Err(Self::execution_client_error(
+                                    "stored schemas contain a duplicate requested schemaId"
+                                        .to_string(),
+                                ));
+                            }
+                            response_bytes = Self::add_bounded_indexing_response_item(
+                                response_bytes,
+                                schema,
+                                !found.is_empty(),
+                                response_limit,
+                            )?;
+                            found.insert(schema_id.to_string(), schema.clone());
+                        }
+                    }
+                    Ok(Value::Array(
+                        schema_ids
+                            .iter()
+                            .filter_map(|schema_id| found.remove(*schema_id))
+                            .collect(),
+                    ))
+                }
+                "memory_get_active_facts" => {
+                    let params = Self::params_object(&req.params)?;
+                    Self::require_exact_params(params, &["corpusId", "limit"])?;
+                    let corpus_id = Self::bounded_required_string(
+                        params,
+                        "corpusId",
+                        MAX_INDEXING_CORPUS_ID_BYTES,
+                    )?;
+                    let limit_u64 =
+                        params.get("limit").and_then(Value::as_u64).ok_or_else(|| {
+                            Self::execution_client_error(
+                                "limit must be a nonnegative integer".to_string(),
+                            )
+                        })?;
+                    let limit = usize::try_from(limit_u64).map_err(|_| {
+                        Self::execution_client_error(format!(
+                            "limit must not exceed {MAX_INDEXING_ACTIVE_FACTS}"
+                        ))
+                    })?;
+                    if limit > MAX_INDEXING_ACTIVE_FACTS {
+                        return Err(Self::execution_client_error(format!(
+                            "limit must not exceed {MAX_INDEXING_ACTIVE_FACTS}"
+                        )));
+                    }
+                    if limit == 0 {
+                        return Ok(json!([]));
+                    }
+                    let mut active = Vec::with_capacity(limit);
+                    let mut response_bytes = 2_u64;
+                    let response_limit = Self::indexing_result_array_limit(req.id)?;
+                    let facts = self
+                        .stored_snapshot_section(corpus_id, "facts")?
+                        .into_iter()
+                        .flatten();
+                    for fact in facts {
+                        let object = Self::validate_stored_fact_item(fact, corpus_id)?;
+                        if object.get("state").and_then(Value::as_str) == Some("active") {
+                            response_bytes = Self::add_bounded_indexing_response_item(
+                                response_bytes,
+                                fact,
+                                !active.is_empty(),
+                                response_limit,
+                            )?;
+                            active.push(fact.clone());
+                            if active.len() == limit {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Value::Array(active))
+                }
+                "memory_activate_facts_by_schema_ids" => {
+                    let params = Self::params_object(&req.params)?;
+                    let corpus_id = Self::required_string(params, "corpusId")?;
+                    let schema_ids = Self::bounded_unique_ids(
+                        params,
+                        "schemaIds",
+                        MAX_INDEXING_SCHEMA_IDS,
+                        false,
+                    )?;
+                    let schema_ids = schema_ids.iter().copied().collect::<HashSet<_>>();
+                    let updated_at = Self::required_string(params, "updatedAt")?.to_string();
+                    self.validate_stored_facts_for_activation(corpus_id)?;
+                    let facts = self
+                        .state
+                        .snapshots
+                        .get_mut(corpus_id)
+                        .and_then(|snapshot| snapshot.get_mut("facts"))
+                        .and_then(Value::as_array_mut);
+                    let Some(facts) = facts else {
+                        return Ok(json!({"activated": 0}));
+                    };
+                    let mut activated = 0_u64;
+                    for fact in facts.iter_mut() {
+                        let object = fact
+                            .as_object_mut()
+                            .expect("stored facts validated before mutation");
+                        let should_activate = object.get("state").and_then(Value::as_str)
+                            == Some("inactive")
+                            && object
+                                .get("schemaId")
+                                .and_then(Value::as_str)
+                                .is_some_and(|schema_id| schema_ids.contains(schema_id));
+                        if should_activate {
+                            object.insert("state".to_string(), json!("active"));
+                            object.insert("updatedAt".to_string(), json!(updated_at));
+                            activated = activated.checked_add(1).ok_or_else(|| {
+                                Self::execution_client_error(
+                                    "activated fact count overflow".to_string(),
+                                )
+                            })?;
+                        }
+                    }
+                    self.mark_cache_dirty();
+                    self.persist_if_needed().map_err(|err| {
+                        Self::execution_io_error(format!("persist failed: {err}"))
+                    })?;
+                    Ok(json!({"activated": activated}))
                 }
                 "memory_save_checkpoint" => {
                     let checkpoint = req
@@ -6124,6 +6836,60 @@ fn parse_cli() -> io::Result<CliMode> {
     }))
 }
 
+fn read_bounded_normal_frame<R: BufRead>(
+    reader: &mut R,
+    maximum_bytes: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut frame = Vec::new();
+    loop {
+        let buffered = reader.fill_buf()?;
+        if buffered.is_empty() {
+            // Preserve the legacy normal-mode behavior: unlike descriptor
+            // mode, a final JSON request does not require a trailing LF.
+            return if frame.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(frame))
+            };
+        }
+        let newline = buffered.iter().position(|byte| *byte == b'\n');
+        let payload_bytes = newline.unwrap_or(buffered.len());
+        let next = frame
+            .len()
+            .checked_add(payload_bytes)
+            .ok_or_else(|| io::Error::other("normal protocol frame byte count overflow"))?;
+        if next > maximum_bytes {
+            return Err(io::Error::other(format!(
+                "normal protocol input frame exceeds {maximum_bytes} bytes"
+            )));
+        }
+        frame.extend_from_slice(&buffered[..payload_bytes]);
+        reader.consume(payload_bytes + usize::from(newline.is_some()));
+        if newline.is_some() {
+            if frame.last() == Some(&b'\r') {
+                frame.pop();
+            }
+            return Ok(Some(frame));
+        }
+    }
+}
+
+fn serialize_normal_response(
+    response: &RpcResponse,
+    bounded_indexing_response: bool,
+) -> io::Result<String> {
+    if bounded_indexing_response {
+        Server::validate_indexing_response_size(response).map_err(|error| {
+            io::Error::other(format!(
+                "bounded indexing response validation failed: {}",
+                error.message
+            ))
+        })?;
+    }
+    serde_json::to_string(response)
+        .map_err(|err| io::Error::other(format!("serialize response failed: {err}")))
+}
+
 fn run_normal(db_path: PathBuf) -> io::Result<()> {
     let db_path = Server::resolve_db_path(db_path)?;
     let crash_tracker = CrashTracker::new(db_path.with_extension("native-audit.log"));
@@ -6137,10 +6903,12 @@ fn run_normal(db_path: PathBuf) -> io::Result<()> {
     let mut server = Server::open_resolved(db_path)?;
     server.replay_wal()?;
     let stdin = io::stdin();
+    let mut input = stdin.lock();
     let mut stdout = io::stdout();
-    for line_result in stdin.lock().lines() {
-        let line = match line_result {
-            Ok(line) => line,
+    loop {
+        let line = match read_bounded_normal_frame(&mut input, MAX_NORMAL_REQUEST_FRAME_BYTES) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
             Err(err) => {
                 crash_tracker.append_crash_event(
                     Some(1),
@@ -6148,6 +6916,16 @@ fn run_normal(db_path: PathBuf) -> io::Result<()> {
                     Some(format!("stdin read failed: {err}")),
                 );
                 return Err(err);
+            }
+        };
+        let request_wire_bytes = u64::try_from(line.len())
+            .map_err(|_| io::Error::other("normal request length does not fit u64"))?;
+        let line = match String::from_utf8(line) {
+            Ok(line) => line,
+            Err(_) => {
+                let error = io::Error::other("normal protocol input frame is not valid UTF-8");
+                crash_tracker.append_crash_event(Some(1), None, Some(error.to_string()));
+                return Err(error);
             }
         };
         if line.trim().is_empty() {
@@ -6193,11 +6971,25 @@ fn run_normal(db_path: PathBuf) -> io::Result<()> {
                 continue;
             }
         };
+        drop(line);
         let progress_protocol_version = incoming.progress_protocol_version;
         let req = incoming.into_rpc();
         crash_tracker.set_last_request_id(req.id.to_string());
         let method_for_wal = Server::is_mutating_method(&req.method);
-        let resp = if let Some(version) = progress_protocol_version {
+        let bounded_indexing_response = Server::is_indexing_memory_method(&req.method);
+        let indexing_wire_overflow =
+            bounded_indexing_response && request_wire_bytes > MAX_INDEXING_REQUEST_BYTES;
+        let resp = if indexing_wire_overflow {
+            if method_for_wal {
+                server.fatal = true;
+            }
+            server.response_for_result(
+                req.id,
+                Err(Server::execution_client_error(
+                    "bounded indexing request exceeds its byte limit".to_string(),
+                )),
+            )
+        } else if let Some(version) = progress_protocol_version {
             if version != 1 || req.method != "batch_commit" {
                 server.fatal = true;
                 server.response_for_result(
@@ -6219,20 +7011,23 @@ fn run_normal(db_path: PathBuf) -> io::Result<()> {
             // an external path and must do no I/O while idle or recovering.
             server.handle_prepared(req)
         } else if method_for_wal {
-            match server.canonicalize_request(req.clone()) {
+            let request_id = req.id;
+            match server.canonicalize_request(req) {
                 Err(err) => {
                     server.fatal = true;
-                    server.response_for_result(req.id, Err(err))
+                    server.response_for_result(request_id, Err(err))
                 }
                 Ok(canonical) => {
-                    let validation = server.validate_mutation_params(&canonical);
+                    let validation = server
+                        .validate_new_mutation_request_id(canonical.id)
+                        .and_then(|()| server.validate_mutation_params(&canonical));
                     if let Err(err) = validation {
                         server.fatal = true;
-                        server.response_for_result(req.id, Err(err))
+                        server.response_for_result(request_id, Err(err))
                     } else if let Err(err) = server.wal_append(&canonical) {
                         server.fatal = true;
                         server.response_for_result(
-                            req.id,
+                            request_id,
                             Err(Server::execution_io_error(format!(
                                 "durability failure: {err}"
                             ))),
@@ -6245,8 +7040,7 @@ fn run_normal(db_path: PathBuf) -> io::Result<()> {
         } else {
             server.handle_prepared(req)
         };
-        let payload = serde_json::to_string(&resp)
-            .map_err(|err| io::Error::other(format!("serialize response failed: {err}")))?;
+        let payload = serialize_normal_response(&resp, bounded_indexing_response)?;
         if let Err(write_err) = stdout
             .write_all(payload.as_bytes())
             .and_then(|_| stdout.write_all(b"\n"))
@@ -6446,6 +7240,134 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn snapshot_delta_merge_indexes_only_incoming_ids_and_preserves_order() {
+        let mut existing = (0..100_000)
+            .map(|index| json!({"factId": format!("f{index}"), "value": index}))
+            .collect::<Vec<_>>();
+        Server::merge_snapshot_section(
+            &mut existing,
+            vec![
+                json!({"factId":"f99999","value":"replaced"}),
+                json!({"factId":"new","value":"appended"}),
+            ],
+            "factId",
+        );
+        assert_eq!(existing.len(), 100_001);
+        assert_eq!(existing[99_999]["value"], json!("replaced"));
+        assert_eq!(existing[100_000]["factId"], json!("new"));
+
+        let source = std::fs::read_to_string(file!()).expect("read native source");
+        let start = source
+            .find("fn merge_snapshot_section")
+            .expect("delta merge helper");
+        let end = source[start..]
+            .find("fn validate_mutation_params")
+            .map(|offset| start + offset)
+            .expect("next helper");
+        let helper = &source[start..end];
+        assert!(helper.contains("incoming_index"));
+        assert!(!helper.contains("existing.iter().enumerate()"));
+        assert!(!helper.contains("HashMap<String, usize> = HashMap::new()"));
+    }
+
+    #[test]
+    fn indexing_wire_accounting_is_exact_at_max_and_max_plus_one() {
+        let empty_response = RpcResponse {
+            id: u64::MAX,
+            ok: true,
+            result: Some(json!([])),
+            error: None,
+        };
+        let empty_bytes = serde_json::to_vec(&empty_response).unwrap().len() as u64;
+        let array_limit = Server::indexing_result_array_limit(u64::MAX).unwrap();
+        assert_eq!(array_limit + empty_bytes - 2, MAX_INDEXING_RESPONSE_BYTES);
+
+        let first = json!({"factId":"f1","text":"ok"});
+        let unbounded_first =
+            Server::add_bounded_indexing_response_item(2, &first, false, u64::MAX)
+                .expect("measure first bounded item");
+        let first_bytes =
+            Server::add_bounded_indexing_response_item(2, &first, false, unbounded_first)
+                .expect("exact array maximum");
+        assert_eq!(first_bytes, unbounded_first);
+        assert!(
+            Server::add_bounded_indexing_response_item(2, &first, false, unbounded_first - 1)
+                .is_err(),
+            "array max+1 must fail"
+        );
+        let second = json!({"factId":"f2","text":"ok"});
+        let second_bytes =
+            Server::add_bounded_indexing_response_item(first_bytes, &second, true, u64::MAX)
+                .expect("second bounded item");
+        assert_eq!(
+            second_bytes,
+            2 + serde_json::to_vec(&first).unwrap().len() as u64
+                + 1
+                + serde_json::to_vec(&second).unwrap().len() as u64
+        );
+
+        let empty_string_response = RpcResponse {
+            id: u64::MAX,
+            ok: true,
+            result: Some(Value::String(String::new())),
+            error: None,
+        };
+        let base_bytes = serde_json::to_vec(&empty_string_response).unwrap().len();
+        let payload_bytes = MAX_INDEXING_RESPONSE_BYTES as usize - base_bytes;
+        let mut exact_response = RpcResponse {
+            id: u64::MAX,
+            ok: true,
+            result: Some(Value::String("x".repeat(payload_bytes))),
+            error: None,
+        };
+        assert_eq!(
+            serde_json::to_vec(&exact_response).unwrap().len() as u64,
+            MAX_INDEXING_RESPONSE_BYTES
+        );
+        Server::validate_indexing_response_size(&exact_response).unwrap();
+        if let Some(Value::String(value)) = exact_response.result.as_mut() {
+            value.push('x');
+        }
+        assert!(Server::validate_indexing_response_size(&exact_response).is_err());
+
+        let request = RpcRequest {
+            id: 1,
+            method: "memory_get_active_facts".to_string(),
+            params: json!({"corpusId":"c1","limit":1}),
+        };
+        let request_bytes = serde_json::to_vec(&request).unwrap().len() as u64;
+        assert_eq!(
+            Server::bounded_serialized_bytes(&request, request_bytes, "too large").unwrap(),
+            request_bytes
+        );
+        assert!(
+            Server::bounded_serialized_bytes(&request, request_bytes - 1, "too large").is_err()
+        );
+    }
+
+    #[test]
+    fn normal_frame_reader_bounds_input_and_preserves_legacy_eof() {
+        let mut exact = BufReader::new(&b"abc\r\nrest"[..]);
+        assert_eq!(
+            read_bounded_normal_frame(&mut exact, 4).unwrap(),
+            Some(b"abc".to_vec())
+        );
+        assert_eq!(
+            read_bounded_normal_frame(&mut exact, 4).unwrap(),
+            Some(b"rest".to_vec())
+        );
+        assert_eq!(read_bounded_normal_frame(&mut exact, 4).unwrap(), None);
+
+        let mut exact_max = BufReader::new(&b"abcd\n"[..]);
+        assert_eq!(
+            read_bounded_normal_frame(&mut exact_max, 4).unwrap(),
+            Some(b"abcd".to_vec())
+        );
+        let mut max_plus_one = BufReader::new(&b"abcde\n"[..]);
+        assert!(read_bounded_normal_frame(&mut max_plus_one, 4).is_err());
     }
 
     #[derive(Default)]
@@ -7223,6 +8145,7 @@ mod tests {
                 "maxRecordBytes": MAX_WAL_RECORD_BYTES,
                 "maxBytes": MAX_WAL_BYTES,
                 "maxRecords": MAX_WAL_RECORDS,
+                "mutationRequestIdUniqueness": "activeTransaction",
             })
         );
 
@@ -7587,6 +8510,9 @@ mod tests {
             "memory_save",
             "memory_save_file",
             "memory_load",
+            "memory_get_schemas_by_ids",
+            "memory_get_active_facts",
+            "memory_activate_facts_by_schema_ids",
             "memory_save_checkpoint",
             "memory_load_checkpoint",
             "memory_validate_integrity",
@@ -7606,6 +8532,24 @@ mod tests {
             .map(|spec| spec.name)
             .collect::<BTreeSet<_>>();
         assert_eq!(actual, expected);
+
+        let expected_bounded_indexing = [
+            "memory_upsert",
+            "memory_get_schemas_by_ids",
+            "memory_get_active_facts",
+            "memory_activate_facts_by_schema_ids",
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let actual_bounded_indexing = METHOD_SPECS
+            .iter()
+            .filter(|spec| spec.wire_profile == MethodWireProfile::BoundedIndexing)
+            .map(|spec| spec.name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_bounded_indexing, expected_bounded_indexing);
+        assert!(!Server::is_indexing_memory_method(
+            "unknown_dispatch_method"
+        ));
 
         for spec in METHOD_SPECS {
             let path = temp_path("agdb-native-dispatch");
