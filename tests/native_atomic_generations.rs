@@ -2594,6 +2594,9 @@ fn protocol_info_is_the_method_policy_and_unknown_is_not_a_read() {
         ("memory_save", "mutation", true),
         ("memory_save_file", "mutation", true),
         ("memory_load", "read", false),
+        ("memory_get_schemas_by_ids", "read", false),
+        ("memory_get_active_facts", "read", false),
+        ("memory_activate_facts_by_schema_ids", "mutation", true),
         ("memory_save_checkpoint", "mutation", true),
         ("memory_load_checkpoint", "read", false),
         ("memory_validate_integrity", "read", false),
@@ -2663,6 +2666,917 @@ fn mutation_requires_explicit_active_batch_and_recovery_commit_requires_new_muta
     assert_eq!(recovery_commit["ok"], json!(false));
     assert_eq!(bare.finish().code(), Some(0));
     assert_eq!(generation(&db.path), 1);
+}
+
+#[test]
+fn bounded_indexing_memory_reads_and_activation_preserve_transaction_authority() {
+    let db = TempDb::new("bounded-indexing-memory");
+    let mut seed = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(seed.send(batch_begin(1))["ok"], json!(true));
+    assert_eq!(
+        seed.send(json!({
+            "id": 2,
+            "method": "memory_upsert",
+            "params": {
+                "corpusId": "c1",
+                "schemas": [
+                    {"schemaId":"s1","corpusId":"c1","state":"pending"},
+                    {"schemaId":"s2","corpusId":"c1","state":"stable"}
+                ],
+                "facts": [
+                    {"factId":"f1","corpusId":"c1","schemaId":"s1","state":"inactive","updatedAt":"before"},
+                    {"factId":"f2","corpusId":"c1","schemaId":"s2","state":"active","updatedAt":"before"},
+                    {"factId":"f3","corpusId":"c1","schemaId":"s2","state":"inactive","updatedAt":"before"}
+                ]
+            }
+        }))["ok"],
+        json!(true)
+    );
+    assert_eq!(seed.commit(3)["ok"], json!(true));
+    assert_eq!(seed.finish().code(), Some(0));
+
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    let info = native.send(json!({"id":4,"method":"protocol_info","params":{}}));
+    assert_eq!(
+        info["result"]["limits"]["indexingMemory"],
+        json!({
+            "schema":"native-indexing-memory@1",
+            "maxRequestBytes":67108864,
+            "maxResponseBytes":8388608,
+            "maxSchemaIds":4096,
+            "maxActiveFacts":100,
+            "maxDeltaItemsPerSection":4096,
+            "maxDomainIdBytes":4096,
+            "maxCorpusIdBytes":1024,
+            "maxUpdatedAtBytes":128
+        })
+    );
+    assert_eq!(
+        info["result"]["limits"]["wire"]["maxNormalRequestFrameBytes"],
+        json!(536870912)
+    );
+    assert_eq!(
+        info["result"]["limits"]["wal"]["mutationRequestIdUniqueness"],
+        json!("activeTransaction")
+    );
+    let schemas = native.send(json!({
+        "id":5,
+        "method":"memory_get_schemas_by_ids",
+        "params":{"corpusId":"c1","schemaIds":["s2","missing","s1"]}
+    }));
+    assert_eq!(schemas["ok"], json!(true));
+    assert_eq!(schemas["result"].as_array().unwrap().len(), 2);
+    assert_eq!(schemas["result"][0]["schemaId"], json!("s2"));
+    assert_eq!(schemas["result"][1]["schemaId"], json!("s1"));
+    assert_eq!(
+        native.send(json!({
+            "id":6,
+            "method":"memory_get_schemas_by_ids",
+            "params":{"corpusId":"c1","schemaIds":[]}
+        }))["result"],
+        json!([])
+    );
+    assert_eq!(
+        native.send(json!({
+            "id":7,
+            "method":"memory_get_active_facts",
+            "params":{"corpusId":"c1","limit":1}
+        }))["result"][0]["factId"],
+        json!("f2")
+    );
+    assert_eq!(
+        native.send(json!({
+            "id":8,
+            "method":"memory_get_active_facts",
+            "params":{"corpusId":"c1","limit":0}
+        }))["result"],
+        json!([])
+    );
+    let over_limit = native.send(json!({
+        "id":9,
+        "method":"memory_get_active_facts",
+        "params":{"corpusId":"c1","limit":101}
+    }));
+    assert_eq!(over_limit["ok"], json!(false));
+
+    assert_eq!(native.send(batch_begin(10))["ok"], json!(true));
+    let activated = native.send(json!({
+        "id":11,
+        "method":"memory_activate_facts_by_schema_ids",
+        "params":{"corpusId":"c1","schemaIds":["s1"],"updatedAt":"after"}
+    }));
+    assert_eq!(activated["result"], json!({"activated":1}));
+    let read_own_write = native.send(json!({
+        "id":12,
+        "method":"memory_get_active_facts",
+        "params":{"corpusId":"c1","limit":100}
+    }));
+    assert_eq!(read_own_write["result"][0]["factId"], json!("f1"));
+    assert_eq!(read_own_write["result"][0]["updatedAt"], json!("after"));
+    assert_eq!(read_own_write["result"][1]["factId"], json!("f2"));
+    assert_eq!(
+        native.send(json!({
+            "id":13,
+            "method":"memory_activate_facts_by_schema_ids",
+            "params":{"corpusId":"c1","schemaIds":["s1"],"updatedAt":"later"}
+        }))["result"],
+        json!({"activated":0})
+    );
+    assert_eq!(native.commit(14)["ok"], json!(true));
+    assert_eq!(native.finish().code(), Some(0));
+
+    let mut crash = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(crash.send(batch_begin(15))["ok"], json!(true));
+    assert_eq!(
+        crash.send(json!({
+            "id":16,
+            "method":"memory_activate_facts_by_schema_ids",
+            "params":{"corpusId":"c1","schemaIds":["s2"],"updatedAt":"uncommitted"}
+        }))["result"],
+        json!({"activated":1})
+    );
+    assert_eq!(crash.finish().code(), Some(0));
+    let activation_wal = std::fs::read(db.path.with_extension("agdb.wal")).unwrap();
+    assert!(
+        activation_wal
+            .windows(b"memory_activate_facts_by_schema_ids".len())
+            .any(|window| window == b"memory_activate_facts_by_schema_ids"),
+        "new-method intent must remain exact in recovery WAL"
+    );
+    let canonical: Value = serde_json::from_slice(&std::fs::read(&db.path).unwrap()).unwrap();
+    let f3 = canonical["snapshots"]["c1"]["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|fact| fact["factId"] == json!("f3"))
+        .unwrap();
+    assert_eq!(f3["state"], json!("inactive"));
+    discard_pending_recovery(&db.path);
+    assert!(
+        !db.path.with_extension("agdb.wal").exists(),
+        "the current binary must quarantine new-method WAL before legacy binary rollback"
+    );
+    let mut rollback_safe = NativeProcess::spawn(&db.path, &[]);
+    let info = rollback_safe.send(json!({"id":17,"method":"protocol_info","params":{}}));
+    assert_eq!(info["result"]["state"], json!("idle"));
+    assert_eq!(info["result"]["generation"], json!(2));
+    assert_eq!(rollback_safe.finish().code(), Some(0));
+}
+
+#[test]
+fn bounded_indexing_memory_rejects_ambiguous_or_cross_corpus_input_before_wal() {
+    let cases = [
+        (
+            "empty-schema-ids",
+            json!({
+                "method":"memory_activate_facts_by_schema_ids",
+                "params":{"corpusId":"c1","schemaIds":[],"updatedAt":"now"}
+            }),
+        ),
+        (
+            "duplicate-schema-ids",
+            json!({
+                "method":"memory_activate_facts_by_schema_ids",
+                "params":{"corpusId":"c1","schemaIds":["s1","s1"],"updatedAt":"now"}
+            }),
+        ),
+        (
+            "unknown-activation-field",
+            json!({
+                "method":"memory_activate_facts_by_schema_ids",
+                "params":{"corpusId":"c1","schemaIds":["s1"],"updatedAt":"now","extra":true}
+            }),
+        ),
+        (
+            "duplicate-upsert-ids",
+            json!({
+                "method":"memory_upsert",
+                "params":{"corpusId":"c1","facts":[
+                    {"factId":"f1","corpusId":"c1","schemaId":"s1","state":"inactive"},
+                    {"factId":"f1","corpusId":"c1","schemaId":"s1","state":"inactive"}
+                ]}
+            }),
+        ),
+        (
+            "cross-corpus-upsert",
+            json!({
+                "method":"memory_upsert",
+                "params":{"corpusId":"c1","facts":[{"factId":"f1","corpusId":"c2","schemaId":"s1","state":"inactive"}]}
+            }),
+        ),
+        (
+            "non-string-corpus-upsert",
+            json!({
+                "method":"memory_upsert",
+                "params":{"corpusId":"c1","facts":[{"factId":"f1","corpusId":3,"schemaId":"s1","state":"inactive"}]}
+            }),
+        ),
+        (
+            "missing-fact-schema-id",
+            json!({
+                "method":"memory_upsert",
+                "params":{"corpusId":"c1","facts":[{"factId":"f1","state":"inactive"}]}
+            }),
+        ),
+        (
+            "missing-fact-state",
+            json!({
+                "method":"memory_upsert",
+                "params":{"corpusId":"c1","facts":[{"factId":"f1","schemaId":"s1"}]}
+            }),
+        ),
+        (
+            "non-string-fact-schema-id",
+            json!({
+                "method":"memory_upsert",
+                "params":{"corpusId":"c1","facts":[{"factId":"f1","schemaId":1,"state":"inactive"}]}
+            }),
+        ),
+        (
+            "non-string-fact-state",
+            json!({
+                "method":"memory_upsert",
+                "params":{"corpusId":"c1","facts":[{"factId":"f1","schemaId":"s1","state":1}]}
+            }),
+        ),
+        (
+            "overlong-fact-schema-id",
+            json!({
+                "method":"memory_upsert",
+                "params":{"corpusId":"c1","facts":[{"factId":"f1","schemaId":"x".repeat(4097),"state":"inactive"}]}
+            }),
+        ),
+        (
+            "overlong-fact-state",
+            json!({
+                "method":"memory_upsert",
+                "params":{"corpusId":"c1","facts":[{"factId":"f1","schemaId":"s1","state":"x".repeat(4097)}]}
+            }),
+        ),
+    ];
+    for (label, mut request) in cases {
+        let db = TempDb::new(label);
+        let mut native = NativeProcess::spawn(&db.path, &[]);
+        assert_eq!(native.send(batch_begin(1))["ok"], json!(true), "{label}");
+        request["id"] = json!(2);
+        assert_eq!(native.send(request)["ok"], json!(false), "{label}");
+        assert_ne!(native.finish().code(), Some(0), "{label}");
+        assert!(!db.path.exists(), "{label} published a generation");
+        assert!(
+            !db.path.with_extension("agdb.wal").exists(),
+            "{label} appended WAL before validation"
+        );
+    }
+
+    let db = TempDb::new("schema-cap-max-plus-one");
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    let ids = (0..=4096)
+        .map(|index| format!("s{index}"))
+        .collect::<Vec<_>>();
+    let rejected = native.send(json!({
+        "id":1,
+        "method":"memory_get_schemas_by_ids",
+        "params":{"corpusId":"c1","schemaIds":ids}
+    }));
+    assert_eq!(rejected["ok"], json!(false));
+    let duplicate_read = native.send(json!({
+        "id":2,
+        "method":"memory_get_schemas_by_ids",
+        "params":{"corpusId":"c1","schemaIds":["s1","s1"]}
+    }));
+    assert_eq!(duplicate_read["ok"], json!(false));
+    let unknown_read_field = native.send(json!({
+        "id":3,
+        "method":"memory_get_active_facts",
+        "params":{"corpusId":"c1","limit":1,"extra":true}
+    }));
+    assert_eq!(unknown_read_field["ok"], json!(false));
+    let oversized_id = "x".repeat(4097);
+    assert_eq!(
+        native.send(json!({
+            "id":4,
+            "method":"memory_get_schemas_by_ids",
+            "params":{"corpusId":"c1","schemaIds":[oversized_id]}
+        }))["ok"],
+        json!(false)
+    );
+    assert_eq!(native.finish().code(), Some(0));
+
+    let db = TempDb::new("activation-cap-max-plus-one");
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(native.send(batch_begin(1))["ok"], json!(true));
+    let ids = (0..=4096)
+        .map(|index| format!("s{index}"))
+        .collect::<Vec<_>>();
+    let rejected = native.send(json!({
+        "id":2,
+        "method":"memory_activate_facts_by_schema_ids",
+        "params":{"corpusId":"c1","schemaIds":ids,"updatedAt":"now"}
+    }));
+    assert_eq!(rejected["ok"], json!(false));
+    assert_ne!(native.finish().code(), Some(0));
+    assert!(!db.path.with_extension("agdb.wal").exists());
+
+    for (section, id_key) in [
+        ("passages", "passageId"),
+        ("facts", "factId"),
+        ("schemas", "schemaId"),
+    ] {
+        let db = TempDb::new(&format!("{section}-delta-cap-max-plus-one"));
+        let mut native = NativeProcess::spawn(&db.path, &[]);
+        assert_eq!(native.send(batch_begin(1))["ok"], json!(true));
+        let items = (0..=4096)
+            .map(|index| {
+                let mut item = serde_json::Map::new();
+                item.insert(id_key.to_string(), json!(format!("id-{index}")));
+                item.insert("corpusId".to_string(), json!("c1"));
+                Value::Object(item)
+            })
+            .collect::<Vec<_>>();
+        let mut params = serde_json::Map::new();
+        params.insert("corpusId".to_string(), json!("c1"));
+        params.insert(section.to_string(), Value::Array(items));
+        let rejected = native.send(json!({
+            "id":2,
+            "method":"memory_upsert",
+            "params":Value::Object(params)
+        }));
+        assert_eq!(rejected["ok"], json!(false), "{section}");
+        assert_ne!(native.finish().code(), Some(0), "{section}");
+        assert!(
+            !db.path.with_extension("agdb.wal").exists(),
+            "{section} cap failure appended WAL"
+        );
+    }
+}
+
+#[test]
+fn duplicate_mutation_request_id_is_transaction_scoped_and_rejected_before_second_wal() {
+    let db = TempDb::new("transaction-scoped-mutation-request-id");
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(native.send(batch_begin(1))["ok"], json!(true));
+    assert_eq!(
+        native.send(json!({
+            "id":2,
+            "method":"memory_upsert",
+            "params":{
+                "corpusId":"c1",
+                "facts":[{"factId":"f1","schemaId":"s1","state":"inactive"}]
+            }
+        }))["ok"],
+        json!(true)
+    );
+    assert_eq!(native.commit(3)["ok"], json!(true));
+
+    assert_eq!(native.send(batch_begin(4))["ok"], json!(true));
+    assert_eq!(
+        native.send(json!({
+            "id":2,
+            "method":"memory_upsert",
+            "params":{
+                "corpusId":"c1",
+                "facts":[{"factId":"f2","schemaId":"s1","state":"inactive"}]
+            }
+        }))["ok"],
+        json!(true),
+        "a committed transaction must release its bounded request-ID authority"
+    );
+    let wal_path = db.path.with_extension("agdb.wal");
+    let wal_before_duplicate = std::fs::read(&wal_path).unwrap();
+    let duplicate = native.send(json!({
+        "id":2,
+        "method":"memory_upsert",
+        "params":{
+            "corpusId":"c1",
+            "facts":[{"factId":"f3","schemaId":"s1","state":"inactive"}]
+        }
+    }));
+    assert_eq!(duplicate["ok"], json!(false));
+    assert_eq!(duplicate["error"]["failureClass"], json!("CLIENT_INPUT"));
+    assert_ne!(native.finish().code(), Some(0));
+    assert_eq!(
+        std::fs::read(&wal_path).unwrap(),
+        wal_before_duplicate,
+        "duplicate mutation request ID appended a second WAL record"
+    );
+    let canonical: Value = serde_json::from_slice(&std::fs::read(&db.path).unwrap()).unwrap();
+    assert_eq!(canonical["generation"], json!(1));
+    assert_eq!(
+        canonical["snapshots"]["c1"]["facts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        canonical["snapshots"]["c1"]["facts"][0]["factId"],
+        json!("f1")
+    );
+    discard_pending_recovery(&db.path);
+}
+
+#[test]
+fn bounded_indexing_delta_exact_max_is_accepted_and_replay_is_idempotent() {
+    let db = TempDb::new("bounded-indexing-delta-exact-max");
+    let facts = (0..4096)
+        .map(|index| {
+            json!({
+                "factId":format!("f-{index}"),
+                "corpusId":"c1",
+                "schemaId":"s1",
+                "state":"inactive"
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut request = json!({
+        "id":2,
+        "method":"memory_upsert",
+        "params":{"corpusId":"c1","facts":facts,"exportedAt":""}
+    });
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(native.send(batch_begin(1))["ok"], json!(true));
+    assert_eq!(native.send(request.clone())["ok"], json!(true));
+    request["id"] = json!(3);
+    assert_eq!(native.send(request)["ok"], json!(true));
+    assert_eq!(native.commit(4)["ok"], json!(true));
+    assert_eq!(native.finish().code(), Some(0));
+
+    let mut verify = NativeProcess::spawn(&db.path, &[]);
+    let snapshot = verify.send(json!({
+        "id":5,"method":"memory_load","params":{"corpusId":"c1"}
+    }));
+    assert_eq!(snapshot["result"]["facts"].as_array().unwrap().len(), 4096);
+    assert_eq!(snapshot["result"]["exportedAt"], json!(""));
+    assert_eq!(verify.finish().code(), Some(0));
+}
+
+#[test]
+fn bounded_indexing_upsert_repairs_a_legacy_malformed_fact_by_same_id() {
+    let db = TempDb::new("bounded-indexing-repairs-legacy-fact");
+    let source = db.dir.join("legacy-malformed-fact.json");
+    std::fs::write(
+        &source,
+        json!({
+            "corpusId":"c1",
+            "passages":[],
+            "schemas":[],
+            "facts":[{"factId":"f1","corpusId":"c1","value":"legacy"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut seed = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(seed.send(batch_begin(1))["ok"], json!(true));
+    assert_eq!(seed.send(memory_save_file(2, &source))["ok"], json!(true));
+    assert_eq!(seed.commit(3)["ok"], json!(true));
+    assert_eq!(seed.finish().code(), Some(0));
+
+    let mut repair = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(repair.send(batch_begin(4))["ok"], json!(true));
+    assert_eq!(
+        repair.send(json!({
+            "id":5,
+            "method":"memory_upsert",
+            "params":{
+                "corpusId":"c1",
+                "facts":[{
+                    "factId":"f1",
+                    "corpusId":"c1",
+                    "schemaId":"s1",
+                    "state":"active",
+                    "value":"repaired"
+                }]
+            }
+        }))["ok"],
+        json!(true)
+    );
+    assert_eq!(repair.commit(6)["ok"], json!(true));
+    assert_eq!(repair.finish().code(), Some(0));
+
+    let mut verify = NativeProcess::spawn(&db.path, &[]);
+    let active = verify.send(json!({
+        "id":7,
+        "method":"memory_get_active_facts",
+        "params":{"corpusId":"c1","limit":1}
+    }));
+    assert_eq!(active["ok"], json!(true));
+    assert_eq!(active["result"].as_array().unwrap().len(), 1);
+    assert_eq!(active["result"][0]["factId"], json!("f1"));
+    assert_eq!(active["result"][0]["value"], json!("repaired"));
+    assert_eq!(verify.finish().code(), Some(0));
+}
+
+#[test]
+fn bounded_indexing_reads_reject_cross_corpus_stored_objects() {
+    let db = TempDb::new("bounded-indexing-stored-corpus");
+    let source = db.dir.join("snapshot.json");
+    std::fs::write(
+        &source,
+        json!({
+            "corpusId":"c1",
+            "schemas":[{"schemaId":"s1","corpusId":"c2"}],
+            "facts":[{"factId":"f1","corpusId":"c2","schemaId":"s1","state":"active"}],
+            "passages":[]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut seed = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(seed.send(batch_begin(1))["ok"], json!(true));
+    assert_eq!(seed.send(memory_save_file(2, &source))["ok"], json!(true));
+    assert_eq!(seed.commit(3)["ok"], json!(true));
+    assert_eq!(seed.finish().code(), Some(0));
+
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(
+        native.send(json!({
+            "id":4,
+            "method":"memory_get_schemas_by_ids",
+            "params":{"corpusId":"c1","schemaIds":["s1"]}
+        }))["ok"],
+        json!(false)
+    );
+    assert_eq!(
+        native.send(json!({
+            "id":5,
+            "method":"memory_get_active_facts",
+            "params":{"corpusId":"c1","limit":1}
+        }))["ok"],
+        json!(false)
+    );
+    assert_eq!(native.send(batch_begin(6))["ok"], json!(true));
+    assert_eq!(
+        native.send(json!({
+            "id":7,
+            "method":"memory_activate_facts_by_schema_ids",
+            "params":{"corpusId":"c1","schemaIds":["s1"],"updatedAt":"now"}
+        }))["ok"],
+        json!(false)
+    );
+    assert_ne!(native.finish().code(), Some(0));
+    assert_eq!(
+        std::fs::metadata(db.path.with_extension("agdb.wal"))
+            .unwrap()
+            .len(),
+        0,
+        "stored corpus mismatch must fail before WAL append"
+    );
+    assert_eq!(generation(&db.path), 1);
+
+    let malformed = TempDb::new("bounded-indexing-stored-shape");
+    let source = malformed.dir.join("snapshot.json");
+    std::fs::write(
+        &source,
+        json!({
+            "corpusId":"c1",
+            "schemas":[{"schemaId":"s1","corpusId":3}],
+            "facts":[{"factId":"f1","corpusId":3,"schemaId":"s1","state":3}],
+            "passages":[]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut seed = NativeProcess::spawn(&malformed.path, &[]);
+    assert_eq!(seed.send(batch_begin(1))["ok"], json!(true));
+    assert_eq!(seed.send(memory_save_file(2, &source))["ok"], json!(true));
+    assert_eq!(seed.commit(3)["ok"], json!(true));
+    assert_eq!(seed.finish().code(), Some(0));
+    let mut native = NativeProcess::spawn(&malformed.path, &[]);
+    assert_eq!(
+        native.send(json!({
+            "id":4,
+            "method":"memory_get_schemas_by_ids",
+            "params":{"corpusId":"c1","schemaIds":["s1"]}
+        }))["ok"],
+        json!(false)
+    );
+    assert_eq!(
+        native.send(json!({
+            "id":5,
+            "method":"memory_get_active_facts",
+            "params":{"corpusId":"c1","limit":1}
+        }))["ok"],
+        json!(false)
+    );
+    assert_eq!(native.send(batch_begin(6))["ok"], json!(true));
+    assert_eq!(
+        native.send(json!({
+            "id":7,
+            "method":"memory_activate_facts_by_schema_ids",
+            "params":{"corpusId":"c1","schemaIds":["s1"],"updatedAt":"now"}
+        }))["ok"],
+        json!(false)
+    );
+    assert_ne!(native.finish().code(), Some(0));
+    assert_eq!(
+        std::fs::metadata(malformed.path.with_extension("agdb.wal"))
+            .unwrap()
+            .len(),
+        0,
+        "malformed stored fact must fail before WAL append"
+    );
+    assert_eq!(generation(&malformed.path), 1);
+}
+
+#[test]
+fn bounded_indexing_upsert_validates_every_stored_section_before_wal() {
+    for (section, id_key) in [
+        ("passages", "passageId"),
+        ("facts", "factId"),
+        ("schemas", "schemaId"),
+    ] {
+        let db = TempDb::new(&format!("stored-{section}-preflight"));
+        let source = db.dir.join("snapshot.json");
+        let mut stored_item = serde_json::Map::new();
+        stored_item.insert(id_key.to_string(), json!("existing"));
+        stored_item.insert("corpusId".to_string(), json!("wrong-corpus"));
+        if section == "facts" {
+            stored_item.insert("schemaId".to_string(), json!("s1"));
+            stored_item.insert("state".to_string(), json!("inactive"));
+        }
+        let mut snapshot = json!({
+            "corpusId":"c1",
+            "passages":[],
+            "facts":[],
+            "schemas":[]
+        });
+        snapshot[section] = Value::Array(vec![Value::Object(stored_item)]);
+        std::fs::write(&source, snapshot.to_string()).unwrap();
+
+        let mut seed = NativeProcess::spawn(&db.path, &[]);
+        assert_eq!(seed.send(batch_begin(1))["ok"], json!(true));
+        assert_eq!(seed.send(memory_save_file(2, &source))["ok"], json!(true));
+        assert_eq!(seed.commit(3)["ok"], json!(true));
+        assert_eq!(seed.finish().code(), Some(0));
+        assert_zero_wal(&db.path, "seeded stored-section preflight");
+
+        let mut incoming_item = serde_json::Map::new();
+        incoming_item.insert(id_key.to_string(), json!("incoming"));
+        incoming_item.insert("corpusId".to_string(), json!("c1"));
+        if section == "facts" {
+            incoming_item.insert("schemaId".to_string(), json!("s1"));
+            incoming_item.insert("state".to_string(), json!("inactive"));
+        }
+        let mut params = serde_json::Map::new();
+        params.insert("corpusId".to_string(), json!("c1"));
+        params.insert(
+            section.to_string(),
+            Value::Array(vec![Value::Object(incoming_item)]),
+        );
+        let mut native = NativeProcess::spawn(&db.path, &[]);
+        assert_eq!(native.send(batch_begin(4))["ok"], json!(true));
+        let rejected = native.send(json!({
+            "id":5,
+            "method":"memory_upsert",
+            "params":Value::Object(params)
+        }));
+        assert_eq!(rejected["ok"], json!(false), "{section}");
+        assert_ne!(native.finish().code(), Some(0), "{section}");
+        assert_eq!(
+            std::fs::metadata(db.path.with_extension("agdb.wal"))
+                .unwrap()
+                .len(),
+            0,
+            "{section} stored corruption appended WAL"
+        );
+        assert_eq!(generation(&db.path), 1, "{section}");
+    }
+}
+
+#[test]
+fn bounded_indexing_exact_max_and_all_section_upsert_are_corpus_isolated() {
+    let db = TempDb::new("bounded-indexing-parity");
+    let mut seed = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(seed.send(batch_begin(1))["ok"], json!(true));
+    for (id, corpus_id, value) in [(2, "c1", "one"), (3, "c2", "two")] {
+        assert_eq!(
+            seed.send(json!({
+                "id":id,
+                "method":"memory_upsert",
+                "params":{
+                    "corpusId":corpus_id,
+                    "passages":[{"passageId":"p1","corpusId":corpus_id,"text":value}],
+                    "facts":[{"factId":"f1","corpusId":corpus_id,"schemaId":"s1","state":"inactive","value":value}],
+                    "schemas":[{"schemaId":"s1","corpusId":corpus_id,"state":"pending","value":value}]
+                }
+            }))["ok"],
+            json!(true)
+        );
+    }
+    assert_eq!(seed.commit(4)["ok"], json!(true));
+    assert_eq!(seed.finish().code(), Some(0));
+
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    let mut schema_ids = (0..4095)
+        .map(|index| format!("missing-{index}"))
+        .collect::<Vec<_>>();
+    schema_ids.insert(2048, "s1".to_string());
+    assert_eq!(schema_ids.len(), 4096);
+    let c1_schema = native.send(json!({
+        "id":5,
+        "method":"memory_get_schemas_by_ids",
+        "params":{"corpusId":"c1","schemaIds":schema_ids}
+    }));
+    assert_eq!(c1_schema["result"].as_array().unwrap().len(), 1);
+    assert_eq!(c1_schema["result"][0]["value"], json!("one"));
+    let c2_schema = native.send(json!({
+        "id":6,
+        "method":"memory_get_schemas_by_ids",
+        "params":{"corpusId":"c2","schemaIds":["s1"]}
+    }));
+    assert_eq!(c2_schema["result"][0]["value"], json!("two"));
+
+    assert_eq!(native.send(batch_begin(7))["ok"], json!(true));
+    let mut activation_ids = (0..4095)
+        .map(|index| format!("missing-{index}"))
+        .collect::<Vec<_>>();
+    activation_ids.push("s1".to_string());
+    assert_eq!(activation_ids.len(), 4096);
+    assert_eq!(
+        native.send(json!({
+            "id":8,
+            "method":"memory_activate_facts_by_schema_ids",
+            "params":{"corpusId":"c1","schemaIds":activation_ids,"updatedAt":"activated"}
+        }))["result"],
+        json!({"activated":1})
+    );
+    assert_eq!(
+        native.send(json!({
+            "id":9,
+            "method":"memory_upsert",
+            "params":{
+                "corpusId":"c1",
+                "passages":[
+                    {"passageId":"p1","corpusId":"c1","text":"one-replaced"},
+                    {"passageId":"p2","corpusId":"c1","text":"one-new"}
+                ],
+                "facts":[
+                    {"factId":"f1","corpusId":"c1","schemaId":"s1","state":"active","value":"one-replaced"},
+                    {"factId":"f2","corpusId":"c1","schemaId":"s2","state":"inactive","value":"one-new"}
+                ],
+                "schemas":[
+                    {"schemaId":"s1","corpusId":"c1","state":"stable","value":"one-replaced"},
+                    {"schemaId":"s2","corpusId":"c1","state":"pending","value":"one-new"}
+                ]
+            }
+        }))["ok"],
+        json!(true)
+    );
+    assert_eq!(native.commit(10)["ok"], json!(true));
+    assert_eq!(native.finish().code(), Some(0));
+
+    let mut verify = NativeProcess::spawn(&db.path, &[]);
+    let c1 = verify.send(json!({
+        "id":11,"method":"memory_load","params":{"corpusId":"c1"}
+    }));
+    for (section, id_key, value_key) in [
+        ("passages", "passageId", "text"),
+        ("facts", "factId", "value"),
+        ("schemas", "schemaId", "value"),
+    ] {
+        let values = c1["result"][section].as_array().unwrap();
+        assert_eq!(values.len(), 2, "{section}");
+        assert_eq!(values[0][id_key], json!(format!("{}1", &id_key[..1])));
+        assert_eq!(values[1][id_key], json!(format!("{}2", &id_key[..1])));
+        assert_eq!(values[0][value_key], json!("one-replaced"));
+        assert_eq!(values[1][value_key], json!("one-new"));
+    }
+    let c2 = verify.send(json!({
+        "id":12,"method":"memory_load","params":{"corpusId":"c2"}
+    }));
+    assert_eq!(c2["result"]["passages"][0]["text"], json!("two"));
+    assert_eq!(c2["result"]["facts"][0]["state"], json!("inactive"));
+    assert_eq!(c2["result"]["schemas"][0]["value"], json!("two"));
+    assert_eq!(verify.finish().code(), Some(0));
+}
+
+#[test]
+fn bounded_indexing_preserves_full_snapshot_compatibility_and_extensions() {
+    let db = TempDb::new("bounded-indexing-full-snapshot-compatibility");
+    let source = db.dir.join("snapshot.json");
+    std::fs::write(
+        &source,
+        json!({
+            "corpusId":"c1",
+            "schemaVersion":7,
+            "exportedAt":"before",
+            "extension":{"authority":"legacy-full-snapshot"},
+            "passages":[{"passageId":"p1","corpusId":"c1","text":"before"}],
+            "facts":[{"factId":"f1","corpusId":"c1","schemaId":"s1","state":"inactive","value":"before"}],
+            "schemas":[{"schemaId":"s1","corpusId":"c1","state":"pending","value":"before"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut seed = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(seed.send(batch_begin(1))["ok"], json!(true));
+    assert_eq!(seed.send(memory_save_file(2, &source))["ok"], json!(true));
+    assert_eq!(seed.commit(3)["ok"], json!(true));
+    assert_eq!(seed.finish().code(), Some(0));
+
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(native.send(batch_begin(4))["ok"], json!(true));
+    assert_eq!(
+        native.send(json!({
+            "id":5,
+            "method":"memory_upsert",
+            "params":{
+                "corpusId":"c1",
+                "exportedAt":"after",
+                "passages":[
+                    {"passageId":"p1","corpusId":"c1","text":"after"},
+                    {"passageId":"p2","corpusId":"c1","text":"new"}
+                ],
+                "facts":[
+                    {"factId":"f1","corpusId":"c1","schemaId":"s1","state":"active","value":"after"},
+                    {"factId":"f2","corpusId":"c1","schemaId":"s2","state":"inactive","value":"new"}
+                ],
+                "schemas":[
+                    {"schemaId":"s1","corpusId":"c1","state":"stable","value":"after"},
+                    {"schemaId":"s2","corpusId":"c1","state":"pending","value":"new"}
+                ]
+            }
+        }))["ok"],
+        json!(true)
+    );
+    let own_schemas = native.send(json!({
+        "id":6,
+        "method":"memory_get_schemas_by_ids",
+        "params":{"corpusId":"c1","schemaIds":["s2","s1"]}
+    }));
+    assert_eq!(own_schemas["result"][0]["value"], json!("new"));
+    assert_eq!(own_schemas["result"][1]["value"], json!("after"));
+    let own_facts = native.send(json!({
+        "id":7,
+        "method":"memory_get_active_facts",
+        "params":{"corpusId":"c1","limit":100}
+    }));
+    assert_eq!(own_facts["result"].as_array().unwrap().len(), 1);
+    assert_eq!(own_facts["result"][0]["factId"], json!("f1"));
+    assert_eq!(native.commit(8)["ok"], json!(true));
+    assert_eq!(native.finish().code(), Some(0));
+
+    let mut verify = NativeProcess::spawn(&db.path, &[]);
+    let full = verify.send(json!({
+        "id":9,"method":"memory_load","params":{"corpusId":"c1"}
+    }));
+    assert_eq!(full["result"]["schemaVersion"], json!(7));
+    assert_eq!(
+        full["result"]["extension"],
+        json!({"authority":"legacy-full-snapshot"})
+    );
+    assert_eq!(full["result"]["exportedAt"], json!("after"));
+    for section in ["passages", "facts", "schemas"] {
+        assert_eq!(full["result"][section].as_array().unwrap().len(), 2);
+    }
+    assert_eq!(verify.finish().code(), Some(0));
+}
+
+#[test]
+fn bounded_indexing_output_fails_closed_while_full_snapshot_remains_compatible() {
+    let db = TempDb::new("bounded-indexing-output-versus-full-snapshot");
+    let source = db.dir.join("snapshot.json");
+    let large_value = "x".repeat(8 * 1024 * 1024);
+    std::fs::write(
+        &source,
+        json!({
+            "corpusId":"c1",
+            "passages":[],
+            "schemas":[],
+            "facts":[{
+                "factId":"f1",
+                "corpusId":"c1",
+                "schemaId":"s1",
+                "state":"active",
+                "value":large_value
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut seed = NativeProcess::spawn(&db.path, &[]);
+    assert_eq!(seed.send(batch_begin(1))["ok"], json!(true));
+    assert_eq!(seed.send(memory_save_file(2, &source))["ok"], json!(true));
+    assert_eq!(seed.commit(3)["ok"], json!(true));
+    assert_eq!(seed.finish().code(), Some(0));
+
+    let mut native = NativeProcess::spawn(&db.path, &[]);
+    let bounded = native.send(json!({
+        "id":4,
+        "method":"memory_get_active_facts",
+        "params":{"corpusId":"c1","limit":1}
+    }));
+    assert_eq!(bounded["ok"], json!(false));
+    assert!(bounded.get("result").is_none());
+    let full = native.send(json!({
+        "id":5,"method":"memory_load","params":{"corpusId":"c1"}
+    }));
+    assert_eq!(full["ok"], json!(true));
+    assert_eq!(
+        full["result"]["facts"][0]["value"].as_str().unwrap().len(),
+        8 * 1024 * 1024
+    );
+    assert_eq!(native.finish().code(), Some(0));
 }
 
 #[test]
