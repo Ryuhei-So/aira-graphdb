@@ -1,5 +1,5 @@
 use aira_graphdb::bounded_retrieval_contract as contract;
-use serde_json::{Value, json};
+use serde_json::{Number, Value, json};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,6 +21,32 @@ fn fixture() -> Value {
 fn fixture_exchange(method: &str) -> (Value, Value) {
     let exchange = fixture()["exchanges"][method].clone();
     (exchange["request"].clone(), exchange["result"].clone())
+}
+
+fn producer_contract_value() -> Value {
+    serde_json::from_slice(include_bytes!(
+        "../spec/contracts/bounded-retrieval/bounded-retrieval-contract.json"
+    ))
+    .expect("producer contract JSON")
+}
+
+fn collect_opcodes(value: &Value, opcodes: &mut BTreeSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_opcodes(value, opcodes);
+            }
+        }
+        Value::Object(values) => {
+            if let Some(opcode) = values.get("op").and_then(Value::as_str) {
+                opcodes.insert(opcode.to_string());
+            }
+            for value in values.values() {
+                collect_opcodes(value, opcodes);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 fn normalize(dependency: &str, value: &str) -> Option<String> {
@@ -76,7 +102,17 @@ fn retrieval_artifact_is_exactly_pinned_and_embedded() {
             .iter()
             .map(|method| method.name.as_str())
             .collect::<Vec<_>>(),
-        contract::METHODS
+        Vec::<&str>::new()
+    );
+    assert!(!info.checkpoint.executable);
+    assert_eq!(info.checkpoint.availability, "unavailable");
+    assert_eq!(
+        info.checkpoint
+            .unavailable_methods
+            .iter()
+            .map(|method| method.name.as_str())
+            .collect::<Vec<_>>(),
+        contract::BOUNDED_OPERATIONS
     );
 }
 
@@ -108,6 +144,28 @@ fn closed_file_set_rejects_missing_extra_symlink_and_noncanonical_paths() {
         fs::remove_file(&path).expect("remove contract");
         symlink(FIXTURE_FILE, &path).expect("create symlink");
         assert!(contract::verify_artifact_dir(&linked.0).is_err());
+
+        let root_target = TestDir::copy_from(source);
+        let root_link = root_target.0.with_file_name(format!(
+            "{}-root-link",
+            root_target.0.file_name().unwrap().to_string_lossy()
+        ));
+        symlink(&root_target.0, &root_link).expect("create symlinked artifact root");
+        assert!(contract::verify_artifact_dir(&root_link).is_err());
+        fs::remove_file(&root_link).expect("remove symlinked root");
+
+        let parent_link = root_target.0.with_file_name(format!(
+            "{}-parent-link",
+            root_target.0.file_name().unwrap().to_string_lossy()
+        ));
+        symlink(
+            root_target.0.parent().expect("artifact root parent"),
+            &parent_link,
+        )
+        .expect("create symlinked artifact parent");
+        let root_via_parent = parent_link.join(root_target.0.file_name().unwrap());
+        assert!(contract::verify_artifact_dir(&root_via_parent).is_err());
+        fs::remove_file(&parent_link).expect("remove symlinked parent");
     }
 }
 
@@ -138,6 +196,16 @@ fn pin_hash_bytes_version_and_manifest_cross_links_fail_closed() {
     write_json(&manifest_path, &manifest);
     assert!(contract::verify_artifact_dir(&bad_manifest.0).is_err());
     assert!(contract::verify_manifest_bytes(&serde_json::to_vec(&manifest).unwrap()).is_err());
+
+    let mut bad_coverage: Value = serde_json::from_slice(include_bytes!(
+        "../spec/contracts/bounded-retrieval/bounded-retrieval-fixture.manifest.json"
+    ))
+    .expect("parse canonical retrieval manifest");
+    bad_coverage["witnessCoverage"][contract::CANDIDATE_SEARCH]["request"] = json!(9);
+    assert!(
+        contract::verify_manifest_bytes(&serde_json::to_vec(&bad_coverage).unwrap()).is_err(),
+        "manifest coverage must be derived from the canonical assertion arrays"
+    );
 
     let unknown_dependency = TestDir::copy_from(source);
     let mut manifest: Value = serde_json::from_slice(
@@ -177,16 +245,216 @@ fn unknown_schema_ir_and_dependency_are_rejected_before_semantics() {
         ["fields"]["fact"]["dependency"] = json!("unknown@1");
     let bytes = serde_json::to_vec(&unknown_dependency).expect("serialize dependency mutation");
     assert!(contract::parse_producer_contract(&bytes).is_err());
+
+    let mut misspelled_pointer = producer_contract_value();
+    misspelled_pointer["operations"][contract::FACT_EXPAND]["refinement"]["requestAssertions"][0]
+        ["collection"]["path"] = json!("/plan/seedEntities/*/scroe");
+    let bytes = serde_json::to_vec(&misspelled_pointer).expect("serialize pointer mutation");
+    assert!(
+        contract::parse_producer_contract(&bytes).is_err(),
+        "schema-static compilation must reject a pointer typo even when its array may be empty"
+    );
+
+    let mut unknown_role = producer_contract_value();
+    let unused_opcode = unknown_role["refinementNodes"]
+        .as_object()
+        .expect("refinement nodes")
+        .keys()
+        .find(|opcode| {
+            !serde_json::to_string(&unknown_role["operations"])
+                .expect("serialize operations")
+                .contains(&format!("\"{opcode}\""))
+        })
+        .cloned()
+        .expect("canonical declaration has an opcode unused by the current programs");
+    unknown_role["refinementNodes"][unused_opcode]["role"] = json!("futureRole");
+    let bytes = serde_json::to_vec(&unknown_role).expect("serialize role mutation");
+    assert!(
+        contract::parse_producer_contract(&bytes).is_err(),
+        "unsupported roles must fail closed even before an opcode is used"
+    );
+}
+
+#[test]
+fn canonical_refinement_nodes_drive_handler_coverage_and_rule_counterexamples() {
+    let canonical = producer_contract_value();
+    let parsed = contract::parse_producer_contract(
+        &serde_json::to_vec(&canonical).expect("serialize canonical producer contract"),
+    )
+    .expect("pinned producer contract");
+    assert!(!parsed.refinement_nodes.is_empty());
+    let mut used_opcodes = BTreeSet::new();
+    collect_opcodes(&canonical["operations"], &mut used_opcodes);
+
+    for (opcode, node) in &parsed.refinement_nodes {
+        assert_eq!(
+            contract::refinement_handler_count(opcode),
+            1,
+            "canonical opcode {opcode} must have exactly one native handler"
+        );
+
+        let mut bad_marker = canonical.clone();
+        let field = node
+            .fields
+            .keys()
+            .next()
+            .expect("canonical refinement node has a field");
+        bad_marker["refinementNodes"][opcode]["fields"][field] = json!("futureMarker");
+        assert!(
+            contract::parse_producer_contract(
+                &serde_json::to_vec(&bad_marker).expect("serialize marker counterexample")
+            )
+            .is_err(),
+            "canonical opcode {opcode} must reject an unsupported marker"
+        );
+
+        if used_opcodes.contains(opcode) {
+            let mut bad_role = canonical.clone();
+            bad_role["refinementNodes"][opcode]["role"] = json!(if node.role == "expression" {
+                "assertion"
+            } else {
+                "expression"
+            });
+            assert!(
+                contract::parse_producer_contract(
+                    &serde_json::to_vec(&bad_role).expect("serialize role counterexample")
+                )
+                .is_err(),
+                "canonical opcode {opcode} must drive its role"
+            );
+
+            let mut bad_field = canonical.clone();
+            let marker = node
+                .fields
+                .get(field)
+                .expect("canonical field marker")
+                .clone();
+            let fields = bad_field["refinementNodes"][opcode]["fields"]
+                .as_object_mut()
+                .expect("canonical fields object");
+            fields.remove(field);
+            fields.insert("unexpectedField".to_string(), json!(marker));
+            assert!(
+                contract::parse_producer_contract(
+                    &serde_json::to_vec(&bad_field).expect("serialize field counterexample")
+                )
+                .is_err(),
+                "canonical opcode {opcode} must drive its field set"
+            );
+        }
+    }
+
+    let mut missing_opcode = canonical.clone();
+    let removed = missing_opcode["refinementNodes"]
+        .as_object_mut()
+        .expect("canonical refinement nodes")
+        .keys()
+        .next()
+        .cloned()
+        .expect("at least one canonical opcode");
+    missing_opcode["refinementNodes"]
+        .as_object_mut()
+        .unwrap()
+        .remove(&removed);
+    assert!(
+        contract::parse_producer_contract(
+            &serde_json::to_vec(&missing_opcode).expect("serialize missing opcode")
+        )
+        .is_err()
+    );
+
+    let mut extra_opcode = canonical;
+    extra_opcode["refinementNodes"]
+        .as_object_mut()
+        .unwrap()
+        .insert(
+            "futureOpcode".to_string(),
+            json!({"fields": {}, "role": "expression"}),
+        );
+    assert!(
+        contract::parse_producer_contract(
+            &serde_json::to_vec(&extra_opcode).expect("serialize extra opcode")
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn pinned_producer_fixture_validates_through_schema_and_ir() {
-    for method in contract::METHODS {
+    contract::verify_fixture_bytes(include_bytes!(
+        "../spec/contracts/bounded-retrieval/bounded-retrieval-fixture.json"
+    ))
+    .expect("producer witness catalog");
+    for method in contract::BOUNDED_OPERATIONS {
         let (request, result) = fixture_exchange(method);
         contract::validate_semantic_request(method, &request).expect("fixture request");
         contract::validate_semantic_exchange(method, &request, &result, &normalize)
             .expect("fixture exchange");
     }
+}
+
+#[test]
+fn producer_witness_catalog_rejects_identity_patch_and_coverage_drift() {
+    let verify = |fixture: &Value| {
+        contract::verify_fixture_bytes(
+            &serde_json::to_vec(fixture).expect("serialize mutated witness fixture"),
+        )
+    };
+
+    let mut missing = fixture();
+    missing["witnesses"].as_array_mut().unwrap().pop();
+    assert!(
+        verify(&missing).is_err(),
+        "missing witness must fail closed"
+    );
+
+    let mut extra = fixture();
+    let first = extra["witnesses"][0].clone();
+    extra["witnesses"].as_array_mut().unwrap().push(first);
+    assert!(verify(&extra).is_err(), "extra witness must fail closed");
+
+    let mut duplicate = fixture();
+    duplicate["witnesses"][1] = duplicate["witnesses"][0].clone();
+    assert!(
+        verify(&duplicate).is_err(),
+        "duplicate identity must fail closed"
+    );
+
+    let mut reordered = fixture();
+    reordered["witnesses"].as_array_mut().unwrap().swap(0, 1);
+    assert!(
+        verify(&reordered).is_err(),
+        "reordered identity must fail closed"
+    );
+
+    let mut unknown_operation = fixture();
+    unknown_operation["witnesses"][0]["operation"] = json!("future_bounded@1");
+    assert!(verify(&unknown_operation).is_err());
+
+    let mut unknown_partition = fixture();
+    unknown_partition["witnesses"][0]["partition"] = json!("result");
+    assert!(verify(&unknown_partition).is_err());
+
+    let mut unknown_patch_field = fixture();
+    unknown_patch_field["witnesses"][0]["patch"]["future"] = json!(true);
+    assert!(verify(&unknown_patch_field).is_err());
+
+    let mut missing_target = fixture();
+    missing_target["witnesses"][0]["patch"]["path"] = json!("/missing");
+    assert!(verify(&missing_target).is_err());
+
+    let mut shape_breaking = fixture();
+    shape_breaking["witnesses"][0]["patch"]["value"] = Value::Null;
+    assert!(verify(&shape_breaking).is_err());
+
+    let mut non_failing = fixture();
+    let baseline_corpus =
+        non_failing["exchanges"][contract::CANDIDATE_SEARCH]["request"]["corpusId"].clone();
+    non_failing["witnesses"][0]["patch"]["value"] = baseline_corpus;
+    assert!(
+        verify(&non_failing).is_err(),
+        "a witness that no longer falsifies its exact producer assertion must fail closed"
+    );
 }
 
 #[test]
@@ -246,6 +514,24 @@ fn producer_slot_domain_digest_score_and_result_cross_links_fail_closed() {
         )
         .is_err()
     );
+
+    let mut zero_tie = candidate_result.clone();
+    let hits = zero_tie["slots"][1]["hits"]
+        .as_array_mut()
+        .expect("fact hits");
+    hits.swap(0, 1);
+    hits[0]["score"] = Value::Number(Number::from_f64(-0.0).unwrap());
+    hits[1]["score"] = Value::Number(Number::from_f64(0.0).unwrap());
+    assert!(
+        contract::validate_semantic_exchange(
+            contract::CANDIDATE_SEARCH,
+            &candidate,
+            &zero_tie,
+            &normalize,
+        )
+        .is_err(),
+        "-0 and +0 must be treated as a score tie"
+    );
     let mut duplicate = candidate_result.clone();
     let hit = duplicate["slots"][0]["hits"][0].clone();
     duplicate["slots"][0]["hits"] = json!([hit.clone(), hit]);
@@ -303,6 +589,14 @@ fn producer_slot_domain_digest_score_and_result_cross_links_fail_closed() {
     );
 
     assert!(serde_json::from_str::<Value>(r#"{"score":NaN}"#).is_err());
+}
+
+#[test]
+fn wildcard_pointer_on_empty_array_is_vacuously_valid() {
+    let (mut request, _) = fixture_exchange(contract::FACT_EXPAND);
+    request["plan"]["seedEntities"] = json!([]);
+    contract::validate_semantic_request(contract::FACT_EXPAND, &request)
+        .expect("empty wildcard collection follows Synapse vacuous semantics");
 }
 
 #[test]
@@ -782,54 +1076,53 @@ fn bounded_object_and_response_frames_reject_overflow_without_partial_output() {
 }
 
 #[test]
-fn protocol_info_is_exactly_three_read_wal_free_operations() {
+fn protocol_info_separates_unavailable_checkpoint_operations_from_executable_methods() {
     let info = contract::protocol_info().unwrap();
     let names = info
         .methods
         .iter()
         .map(|method| method.name.as_str())
         .collect::<BTreeSet<_>>();
-    assert_eq!(
-        names,
-        contract::METHODS.into_iter().collect::<BTreeSet<_>>()
-    );
-    assert_eq!(info.methods.len(), 3);
-    assert!(info.methods.iter().all(|method| {
-        method.classification == "read"
-            && !method.wal
-            && method.semantic_digest.len() == 64
-            && method.request_schema_sha256.len() == 64
-            && method.result_schema_sha256.len() == 64
-    }));
+    assert!(names.is_empty());
+    assert!(info.methods.is_empty());
     assert!(!names.contains("memory_load"));
     assert!(!names.contains("full_snapshot"));
     assert!(!names.contains("global_projection"));
     assert!(!names.contains("legacy_fallback"));
-    assert_eq!(contract::operation_names().unwrap(), contract::METHODS);
-    let expected_digests = [
-        (
-            contract::CANDIDATE_SEARCH,
-            "4255d5a4076b27d264841579c6dbd3064f90b3e1a89b0386acaad44cb562eb1a",
-        ),
-        (
-            contract::FACT_EXPAND,
-            "296423c9a1b5d5627175e537f0df5be884b17ea15ab9efe4b6875843194bc60d",
-        ),
-        (
-            contract::PPR_MATERIALIZE,
-            "cd1f4bfeb39a01b4f12db1da9a7a05d8179f27eba878d1fd7aa935eb151834ab",
-        ),
-    ];
-    for (method, digest) in expected_digests {
+    assert_eq!(
+        contract::operation_names().unwrap(),
+        contract::BOUNDED_OPERATIONS
+    );
+    assert_eq!(info.checkpoint.status, "checkpoint");
+    assert_eq!(info.checkpoint.availability, "unavailable");
+    assert!(!info.checkpoint.executable);
+    assert_eq!(
+        info.checkpoint
+            .unavailable_methods
+            .iter()
+            .map(|method| method.name.as_str())
+            .collect::<Vec<_>>(),
+        contract::BOUNDED_OPERATIONS
+    );
+    let pinned: Value = serde_json::from_slice(include_bytes!(
+        "../spec/contracts/bounded-retrieval/bounded-retrieval-pin.json"
+    ))
+    .expect("pinned retrieval metadata");
+    for method in &info.checkpoint.unavailable_methods {
         assert_eq!(
-            info.methods
-                .iter()
-                .find(|entry| entry.name == method)
-                .unwrap()
-                .semantic_digest,
-            digest
+            method.semantic_digest,
+            pinned["operationSemanticDigests"][&method.name]["sha256"]
+                .as_str()
+                .expect("pinned operation digest")
         );
     }
+    assert!(info.checkpoint.unavailable_methods.iter().all(|method| {
+        method.availability == "unavailable"
+            && method.reason == "algorithm_dispatch_not_implemented"
+            && method.semantic_digest.len() == 64
+            && method.request_schema_sha256.len() == 64
+            && method.result_schema_sha256.len() == 64
+    }));
     assert_eq!(
         info.limits.max_operation_deadline_ms,
         contract::MAX_OPERATION_DEADLINE_MS

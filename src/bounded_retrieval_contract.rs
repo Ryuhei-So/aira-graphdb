@@ -13,25 +13,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 pub const CANDIDATE_SEARCH: &str = "candidate_search_bounded@1";
 pub const FACT_EXPAND: &str = "fact_expand_bounded@1";
 pub const PPR_MATERIALIZE: &str = "ppr_materialize_bounded@1";
-pub const METHODS: [&str; 3] = [CANDIDATE_SEARCH, FACT_EXPAND, PPR_MATERIALIZE];
+/// The three operations in the pinned producer contract.  This is a contract
+/// inventory, not an executable native method inventory.
+pub const BOUNDED_OPERATIONS: [&str; 3] = [CANDIDATE_SEARCH, FACT_EXPAND, PPR_MATERIALIZE];
 
 pub const CONTRACT_VERSION: &str = "aira-synapse-bounded-retrieval-contract@1";
 pub const REFINEMENT_IR_VERSION: &str = "aira-synapse-refinement-ir@1";
 pub const NORMALIZATION_DIGEST: &str =
     "v15-entity-normalization-ecmascript-tolowercase-unicode16.0.0@1";
 pub const CONTRACT_SHA256: &str =
-    "3ef47549760243ef968f160bc6d944225d23fd8eee7f33a8368f95da85a06aaf";
+    "dd5386c8718d71c6a2588bb095d99789115272dbe66ceda3ee232753d72cada7";
 pub const RETRIEVAL_MANIFEST_SHA256: &str =
-    "6b9faa96f424ef14c08176c2ace115ad7dd0f18b2a9ec72ed3b545ae2fe67f4a";
+    "66452c6f10209f9640c981ddf9b2e750d66b12c64fa349c8fd70968cdd40e526";
 pub const SOURCE_REPOSITORY: &str = "https://github.com/Ryuhei-So/aira-synapse";
 pub const SOURCE_BRANCH: &str = "production-runtime";
-pub const SOURCE_COMMIT: &str = "a2f53107658db177a6fb0c388827f9a1121921be";
+pub const SOURCE_COMMIT: &str = "c8199660d5cdac12b617825e4a3e111ee3daa4c7";
 
 pub const MAX_SAFE_GENERATION: u64 = 9_007_199_254_740_991;
 
@@ -61,8 +63,9 @@ const CONTRACT_FILE: &str = "bounded-retrieval-contract.json";
 const FIXTURE_FILE: &str = "bounded-retrieval-fixture.json";
 const MANIFEST_FILE: &str = "bounded-retrieval-fixture.manifest.json";
 const EXPECTED_PIN_VERSION: &str = "aira-graphdb-bounded-retrieval-pin@1";
-const EXPECTED_MANIFEST_VERSION: &str = "aira-synapse-bounded-retrieval-manifest@1";
-const EXPECTED_FIXTURE_VERSION: &str = "aira-synapse-bounded-retrieval-fixture@1";
+const EXPECTED_MANIFEST_VERSION: &str = "aira-synapse-bounded-retrieval-manifest@2";
+const EXPECTED_FIXTURE_VERSION: &str = "aira-synapse-bounded-retrieval-fixture@2";
+const EXPECTED_WITNESS_VERSION: &str = "aira-synapse-bounded-retrieval-witness@1";
 const MAX_ARTIFACT_BYTES: u64 = 128 * 1024;
 const MAX_TOTAL_ARTIFACT_BYTES: u64 = 256 * 1024;
 
@@ -157,12 +160,21 @@ struct RetrievalManifest {
     fixture_version: String,
     manifest_version: String,
     operation_semantic_digests: BTreeMap<String, OperationDigest>,
+    witness_coverage: BTreeMap<String, WitnessCoverage>,
+    witness_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WitnessCoverage {
+    exchange: u64,
+    request: u64,
 }
 
 fn expected_artifacts() -> Vec<PinnedArtifact> {
     vec![
         PinnedArtifact {
-            bytes: 59_523,
+            bytes: 60_556,
             local_file: CONTRACT_FILE.to_string(),
             sha256: CONTRACT_SHA256.to_string(),
             source_path:
@@ -170,16 +182,16 @@ fn expected_artifacts() -> Vec<PinnedArtifact> {
                     .to_string(),
         },
         PinnedArtifact {
-            bytes: 12_061,
+            bytes: 79_681,
             local_file: FIXTURE_FILE.to_string(),
             sha256:
-                "9bdfbee39b4d1ba01f82df101de287756a9c089796bbfaa571aa88ec3437b210".to_string(),
+                "a003939ca7bac27da2f390b5e5eef7f9c43e0291516e1a55e05a93b151d36f5c".to_string(),
             source_path:
                 "packages/memgraphrag/tests/fixtures/bounded-retrieval/bounded-retrieval-fixture.json"
                     .to_string(),
         },
         PinnedArtifact {
-            bytes: 3_047,
+            bytes: 3_384,
             local_file: MANIFEST_FILE.to_string(),
             sha256: RETRIEVAL_MANIFEST_SHA256.to_string(),
             source_path:
@@ -260,24 +272,24 @@ fn expected_operation_digests() -> BTreeMap<String, OperationDigest> {
         (
             CANDIDATE_SEARCH.to_string(),
             OperationDigest {
-                bytes: 20_276,
-                sha256: "4255d5a4076b27d264841579c6dbd3064f90b3e1a89b0386acaad44cb562eb1a"
+                bytes: 19_371,
+                sha256: "adf3daa1cdf472097e76dae153a6c855ccefe378398e82f8d83a9b39f5917928"
                     .to_string(),
             },
         ),
         (
             FACT_EXPAND.to_string(),
             OperationDigest {
-                bytes: 12_258,
-                sha256: "296423c9a1b5d5627175e537f0df5be884b17ea15ab9efe4b6875843194bc60d"
+                bytes: 12_273,
+                sha256: "4b13eebe0bed3620e91df122c2a4deb01fa1de2520c41a92fbb2f2f131b21e22"
                     .to_string(),
             },
         ),
         (
             PPR_MATERIALIZE.to_string(),
             OperationDigest {
-                bytes: 14_685,
-                sha256: "cd1f4bfeb39a01b4f12db1da9a7a05d8179f27eba878d1fd7aa935eb151834ab"
+                bytes: 16_204,
+                sha256: "8ca961650d6ffe6ef656ce236f8630b879fd956d7774e7229e9a720e75120bdb"
                     .to_string(),
             },
         ),
@@ -298,21 +310,39 @@ fn expected_pin() -> RetrievalPin {
     }
 }
 
-fn expected_manifest() -> RetrievalManifest {
-    RetrievalManifest {
-        contract_bytes: 59_523,
+fn expected_manifest() -> Result<RetrievalManifest, ContractError> {
+    let contract = parse_producer_contract(CONTRACT_BYTES)?;
+    let witness_coverage = contract
+        .operations
+        .iter()
+        .map(|(operation, declaration)| {
+            Ok((
+                operation.clone(),
+                WitnessCoverage {
+                    exchange: u64::try_from(declaration.exchange_assertions.len())
+                        .map_err(|_| error("exchange assertion count exceeds u64"))?,
+                    request: u64::try_from(declaration.request_assertions.len())
+                        .map_err(|_| error("request assertion count exceeds u64"))?,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, ContractError>>()?;
+    Ok(RetrievalManifest {
+        contract_bytes: 60_556,
         contract_file: CONTRACT_FILE.to_string(),
         contract_sha256: CONTRACT_SHA256.to_string(),
         contract_version: CONTRACT_VERSION.to_string(),
         dependencies: expected_dependencies(),
-        fixture_bytes: 12_061,
+        fixture_bytes: 79_681,
         fixture_file: FIXTURE_FILE.to_string(),
-        fixture_sha256: "9bdfbee39b4d1ba01f82df101de287756a9c089796bbfaa571aa88ec3437b210"
+        fixture_sha256: "a003939ca7bac27da2f390b5e5eef7f9c43e0291516e1a55e05a93b151d36f5c"
             .to_string(),
         fixture_version: EXPECTED_FIXTURE_VERSION.to_string(),
         manifest_version: EXPECTED_MANIFEST_VERSION.to_string(),
         operation_semantic_digests: expected_operation_digests(),
-    }
+        witness_coverage,
+        witness_version: EXPECTED_WITNESS_VERSION.to_string(),
+    })
 }
 
 fn parse_json<T: serde::de::DeserializeOwned>(
@@ -369,10 +399,48 @@ fn verify_artifact_bytes(root: &Path, artifact: &PinnedArtifact) -> Result<(), C
     Ok(())
 }
 
+fn verify_no_symlink_components(path: &Path, label: &str) -> Result<(), ContractError> {
+    if path.as_os_str().is_empty() {
+        return Err(error(format!("{label} is empty")));
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                return Err(error(format!(
+                    "{label} contains a parent directory component"
+                )));
+            }
+            Component::Normal(name) => current.push(name),
+        }
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|e| error(format!("{label} component {}: {e}", current.display())))?;
+        if metadata.file_type().is_symlink() {
+            return Err(error(format!(
+                "{label} component {} must not be a symlink",
+                current.display()
+            )));
+        }
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|e| error(format!("{label} {}: {e}", path.display())))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(error(format!(
+            "{label} {} is not a regular non-symlink directory",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Verify the committed retrieval artifact directory as a closed file set.
 /// The source metadata and all five dependency pins are checked independently
 /// of the files' current JSON formatting.
 pub fn verify_artifact_dir(root: &Path) -> Result<(), ContractError> {
+    verify_no_symlink_components(root, "bounded retrieval artifact root")?;
     let expected = expected_pin();
     let mut expected_files = BTreeSet::from([PIN_FILE.to_string()]);
     expected_files.extend(expected.artifacts.iter().map(|a| a.local_file.clone()));
@@ -413,7 +481,7 @@ pub fn verify_artifact_dir(root: &Path) -> Result<(), ContractError> {
     }
     verify_manifest_bytes(&manifest_bytes)?;
     parse_producer_contract(&read_regular_file(&root.join(CONTRACT_FILE))?)?;
-    validate_fixture_bytes(&read_regular_file(&root.join(FIXTURE_FILE))?)?;
+    verify_fixture_bytes(&read_regular_file(&root.join(FIXTURE_FILE))?)?;
     Ok(())
 }
 
@@ -440,7 +508,7 @@ pub fn verify_embedded_artifacts() -> Result<(), ContractError> {
     }
     verify_manifest_bytes(MANIFEST_BYTES)?;
     parse_producer_contract(CONTRACT_BYTES)?;
-    validate_fixture_bytes(FIXTURE_BYTES)?;
+    verify_fixture_bytes(FIXTURE_BYTES)?;
     Ok(())
 }
 
@@ -709,39 +777,274 @@ fn validate_schema(
     Ok(())
 }
 
-fn validate_fixture_bytes(bytes: &[u8]) -> Result<(), ContractError> {
-    let fixture: Value = parse_json(bytes, "bounded retrieval fixture")?;
-    let map = object(&fixture, "bounded retrieval fixture")?;
-    exact_keys(
-        map,
-        &["exchanges", "fixtureVersion"],
-        "bounded retrieval fixture",
-    )?;
-    if map.get("fixtureVersion").and_then(Value::as_str) != Some(EXPECTED_FIXTURE_VERSION) {
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetrievalFixture {
+    fixture_version: String,
+    witness_version: String,
+    exchanges: BTreeMap<String, FixtureExchange>,
+    witnesses: Vec<AssertionWitness>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureExchange {
+    request: Value,
+    result: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AssertionPartition {
+    Request,
+    Exchange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ReplacementRoot {
+    Request,
+    Result,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplacementPatch {
+    root: ReplacementRoot,
+    path: String,
+    value: Value,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AssertionWitness {
+    operation: String,
+    partition: AssertionPartition,
+    assertion_index: u64,
+    patch: ReplacementPatch,
+}
+
+fn replace_json_pointer(
+    root: &mut Value,
+    path: &str,
+    replacement: &Value,
+) -> Result<(), ContractError> {
+    validate_json_pointer(path, "witness patch path")?;
+    if path.is_empty() {
+        *root = replacement.clone();
+        return Ok(());
+    }
+    let segments = path[1..]
+        .split('/')
+        .map(json_pointer_segment)
+        .collect::<Result<Vec<_>, _>>()?;
+    let (last, parents) = segments
+        .split_last()
+        .ok_or_else(|| error("witness patch path has no target"))?;
+    let mut target = root;
+    for segment in parents {
+        target = match target {
+            Value::Object(values) => values
+                .get_mut(segment)
+                .ok_or_else(|| error(format!("witness patch field {segment} is missing")))?,
+            Value::Array(values) => {
+                if !is_canonical_array_index(segment) {
+                    return Err(error("witness patch array index is non-canonical"));
+                }
+                let index = segment
+                    .parse::<usize>()
+                    .map_err(|_| error("witness patch array index exceeds usize"))?;
+                values
+                    .get_mut(index)
+                    .ok_or_else(|| error("witness patch array index is missing"))?
+            }
+            _ => return Err(error("witness patch traversed a scalar")),
+        };
+    }
+    match target {
+        Value::Object(values) => {
+            let slot = values
+                .get_mut(last)
+                .ok_or_else(|| error(format!("witness patch field {last} is missing")))?;
+            *slot = replacement.clone();
+        }
+        Value::Array(values) => {
+            if !is_canonical_array_index(last) {
+                return Err(error("witness patch array index is non-canonical"));
+            }
+            let index = last
+                .parse::<usize>()
+                .map_err(|_| error("witness patch array index exceeds usize"))?;
+            let slot = values
+                .get_mut(index)
+                .ok_or_else(|| error("witness patch array index is missing"))?;
+            *slot = replacement.clone();
+        }
+        _ => return Err(error("witness patch target parent is a scalar")),
+    }
+    Ok(())
+}
+
+fn fixture_normalizer(dependency: &str, value: &str) -> Option<String> {
+    // The compact producer fixture deliberately uses ASCII normalization
+    // operands.  The exact Unicode implementation remains a separately pinned
+    // dependency of the runtime contract rather than a second fixture policy.
+    (dependency == NORMALIZATION_DIGEST).then(|| value.to_ascii_lowercase())
+}
+
+/// Verify the producer-owned baseline exchanges and every assertion witness.
+/// Native derives the expected identity sequence from the pinned declaration;
+/// it does not maintain a second rule or mutation catalog.
+pub fn verify_fixture_bytes(bytes: &[u8]) -> Result<(), ContractError> {
+    let fixture: RetrievalFixture = parse_json(bytes, "bounded retrieval fixture")?;
+    if fixture.fixture_version != EXPECTED_FIXTURE_VERSION {
         return Err(error("bounded retrieval fixture version mismatch"));
     }
-    let exchanges = object(
-        map.get("exchanges").expect("checked exchanges"),
-        "bounded retrieval fixture.exchanges",
-    )?;
-    let expected = METHODS.iter().copied().collect::<BTreeSet<_>>();
-    let actual = exchanges
+    if fixture.witness_version != EXPECTED_WITNESS_VERSION {
+        return Err(error("bounded retrieval witness version mismatch"));
+    }
+    let expected_operations = BOUNDED_OPERATIONS.iter().copied().collect::<BTreeSet<_>>();
+    let actual_operations = fixture
+        .exchanges
         .keys()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    if actual != expected {
+    if actual_operations != expected_operations {
         return Err(error("bounded retrieval fixture operation set mismatch"));
     }
-    for method in METHODS {
-        let exchange = object(
-            exchanges.get(method).expect("checked method"),
-            &format!("fixture exchange {method}"),
+
+    let contract = parse_producer_contract(CONTRACT_BYTES)?;
+    for method in BOUNDED_OPERATIONS {
+        let operation = contract
+            .operations
+            .get(method)
+            .ok_or_else(|| error("pinned fixture operation is absent from contract"))?;
+        let exchange = fixture
+            .exchanges
+            .get(method)
+            .ok_or_else(|| error("pinned fixture exchange is missing"))?;
+        validate_schema(
+            &operation.request,
+            &exchange.request,
+            &contract.domain_contract,
+            "fixture request",
         )?;
-        exact_keys(
-            exchange,
-            &["request", "result"],
-            &format!("fixture exchange {method}"),
+        validate_schema(
+            &operation.result,
+            &exchange.result,
+            &contract.domain_contract,
+            "fixture result",
         )?;
+        if first_failed_assertion(
+            &operation.request_assertions,
+            &exchange.request,
+            None,
+            &fixture_normalizer,
+        )?
+        .is_some()
+            || first_failed_assertion(
+                &operation.exchange_assertions,
+                &exchange.request,
+                Some(&exchange.result),
+                &fixture_normalizer,
+            )?
+            .is_some()
+        {
+            return Err(error(format!("fixture baseline for {method} is invalid")));
+        }
+    }
+
+    let expected_witnesses = contract
+        .operations
+        .values()
+        .map(|operation| operation.request_assertions.len() + operation.exchange_assertions.len())
+        .sum::<usize>();
+    if fixture.witnesses.len() != expected_witnesses {
+        return Err(error("bounded retrieval witness count mismatch"));
+    }
+    let mut cursor = 0_usize;
+    for method in BOUNDED_OPERATIONS {
+        let operation = contract
+            .operations
+            .get(method)
+            .ok_or_else(|| error("pinned witness operation is absent from contract"))?;
+        let baseline = fixture
+            .exchanges
+            .get(method)
+            .ok_or_else(|| error("pinned witness baseline is missing"))?;
+        for (partition, assertions) in [
+            (AssertionPartition::Request, &operation.request_assertions),
+            (AssertionPartition::Exchange, &operation.exchange_assertions),
+        ] {
+            for assertion_index in 0..assertions.len() {
+                let witness = fixture
+                    .witnesses
+                    .get(cursor)
+                    .ok_or_else(|| error("bounded retrieval witness is missing"))?;
+                cursor += 1;
+                if witness.operation != method
+                    || witness.partition != partition
+                    || witness.assertion_index
+                        != u64::try_from(assertion_index)
+                            .map_err(|_| error("assertion index exceeds u64"))?
+                {
+                    return Err(error("bounded retrieval witness identity/order mismatch"));
+                }
+                if partition == AssertionPartition::Request
+                    && witness.patch.root != ReplacementRoot::Request
+                {
+                    return Err(error("request witness must patch the request root"));
+                }
+                let mut request = baseline.request.clone();
+                let mut result = baseline.result.clone();
+                let patch_root = match witness.patch.root {
+                    ReplacementRoot::Request => &mut request,
+                    ReplacementRoot::Result => &mut result,
+                };
+                replace_json_pointer(patch_root, &witness.patch.path, &witness.patch.value)?;
+                validate_schema(
+                    &operation.request,
+                    &request,
+                    &contract.domain_contract,
+                    "witness request",
+                )?;
+                validate_schema(
+                    &operation.result,
+                    &result,
+                    &contract.domain_contract,
+                    "witness result",
+                )?;
+                let request_failure = first_failed_assertion(
+                    &operation.request_assertions,
+                    &request,
+                    None,
+                    &fixture_normalizer,
+                )?;
+                match partition {
+                    AssertionPartition::Request => {
+                        if request_failure != Some(assertion_index) {
+                            return Err(error("request witness does not fail its exact assertion"));
+                        }
+                    }
+                    AssertionPartition::Exchange => {
+                        if request_failure.is_some() {
+                            return Err(error("exchange witness fails a request assertion"));
+                        }
+                        let exchange_failure = first_failed_assertion(
+                            &operation.exchange_assertions,
+                            &request,
+                            Some(&result),
+                            &fixture_normalizer,
+                        )?;
+                        if exchange_failure != Some(assertion_index) {
+                            return Err(error(
+                                "exchange witness does not fail its exact assertion",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -750,7 +1053,7 @@ fn validate_fixture_bytes(bytes: &[u8]) -> Result<(), ContractError> {
 /// operation digest cross-links without reading any source dependency.
 pub fn verify_manifest_bytes(bytes: &[u8]) -> Result<(), ContractError> {
     let manifest: RetrievalManifest = parse_json(bytes, "bounded retrieval manifest")?;
-    if manifest != expected_manifest() {
+    if manifest != expected_manifest()? {
         return Err(error("retrieval manifest cross-link mismatch"));
     }
     Ok(())
@@ -769,272 +1072,173 @@ pub struct ProducerContract {
     pub contract_version: String,
     pub refinement_ir_version: String,
     pub operations: BTreeMap<String, OperationContract>,
+    pub refinement_nodes: BTreeMap<String, RefinementNodeSpec>,
     domain_contract: BTreeMap<String, ContractNode>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct IrNodeSpec {
-    role: &'static str,
-    fields: &'static [(&'static str, &'static str)],
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefinementNodeSpec {
+    pub role: String,
+    pub fields: BTreeMap<String, String>,
 }
 
-const IR_NODE_SPECS: &[(&str, IrNodeSpec)] = &[
-    (
-        "all",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("values", "expression_array_nonempty")],
-        },
-    ),
-    (
-        "any",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("values", "expression_array_nonempty")],
-        },
-    ),
-    (
-        "array_at",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("array", "expression"), ("index", "expression")],
-        },
-    ),
-    (
-        "array_length",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("value", "expression")],
-        },
-    ),
-    (
-        "coalesce",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("values", "expression_array_nonempty")],
-        },
-    ),
-    (
-        "concat",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("values", "expression_array_nonempty")],
-        },
-    ),
-    (
-        "corpus_eq_ref",
-        IrNodeSpec {
-            role: "assertion",
-            fields: &[("corpus", "expression"), ("expected", "expression")],
-        },
-    ),
-    (
-        "eq",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("left", "expression"), ("right", "expression")],
-        },
-    ),
-    (
-        "field_eq_ref",
-        IrNodeSpec {
-            role: "assertion",
-            fields: &[("expected", "expression"), ("value", "expression")],
-        },
-    ),
-    (
-        "finite_range",
-        IrNodeSpec {
-            role: "assertion",
-            fields: &[
-                ("maximum", "number"),
-                ("minimum", "number"),
-                ("value", "expression"),
-            ],
-        },
-    ),
-    (
-        "for_each",
-        IrNodeSpec {
-            role: "assertion",
-            fields: &[
-                ("collection", "expression"),
-                ("predicate", "expression"),
-                ("scope", "string"),
-            ],
-        },
-    ),
-    (
-        "iteration_pointer",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("path", "json_pointer"), ("scope", "string")],
-        },
-    ),
-    (
-        "length_eq",
-        IrNodeSpec {
-            role: "assertion",
-            fields: &[("actual", "expression"), ("expected", "expression")],
-        },
-    ),
-    (
-        "length_lte_ref",
-        IrNodeSpec {
-            role: "assertion",
-            fields: &[("actual", "expression"), ("limit", "expression")],
-        },
-    ),
-    (
-        "literal",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("value", "scalar")],
-        },
-    ),
-    (
-        "lt",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("left", "expression"), ("right", "expression")],
-        },
-    ),
-    (
-        "lte",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("left", "expression"), ("right", "expression")],
-        },
-    ),
-    (
-        "map_lookup",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[
-                ("key", "expression"),
-                ("keyField", "string"),
-                ("map", "expression"),
-                ("valueField", "string"),
-            ],
-        },
-    ),
-    (
-        "max",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("values", "expression_array_nonempty")],
-        },
-    ),
-    (
-        "multiply",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("left", "expression"), ("right", "expression")],
-        },
-    ),
-    (
-        "normalize_ref",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("dependency", "string"), ("value", "expression")],
-        },
-    ),
-    (
-        "not",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("value", "expression")],
-        },
-    ),
-    (
-        "ordered_score_desc_id_asc",
-        IrNodeSpec {
-            role: "assertion",
-            fields: &[
-                ("collection", "expression"),
-                ("id", "expression"),
-                ("idOrder", "id_order"),
-                ("scope", "string"),
-                ("score", "expression"),
-            ],
-        },
-    ),
-    (
-        "pointer",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("path", "json_pointer"), ("root", "root")],
-        },
-    ),
-    (
-        "prefixed_identity",
-        IrNodeSpec {
-            role: "assertion",
-            fields: &[
-                ("identity", "expression"),
-                ("prefix", "string"),
-                ("value", "expression"),
-            ],
-        },
-    ),
-    (
-        "rank_is_index_plus_one",
-        IrNodeSpec {
-            role: "assertion",
-            fields: &[
-                ("collection", "expression"),
-                ("rank", "expression"),
-                ("scope", "string"),
-            ],
-        },
-    ),
-    (
-        "safe_integer_range",
-        IrNodeSpec {
-            role: "assertion",
-            fields: &[
-                ("maximum", "expression"),
-                ("minimum", "number"),
-                ("value", "expression"),
-            ],
-        },
-    ),
-    (
-        "set_contains",
-        IrNodeSpec {
-            role: "expression",
-            fields: &[("set", "expression"), ("value", "expression")],
-        },
-    ),
-    (
-        "tuple_tags",
-        IrNodeSpec {
-            role: "assertion",
-            fields: &[
-                ("actual", "expression"),
-                ("expected", "string_array"),
-                ("field", "string"),
-            ],
-        },
-    ),
-    (
-        "unique_by",
-        IrNodeSpec {
-            role: "assertion",
-            fields: &[
-                ("collection", "expression"),
-                ("key", "expression"),
-                ("scope", "string"),
-            ],
-        },
-    ),
-];
+// This is the native executable handler inventory, not a copy of the
+// producer's roles or field grammar.  The macro is the single source for the
+// opcode-to-handler mapping, the enum match below, and the inventory equality
+// check performed when the pinned producer declaration is parsed.
+macro_rules! refinement_handler_inventory {
+    ($callback:ident) => {
+        $callback! {
+            All => "all",
+            Any => "any",
+            ArrayAt => "array_at",
+            ArrayLength => "array_length",
+            Coalesce => "coalesce",
+            Concat => "concat",
+            CorpusEqRef => "corpus_eq_ref",
+            Eq => "eq",
+            FieldEqRef => "field_eq_ref",
+            FiniteRange => "finite_range",
+            ForEach => "for_each",
+            IterationPointer => "iteration_pointer",
+            LengthEq => "length_eq",
+            LengthLteRef => "length_lte_ref",
+            Literal => "literal",
+            Lt => "lt",
+            Lte => "lte",
+            MapLookup => "map_lookup",
+            Max => "max",
+            Multiply => "multiply",
+            NormalizeRef => "normalize_ref",
+            Not => "not",
+            OrderedScoreDescIdAsc => "ordered_score_desc_id_asc",
+            Pointer => "pointer",
+            PrefixedIdentity => "prefixed_identity",
+            RankIsIndexPlusOne => "rank_is_index_plus_one",
+            SafeIntegerRange => "safe_integer_range",
+            SetContains => "set_contains",
+            TupleTags => "tuple_tags",
+            UniqueBy => "unique_by",
+        }
+    };
+}
 
-fn ir_spec(op: &str) -> Option<IrNodeSpec> {
-    IR_NODE_SPECS
+macro_rules! define_refinement_handlers {
+    ($( $handler:ident => $opcode:literal ),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum RefinementHandler {
+            $( $handler ),+
+        }
+
+        const HANDLER_OPCODES: &[&str] = &[
+            $( $opcode ),+
+        ];
+
+        fn refinement_handler(opcode: &str) -> Option<RefinementHandler> {
+            match opcode {
+                $( $opcode => Some(RefinementHandler::$handler), )+
+                _ => None,
+            }
+        }
+    };
+}
+
+refinement_handler_inventory!(define_refinement_handlers);
+
+// These are the only field-marker meanings implemented by native.  Their
+// names are deliberately independent of any producer node's field list.
+macro_rules! refinement_field_marker_inventory {
+    ($callback:ident) => {
+        $callback! {
+            Expression => "expression",
+            ExpressionArrayNonempty => "expression_array_nonempty",
+            Number => "number",
+            Scalar => "scalar",
+            String => "string",
+            JsonPointer => "json_pointer",
+            Root => "root",
+            IdOrder => "id_order",
+            StringArray => "string_array",
+        }
+    };
+}
+
+macro_rules! define_refinement_field_markers {
+    ($( $marker:ident => $name:literal ),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum RefinementFieldMarker {
+            $( $marker ),+
+        }
+
+        const SUPPORTED_FIELD_MARKERS: &[&str] = &[
+            $( $name ),+
+        ];
+
+        fn refinement_field_marker(name: &str) -> Option<RefinementFieldMarker> {
+            match name {
+                $( $name => Some(RefinementFieldMarker::$marker), )+
+                _ => None,
+            }
+        }
+    };
+}
+
+refinement_field_marker_inventory!(define_refinement_field_markers);
+
+const SUPPORTED_REFINEMENT_ROLES: &[&str] = &["assertion", "expression"];
+
+fn validate_handler_inventory(
+    nodes: &BTreeMap<String, RefinementNodeSpec>,
+) -> Result<(), ContractError> {
+    let handler_set = HANDLER_OPCODES.iter().copied().collect::<BTreeSet<_>>();
+    if handler_set.len() != HANDLER_OPCODES.len() {
+        return Err(error(
+            "native refinement handler inventory contains duplicates",
+        ));
+    }
+    let canonical_set = nodes.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if canonical_set != handler_set {
+        return Err(error(
+            "pinned refinement opcode set does not exactly match native handlers",
+        ));
+    }
+    for opcode in canonical_set {
+        if refinement_handler(opcode).is_none() {
+            return Err(error(format!(
+                "pinned refinement opcode {opcode} has no native handler"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_field_marker_inventory() -> Result<(), ContractError> {
+    let marker_set = SUPPORTED_FIELD_MARKERS
         .iter()
-        .find(|(name, _)| *name == op)
-        .map(|(_, spec)| *spec)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if marker_set.len() != SUPPORTED_FIELD_MARKERS.len() {
+        return Err(error(
+            "native refinement field-marker inventory contains duplicates",
+        ));
+    }
+    let role_set = SUPPORTED_REFINEMENT_ROLES
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if role_set.len() != SUPPORTED_REFINEMENT_ROLES.len() {
+        return Err(error(
+            "native refinement role inventory contains duplicates",
+        ));
+    }
+    Ok(())
+}
+
+/// Return the native handler count for a name.  A canonical opcode must return
+/// exactly one; the value is exposed so integration tests can derive coverage
+/// from the pinned producer declaration rather than a second opcode list.
+pub fn refinement_handler_count(opcode: &str) -> usize {
+    usize::from(refinement_handler(opcode).is_some())
 }
 
 fn validate_json_pointer(path: &str, label: &str) -> Result<(), ContractError> {
@@ -1058,12 +1262,16 @@ fn validate_json_pointer(path: &str, label: &str) -> Result<(), ContractError> {
 fn validate_ir_field(
     value: &Value,
     marker: &str,
-    nodes: &BTreeMap<String, IrNodeSpec>,
+    nodes: &BTreeMap<String, RefinementNodeSpec>,
     label: &str,
 ) -> Result<(), ContractError> {
-    match marker {
-        "expression" => validate_ir_expression(value, "expression", nodes, label),
-        "expression_array_nonempty" => {
+    let marker_kind = refinement_field_marker(marker)
+        .ok_or_else(|| error(format!("unknown refinement field marker {marker}")))?;
+    match marker_kind {
+        RefinementFieldMarker::Expression => {
+            validate_ir_expression(value, "expression", nodes, label)
+        }
+        RefinementFieldMarker::ExpressionArrayNonempty => {
             let values = value
                 .as_array()
                 .ok_or_else(|| error(format!("{label} must be an expression array")))?;
@@ -1075,37 +1283,37 @@ fn validate_ir_field(
             }
             Ok(())
         }
-        "number" => {
+        RefinementFieldMarker::Number => {
             if value.as_f64().is_none_or(|number| !number.is_finite()) {
                 Err(error(format!("{label} must be a finite JSON number")))
             } else {
                 Ok(())
             }
         }
-        "scalar" => {
+        RefinementFieldMarker::Scalar => {
             if is_scalar(value) {
                 Ok(())
             } else {
                 Err(error(format!("{label} must be a scalar")))
             }
         }
-        "string" => value
+        RefinementFieldMarker::String => value
             .as_str()
             .map(|_| ())
             .ok_or_else(|| error(format!("{label} must be a string"))),
-        "json_pointer" => value
+        RefinementFieldMarker::JsonPointer => value
             .as_str()
             .ok_or_else(|| error(format!("{label} must be a string")))
             .and_then(|path| validate_json_pointer(path, label)),
-        "root" => match value.as_str() {
+        RefinementFieldMarker::Root => match value.as_str() {
             Some("request") | Some("result") => Ok(()),
             _ => Err(error(format!("{label} must select request or result"))),
         },
-        "id_order" => match value.as_str() {
+        RefinementFieldMarker::IdOrder => match value.as_str() {
             Some("unicode_utf16_code_unit_asc") => Ok(()),
             _ => Err(error(format!("{label} has an unsupported id order"))),
         },
-        "string_array" => {
+        RefinementFieldMarker::StringArray => {
             let values = value
                 .as_array()
                 .ok_or_else(|| error(format!("{label} must be a string array")))?;
@@ -1115,14 +1323,13 @@ fn validate_ir_field(
                 Ok(())
             }
         }
-        unknown => Err(error(format!("unknown refinement field marker {unknown}"))),
     }
 }
 
 fn validate_ir_expression(
     value: &Value,
     expected_role: &str,
-    nodes: &BTreeMap<String, IrNodeSpec>,
+    nodes: &BTreeMap<String, RefinementNodeSpec>,
     label: &str,
 ) -> Result<(), ContractError> {
     let map = object(value, label)?;
@@ -1133,6 +1340,8 @@ fn validate_ir_expression(
     let spec = nodes
         .get(op)
         .ok_or_else(|| error(format!("unknown refinement opcode {op}")))?;
+    let handler = refinement_handler(op)
+        .ok_or_else(|| error(format!("unsupported refinement opcode {op}")))?;
     if spec.role != expected_role {
         return Err(error(format!(
             "refinement opcode {op} has role {}, expected {expected_role}",
@@ -1140,13 +1349,13 @@ fn validate_ir_expression(
         )));
     }
     let mut fields = vec!["op"];
-    fields.extend(spec.fields.iter().map(|(field, _)| *field));
+    fields.extend(spec.fields.keys().map(String::as_str));
     exact_keys(map, &fields, label)?;
-    for (field, marker) in spec.fields {
-        let field_value = map.get(*field).expect("exact_keys checked IR field");
+    for (field, marker) in &spec.fields {
+        let field_value = map.get(field).expect("exact_keys checked IR field");
         validate_ir_field(field_value, marker, nodes, &format!("{label}.{field}"))?;
     }
-    if op == "normalize_ref"
+    if matches!(handler, RefinementHandler::NormalizeRef)
         && map.get("dependency").and_then(Value::as_str) != Some(NORMALIZATION_DIGEST)
     {
         return Err(error("normalize_ref names an unpinned dependency"));
@@ -1154,16 +1363,11 @@ fn validate_ir_expression(
     Ok(())
 }
 
-fn parse_refinement_nodes(value: &Value) -> Result<BTreeMap<String, IrNodeSpec>, ContractError> {
+fn parse_refinement_nodes(
+    value: &Value,
+) -> Result<BTreeMap<String, RefinementNodeSpec>, ContractError> {
     let map = object(value, "refinementNodes")?;
-    let expected = IR_NODE_SPECS
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<BTreeSet<_>>();
-    let actual = map.keys().map(String::as_str).collect::<BTreeSet<_>>();
-    if actual != expected {
-        return Err(error("refinement IR node set mismatch"));
-    }
+    validate_field_marker_inventory()?;
     let mut nodes = BTreeMap::new();
     for (name, value) in map {
         let declaration = object(value, &format!("refinementNodes.{name}"))?;
@@ -1176,48 +1380,47 @@ fn parse_refinement_nodes(value: &Value) -> Result<BTreeMap<String, IrNodeSpec>,
             .get("role")
             .and_then(Value::as_str)
             .ok_or_else(|| error(format!("refinementNodes.{name}.role must be a string")))?;
+        if !SUPPORTED_REFINEMENT_ROLES.contains(&role) {
+            return Err(error(format!(
+                "refinement node {name} has unsupported role {role}"
+            )));
+        }
         let fields = object(
             declaration.get("fields").expect("checked fields"),
             &format!("refinementNodes.{name}.fields"),
         )?;
-        let expected_spec = ir_spec(name).expect("static IR spec set");
-        if role != expected_spec.role {
-            return Err(error(format!("refinement node {name} role mismatch")));
-        }
-        let expected_fields = expected_spec
-            .fields
-            .iter()
-            .map(|(field, marker)| (*field, *marker))
-            .collect::<BTreeMap<_, _>>();
-        let actual_fields = fields
+        let fields = fields
             .iter()
             .map(|(field, marker)| {
-                marker
-                    .as_str()
-                    .map(|marker| (field.as_str(), marker))
-                    .ok_or_else(|| {
-                        error(format!(
-                            "refinement node {name} field marker must be a string"
-                        ))
-                    })
+                let marker = marker.as_str().ok_or_else(|| {
+                    error(format!(
+                        "refinement node {name} field marker must be a string"
+                    ))
+                })?;
+                if refinement_field_marker(marker).is_none() {
+                    return Err(error(format!(
+                        "refinement node {name} has unsupported field marker {marker}"
+                    )));
+                }
+                Ok((field.clone(), marker.to_string()))
             })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        if actual_fields != expected_fields {
-            return Err(error(format!(
-                "refinement node {name} field grammar mismatch"
-            )));
-        }
-        // The declaration is checked against the native interpreter grammar;
-        // retaining the static grammar avoids leaking one allocation per
-        // contract parse while still making the producer bytes authoritative
-        // for the presence and exact shape of every node.
-        nodes.insert(name.clone(), expected_spec);
+            .collect::<Result<BTreeMap<_, _>, ContractError>>()?;
+        nodes.insert(
+            name.clone(),
+            RefinementNodeSpec {
+                role: role.to_string(),
+                fields,
+            },
+        );
     }
+    validate_handler_inventory(&nodes)?;
     Ok(nodes)
 }
 
 /// Parse and bind the producer contract.  The parser rejects unknown schema
-/// kinds, dependency names, refinement opcodes, roles, and field grammars.
+/// kinds and dependency names, and validates every refinement expression
+/// against the producer-declared node roles/fields plus native's handler and
+/// primitive marker inventories.
 pub fn parse_producer_contract(bytes: &[u8]) -> Result<ProducerContract, ContractError> {
     let value: Value = parse_json(bytes, "bounded retrieval contract")?;
     let map = object(&value, "bounded retrieval contract")?;
@@ -1251,7 +1454,7 @@ pub fn parse_producer_contract(bytes: &[u8]) -> Result<ProducerContract, Contrac
         map.get("operations").expect("checked operations"),
         "bounded retrieval contract.operations",
     )?;
-    let expected_methods = METHODS.iter().copied().collect::<BTreeSet<_>>();
+    let expected_methods = BOUNDED_OPERATIONS.iter().copied().collect::<BTreeSet<_>>();
     let actual_methods = operations_value
         .keys()
         .map(String::as_str)
@@ -1260,7 +1463,7 @@ pub fn parse_producer_contract(bytes: &[u8]) -> Result<ProducerContract, Contrac
         return Err(error("bounded retrieval operation set mismatch"));
     }
     let mut operations = BTreeMap::new();
-    for method in METHODS {
+    for method in BOUNDED_OPERATIONS {
         let operation = object(
             operations_value.get(method).expect("checked operation"),
             &format!("operation {method}"),
@@ -1308,6 +1511,24 @@ pub fn parse_producer_contract(bytes: &[u8]) -> Result<ProducerContract, Contrac
             &nodes,
             &format!("operation {method}.exchangeAssertions"),
         )?;
+        validate_assertion_pointers(
+            &request_assertions,
+            true,
+            &request,
+            &result,
+            &domain_contract,
+            &nodes,
+            &format!("operation {method}.requestAssertions"),
+        )?;
+        validate_assertion_pointers(
+            &exchange_assertions,
+            false,
+            &request,
+            &result,
+            &domain_contract,
+            &nodes,
+            &format!("operation {method}.exchangeAssertions"),
+        )?;
         operations.insert(
             method.to_string(),
             OperationContract {
@@ -1322,6 +1543,7 @@ pub fn parse_producer_contract(bytes: &[u8]) -> Result<ProducerContract, Contrac
         contract_version: contract_version.to_string(),
         refinement_ir_version: refinement_ir_version.to_string(),
         operations,
+        refinement_nodes: nodes,
         domain_contract,
     })
 }
@@ -1365,9 +1587,351 @@ fn validate_external_dependencies(
     Ok(())
 }
 
+fn unwrap_structural_node<'a>(
+    node: &'a ContractNode,
+    domain: &'a BTreeMap<String, ContractNode>,
+) -> Result<&'a ContractNode, ContractError> {
+    match node {
+        ContractNode::Optional(value) => unwrap_structural_node(value, domain),
+        ContractNode::ExternalRef { reference_kind, .. } => domain
+            .get(reference_kind)
+            .ok_or_else(|| error(format!("unresolved external contract {reference_kind}")))
+            .and_then(|value| unwrap_structural_node(value, domain)),
+        _ => Ok(node),
+    }
+}
+
+fn is_canonical_array_index(segment: &str) -> bool {
+    segment == "0"
+        || segment
+            .strip_prefix(|character: char| ('1'..='9').contains(&character))
+            .is_some_and(|rest| rest.chars().all(|character| character.is_ascii_digit()))
+}
+
+fn structural_child<'a>(
+    node: &'a ContractNode,
+    segment: &str,
+    domain: &'a BTreeMap<String, ContractNode>,
+) -> Result<&'a ContractNode, ContractError> {
+    match unwrap_structural_node(node, domain)? {
+        ContractNode::Array(item) => {
+            if segment != "*" && !is_canonical_array_index(segment) {
+                return Err(error(format!("array segment {segment} is invalid")));
+            }
+            Ok(item)
+        }
+        ContractNode::Tuple(items) if segment == "*" => {
+            let first = items
+                .first()
+                .ok_or_else(|| error("tuple wildcard has no item contract"))?;
+            if items.iter().skip(1).any(|item| item != first) {
+                return Err(error("tuple wildcard crosses non-identical item contracts"));
+            }
+            Ok(first)
+        }
+        ContractNode::Tuple(items) => {
+            if !is_canonical_array_index(segment) {
+                return Err(error(format!("tuple segment {segment} is invalid")));
+            }
+            items
+                .get(
+                    segment
+                        .parse::<usize>()
+                        .map_err(|_| error(format!("tuple segment {segment} is invalid")))?,
+                )
+                .ok_or_else(|| error(format!("tuple index {segment} is absent")))
+        }
+        ContractNode::Object(fields) => fields
+            .get(segment)
+            .ok_or_else(|| error(format!("field {segment} is absent"))),
+        node => Err(error(format!(
+            "cannot traverse structural node {node:?} through {segment}"
+        ))),
+    }
+}
+
+fn structural_contract_at<'a>(
+    root: &'a ContractNode,
+    path: &str,
+    domain: &'a BTreeMap<String, ContractNode>,
+) -> Result<&'a ContractNode, ContractError> {
+    validate_json_pointer(path, "refinement structural pointer")?;
+    let mut current = root;
+    if path.is_empty() {
+        return Ok(current);
+    }
+    for raw_segment in path[1..].split('/') {
+        let segment = json_pointer_segment(raw_segment)?;
+        current = structural_child(current, &segment, domain)?;
+    }
+    Ok(current)
+}
+
+fn expression_contract<'a>(
+    expression: &Value,
+    request: &'a ContractNode,
+    result: &'a ContractNode,
+    domain: &'a BTreeMap<String, ContractNode>,
+    scopes: &BTreeMap<String, &'a ContractNode>,
+) -> Result<Option<&'a ContractNode>, ContractError> {
+    let map = object(expression, "refinement expression")?;
+    let opcode = map
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(|| error("refinement expression op is missing"))?;
+    match refinement_handler(opcode)
+        .ok_or_else(|| error(format!("unsupported refinement opcode {opcode}")))?
+    {
+        RefinementHandler::Pointer => {
+            let root = match map.get("root").and_then(Value::as_str) {
+                Some("request") => request,
+                Some("result") => result,
+                _ => return Err(error("pointer root is invalid")),
+            };
+            let path = map
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| error("pointer path is not a string"))?;
+            structural_contract_at(root, path, domain).map(Some)
+        }
+        RefinementHandler::IterationPointer => {
+            let scope = map
+                .get("scope")
+                .and_then(Value::as_str)
+                .ok_or_else(|| error("iteration pointer scope is not a string"))?;
+            let root = scopes
+                .get(scope)
+                .copied()
+                .ok_or_else(|| error(format!("iteration scope {scope} is absent")))?;
+            let path = map
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| error("iteration pointer path is not a string"))?;
+            structural_contract_at(root, path, domain).map(Some)
+        }
+        RefinementHandler::ArrayAt => {
+            let source = expression_contract(
+                map.get("array")
+                    .ok_or_else(|| error("array_at.array is missing"))?,
+                request,
+                result,
+                domain,
+                scopes,
+            )?
+            .ok_or_else(|| error("array_at source has no structural contract"))?;
+            match unwrap_structural_node(source, domain)? {
+                ContractNode::Array(item) => Ok(Some(item)),
+                ContractNode::Tuple(items) => {
+                    let index = object(
+                        map.get("index")
+                            .ok_or_else(|| error("array_at.index is missing"))?,
+                        "array_at.index",
+                    )?;
+                    if index.get("op").and_then(Value::as_str) != Some("literal") {
+                        return Err(error("tuple array_at index must be a literal"));
+                    }
+                    let index = index
+                        .get("value")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .ok_or_else(|| {
+                            error("tuple array_at index must be a safe nonnegative integer")
+                        })?;
+                    items
+                        .get(index)
+                        .map(Some)
+                        .ok_or_else(|| error(format!("tuple array_at index {index} is absent")))
+                }
+                _ => Err(error("array_at source must resolve to an array or tuple")),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn walk_refinement_expression<'a>(
+    expression: &Value,
+    request: &'a ContractNode,
+    result: &'a ContractNode,
+    domain: &'a BTreeMap<String, ContractNode>,
+    nodes: &BTreeMap<String, RefinementNodeSpec>,
+    scopes: &BTreeMap<String, &'a ContractNode>,
+) -> Result<(), ContractError> {
+    expression_contract(expression, request, result, domain, scopes)?;
+    let map = object(expression, "refinement expression")?;
+    let opcode = map
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(|| error("refinement expression op is missing"))?;
+    let declaration = nodes
+        .get(opcode)
+        .ok_or_else(|| error(format!("unknown refinement opcode {opcode}")))?;
+    for (field, marker) in &declaration.fields {
+        match refinement_field_marker(marker) {
+            Some(RefinementFieldMarker::Expression) => walk_refinement_expression(
+                map.get(field).expect("IR shape already validated"),
+                request,
+                result,
+                domain,
+                nodes,
+                scopes,
+            )?,
+            Some(RefinementFieldMarker::ExpressionArrayNonempty) => {
+                for child in map
+                    .get(field)
+                    .and_then(Value::as_array)
+                    .expect("IR shape already validated")
+                {
+                    walk_refinement_expression(child, request, result, domain, nodes, scopes)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn contains_result_pointer(
+    expression: &Value,
+    nodes: &BTreeMap<String, RefinementNodeSpec>,
+) -> Result<bool, ContractError> {
+    let map = object(expression, "refinement expression")?;
+    let opcode = map
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(|| error("refinement expression op is missing"))?;
+    if opcode == "pointer" && map.get("root").and_then(Value::as_str) == Some("result") {
+        return Ok(true);
+    }
+    let declaration = nodes
+        .get(opcode)
+        .ok_or_else(|| error(format!("unknown refinement opcode {opcode}")))?;
+    for (field, marker) in &declaration.fields {
+        match refinement_field_marker(marker) {
+            Some(RefinementFieldMarker::Expression) => {
+                if contains_result_pointer(
+                    map.get(field).expect("IR shape already validated"),
+                    nodes,
+                )? {
+                    return Ok(true);
+                }
+            }
+            Some(RefinementFieldMarker::ExpressionArrayNonempty) => {
+                for child in map
+                    .get(field)
+                    .and_then(Value::as_array)
+                    .expect("IR shape already validated")
+                {
+                    if contains_result_pointer(child, nodes)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+fn validate_assertion_pointer(
+    assertion: &Value,
+    request: &ContractNode,
+    result: &ContractNode,
+    domain: &BTreeMap<String, ContractNode>,
+    nodes: &BTreeMap<String, RefinementNodeSpec>,
+) -> Result<(), ContractError> {
+    let map = object(assertion, "refinement assertion")?;
+    let opcode = map
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(|| error("refinement assertion op is missing"))?;
+    let declaration = nodes
+        .get(opcode)
+        .ok_or_else(|| error(format!("unknown refinement opcode {opcode}")))?;
+    let mut scopes = BTreeMap::new();
+    if declaration.fields.contains_key("scope") {
+        let collection = map
+            .get("collection")
+            .ok_or_else(|| error(format!("{opcode}.collection is missing")))?;
+        walk_refinement_expression(collection, request, result, domain, nodes, &scopes)?;
+        let collection_contract =
+            expression_contract(collection, request, result, domain, &scopes)?
+                .ok_or_else(|| error(format!("{opcode} collection has no structural pointer")))?;
+        let item = match unwrap_structural_node(collection_contract, domain)? {
+            ContractNode::Array(item) => item.as_ref(),
+            _ => {
+                return Err(error(format!(
+                    "{opcode} collection must resolve to an array"
+                )));
+            }
+        };
+        let scope = map
+            .get("scope")
+            .and_then(Value::as_str)
+            .ok_or_else(|| error(format!("{opcode}.scope must be a string")))?;
+        scopes.insert(scope.to_string(), item);
+    }
+    for (field, marker) in &declaration.fields {
+        if field == "collection" && !scopes.is_empty() {
+            continue;
+        }
+        match refinement_field_marker(marker) {
+            Some(RefinementFieldMarker::Expression) => walk_refinement_expression(
+                map.get(field).expect("IR shape already validated"),
+                request,
+                result,
+                domain,
+                nodes,
+                &scopes,
+            )?,
+            Some(RefinementFieldMarker::ExpressionArrayNonempty) => {
+                for child in map
+                    .get(field)
+                    .and_then(Value::as_array)
+                    .expect("IR shape already validated")
+                {
+                    walk_refinement_expression(child, request, result, domain, nodes, &scopes)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_assertion_pointers(
+    assertions: &[Value],
+    request_partition: bool,
+    request: &ContractNode,
+    result: &ContractNode,
+    domain: &BTreeMap<String, ContractNode>,
+    nodes: &BTreeMap<String, RefinementNodeSpec>,
+    label: &str,
+) -> Result<(), ContractError> {
+    for (index, assertion) in assertions.iter().enumerate() {
+        let has_result = contains_result_pointer(assertion, nodes)?;
+        if request_partition && has_result {
+            return Err(error(format!(
+                "{label}[{index}] request assertion references result"
+            )));
+        }
+        if !request_partition && !has_result {
+            return Err(error(format!(
+                "{label}[{index}] exchange assertion has no result dependency"
+            )));
+        }
+        validate_assertion_pointer(assertion, request, result, domain, nodes).map_err(|cause| {
+            error(format!(
+                "{label}[{index}] pointer validation failed: {cause}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 fn parse_assertions(
     value: &Value,
-    nodes: &BTreeMap<String, IrNodeSpec>,
+    nodes: &BTreeMap<String, RefinementNodeSpec>,
     label: &str,
 ) -> Result<Vec<Value>, ContractError> {
     let assertions = value
@@ -1395,12 +1959,12 @@ fn pinned_contract() -> Result<&'static ProducerContract, ContractError> {
 
 pub fn operation_names() -> Result<Vec<&'static str>, ContractError> {
     let contract = pinned_contract()?;
-    let names = METHODS
+    let names = BOUNDED_OPERATIONS
         .iter()
         .copied()
         .filter(|name| contract.operations.contains_key(*name))
         .collect::<Vec<_>>();
-    if names.len() != METHODS.len() {
+    if names.len() != BOUNDED_OPERATIONS.len() {
         return Err(error("pinned contract operation inventory is incomplete"));
     }
     Ok(names)
@@ -1463,9 +2027,11 @@ fn pointer_values<'a>(root: &'a Value, path: &str) -> Result<Vec<&'a Value>, Con
     let mut current = vec![root];
     for raw_segment in path[1..].split('/') {
         let segment = json_pointer_segment(raw_segment)?;
+        let wildcard = segment == "*";
+        let had_values = !current.is_empty();
         let mut next = Vec::new();
         for value in current {
-            if segment == "*" {
+            if wildcard {
                 match value {
                     Value::Array(values) => next.extend(values.iter()),
                     Value::Object(values) => next.extend(values.values()),
@@ -1491,7 +2057,7 @@ fn pointer_values<'a>(root: &'a Value, path: &str) -> Result<Vec<&'a Value>, Con
                 }
             }
         }
-        if next.is_empty() {
+        if next.is_empty() && !wildcard && had_values {
             return Err(error("JSON pointer selected no values"));
         }
         current = next;
@@ -1589,13 +2155,15 @@ fn eval<'a>(
         .get("op")
         .and_then(Value::as_str)
         .ok_or_else(|| error("refinement expression op is missing"))?;
+    let handler = refinement_handler(op)
+        .ok_or_else(|| error(format!("unsupported refinement opcode {op}")))?;
     let field = |name: &str| {
         map.get(name)
             .ok_or_else(|| error(format!("refinement opcode {op} field {name} is missing")))
     };
-    match op {
-        "literal" => Ok(EvalValue::Owned(field("value")?.clone())),
-        "pointer" => {
+    match handler {
+        RefinementHandler::Literal => Ok(EvalValue::Owned(field("value")?.clone())),
+        RefinementHandler::Pointer => {
             let path = field("path")?
                 .as_str()
                 .ok_or_else(|| error("pointer path is not a string"))?;
@@ -1608,7 +2176,7 @@ fn eval<'a>(
             };
             pointer_value(root, path)
         }
-        "iteration_pointer" => {
+        RefinementHandler::IterationPointer => {
             let path = field("path")?
                 .as_str()
                 .ok_or_else(|| error("iteration pointer path is not a string"))?;
@@ -1617,7 +2185,7 @@ fn eval<'a>(
                 .ok_or_else(|| error("iteration pointer scope is not a string"))?;
             current_pointer(current, scope, path)
         }
-        "array_length" => {
+        RefinementHandler::ArrayLength => {
             let value = eval(field("value")?, context, current)?;
             let length = match &value {
                 EvalValue::Refs(values) => values.len(),
@@ -1630,7 +2198,7 @@ fn eval<'a>(
             }
             Ok(scalar_u64(length as u64))
         }
-        "array_at" => {
+        RefinementHandler::ArrayAt => {
             let array = eval(field("array")?, context, current)?;
             let index = number_value(&eval(field("index")?, context, current)?, "array index")?;
             if index < 0.0 || index.fract() != 0.0 || index > usize::MAX as f64 {
@@ -1641,14 +2209,15 @@ fn eval<'a>(
                 .ok_or_else(|| error("array_at index is missing"))?;
             Ok(EvalValue::Ref(value))
         }
-        "all" | "any" => {
+        RefinementHandler::All | RefinementHandler::Any => {
             let values = field("values")?
                 .as_array()
                 .ok_or_else(|| error(format!("{op}.values is not an array")))?;
-            let mut result = op == "all";
+            let is_all = matches!(handler, RefinementHandler::All);
+            let mut result = is_all;
             for value in values {
                 let next = bool_value(&eval(value, context, current)?, op)?;
-                if op == "all" {
+                if is_all {
                     result &= next;
                     if !result {
                         break;
@@ -1662,7 +2231,7 @@ fn eval<'a>(
             }
             Ok(EvalValue::Owned(Value::Bool(result)))
         }
-        "coalesce" => {
+        RefinementHandler::Coalesce => {
             let values = field("values")?
                 .as_array()
                 .ok_or_else(|| error("coalesce.values is not an array"))?;
@@ -1674,7 +2243,7 @@ fn eval<'a>(
             }
             Ok(EvalValue::Owned(Value::Null))
         }
-        "concat" => {
+        RefinementHandler::Concat => {
             let values = field("values")?
                 .as_array()
                 .ok_or_else(|| error("concat.values is not an array"))?;
@@ -1687,25 +2256,27 @@ fn eval<'a>(
             }
             Ok(EvalValue::Owned(Value::String(result)))
         }
-        "eq" => Ok(EvalValue::Owned(Value::Bool(values_equal(
+        RefinementHandler::Eq => Ok(EvalValue::Owned(Value::Bool(values_equal(
             &eval(field("left")?, context, current)?,
             &eval(field("right")?, context, current)?,
         )?))),
-        "lt" | "lte" => {
+        RefinementHandler::Lt | RefinementHandler::Lte => {
             let left = number_value(&eval(field("left")?, context, current)?, op)?;
             let right = number_value(&eval(field("right")?, context, current)?, op)?;
-            Ok(EvalValue::Owned(Value::Bool(if op == "lt" {
-                left < right
-            } else {
-                left <= right
-            })))
+            Ok(EvalValue::Owned(Value::Bool(
+                if matches!(handler, RefinementHandler::Lt) {
+                    left < right
+                } else {
+                    left <= right
+                },
+            )))
         }
-        "multiply" => {
+        RefinementHandler::Multiply => {
             let left = number_value(&eval(field("left")?, context, current)?, "multiply")?;
             let right = number_value(&eval(field("right")?, context, current)?, "multiply")?;
             scalar_number(left * right, "multiply")
         }
-        "max" => {
+        RefinementHandler::Max => {
             let values = field("values")?
                 .as_array()
                 .ok_or_else(|| error("max.values is not an array"))?;
@@ -1715,11 +2286,11 @@ fn eval<'a>(
             }
             scalar_number(maximum, "max")
         }
-        "not" => Ok(EvalValue::Owned(Value::Bool(!bool_value(
+        RefinementHandler::Not => Ok(EvalValue::Owned(Value::Bool(!bool_value(
             &eval(field("value")?, context, current)?,
             "not",
         )?))),
-        "normalize_ref" => {
+        RefinementHandler::NormalizeRef => {
             let dependency = field("dependency")?
                 .as_str()
                 .ok_or_else(|| error("normalize_ref dependency is not a string"))?;
@@ -1729,7 +2300,7 @@ fn eval<'a>(
             })?;
             Ok(EvalValue::Owned(Value::String(normalized)))
         }
-        "map_lookup" => {
+        RefinementHandler::MapLookup => {
             let key = eval(field("key")?, context, current)?;
             let key_field = field("keyField")?
                 .as_str()
@@ -1743,19 +2314,19 @@ fn eval<'a>(
                 let entry_map = entry
                     .as_object()
                     .ok_or_else(|| error("map_lookup entry is not an object"))?;
-                if let Some(candidate) = entry_map.get(key_field) {
-                    if values_equal(&EvalValue::Ref(candidate), &key)? {
-                        return Ok(EvalValue::Ref(
-                            entry_map
-                                .get(value_field)
-                                .ok_or_else(|| error("map_lookup value field is missing"))?,
-                        ));
-                    }
+                if let Some(candidate) = entry_map.get(key_field)
+                    && values_equal(&EvalValue::Ref(candidate), &key)?
+                {
+                    return Ok(EvalValue::Ref(
+                        entry_map
+                            .get(value_field)
+                            .ok_or_else(|| error("map_lookup value field is missing"))?,
+                    ));
                 }
             }
             Ok(EvalValue::Owned(Value::Null))
         }
-        "set_contains" => {
+        RefinementHandler::SetContains => {
             let set = eval(field("set")?, context, current)?;
             let values = array_values(&set, "set_contains")?;
             let value = eval(field("value")?, context, current)?;
@@ -1768,11 +2339,11 @@ fn eval<'a>(
             }
             Ok(EvalValue::Owned(Value::Bool(contains)))
         }
-        "field_eq_ref" => Ok(EvalValue::Owned(Value::Bool(values_equal(
+        RefinementHandler::FieldEqRef => Ok(EvalValue::Owned(Value::Bool(values_equal(
             &eval(field("value")?, context, current)?,
             &eval(field("expected")?, context, current)?,
         )?))),
-        "finite_range" => {
+        RefinementHandler::FiniteRange => {
             let minimum = field("minimum")?
                 .as_f64()
                 .ok_or_else(|| error("finite_range minimum is not a number"))?;
@@ -1780,18 +2351,14 @@ fn eval<'a>(
                 .as_f64()
                 .ok_or_else(|| error("finite_range maximum is not a number"))?;
             let value = eval(field("value")?, context, current)?;
-            let valid = value
-                .refs()
-                .iter()
-                .map(|value| {
-                    value.as_f64().is_some_and(|number| {
-                        number.is_finite() && number >= minimum && number <= maximum
-                    })
+            let valid = value.refs().iter().all(|value| {
+                value.as_f64().is_some_and(|number| {
+                    number.is_finite() && number >= minimum && number <= maximum
                 })
-                .all(|valid| valid);
+            });
             Ok(EvalValue::Owned(Value::Bool(valid)))
         }
-        "safe_integer_range" => {
+        RefinementHandler::SafeIntegerRange => {
             let minimum = field("minimum")?
                 .as_f64()
                 .ok_or_else(|| error("safe_integer_range minimum is not a number"))?;
@@ -1808,7 +2375,7 @@ fn eval<'a>(
             });
             Ok(EvalValue::Owned(Value::Bool(valid)))
         }
-        "tuple_tags" => {
+        RefinementHandler::TupleTags => {
             let expected = field("expected")?
                 .as_array()
                 .ok_or_else(|| error("tuple_tags expected is not an array"))?;
@@ -1832,9 +2399,9 @@ fn eval<'a>(
                 });
             Ok(EvalValue::Owned(Value::Bool(valid)))
         }
-        "length_eq" | "length_lte_ref" => {
+        RefinementHandler::LengthEq | RefinementHandler::LengthLteRef => {
             let actual = eval(field("actual")?, context, current)?;
-            let expected_name = if op == "length_eq" {
+            let expected_name = if matches!(handler, RefinementHandler::LengthEq) {
                 "expected"
             } else {
                 "limit"
@@ -1846,13 +2413,15 @@ fn eval<'a>(
                 .ok_or_else(|| error("length assertion actual is not an array"))?
                 .len() as u64;
             let expected_len = number_value(&expected, "length assertion expected")?;
-            Ok(EvalValue::Owned(Value::Bool(if op == "length_eq" {
-                actual_len as f64 == expected_len
-            } else {
-                actual_len as f64 <= expected_len
-            })))
+            Ok(EvalValue::Owned(Value::Bool(
+                if matches!(handler, RefinementHandler::LengthEq) {
+                    actual_len as f64 == expected_len
+                } else {
+                    actual_len as f64 <= expected_len
+                },
+            )))
         }
-        "unique_by" => {
+        RefinementHandler::UniqueBy => {
             let collection = eval(field("collection")?, context, current)?;
             let collection = collection
                 .one("unique_by")?
@@ -1875,7 +2444,7 @@ fn eval<'a>(
             }
             Ok(EvalValue::Owned(Value::Bool(true)))
         }
-        "ordered_score_desc_id_asc" => {
+        RefinementHandler::OrderedScoreDescIdAsc => {
             let collection = eval(field("collection")?, context, current)?;
             let collection = collection
                 .one("ordered_score_desc_id_asc")?
@@ -1896,19 +2465,18 @@ fn eval<'a>(
                     &eval(id_expression, context, Some((scope, item)))?,
                     "ordered id",
                 )?;
-                if let Some((previous_score, previous_id)) = &previous {
-                    if score > *previous_score
-                        || (score.total_cmp(previous_score).is_eq()
-                            && id.encode_utf16().cmp(previous_id.encode_utf16()).is_lt())
-                    {
-                        return Ok(EvalValue::Owned(Value::Bool(false)));
-                    }
+                if let Some((previous_score, previous_id)) = &previous
+                    && (score > *previous_score
+                        || (score == *previous_score
+                            && id.encode_utf16().cmp(previous_id.encode_utf16()).is_lt()))
+                {
+                    return Ok(EvalValue::Owned(Value::Bool(false)));
                 }
                 previous = Some((score, id));
             }
             Ok(EvalValue::Owned(Value::Bool(true)))
         }
-        "for_each" => {
+        RefinementHandler::ForEach => {
             let collection = eval(field("collection")?, context, current)?;
             let collection = collection
                 .one("for_each")?
@@ -1928,7 +2496,7 @@ fn eval<'a>(
             }
             Ok(EvalValue::Owned(Value::Bool(true)))
         }
-        "rank_is_index_plus_one" => {
+        RefinementHandler::RankIsIndexPlusOne => {
             let collection = eval(field("collection")?, context, current)?;
             let collection = collection
                 .one("rank_is_index_plus_one")?
@@ -1949,7 +2517,7 @@ fn eval<'a>(
             }
             Ok(EvalValue::Owned(Value::Bool(true)))
         }
-        "prefixed_identity" => {
+        RefinementHandler::PrefixedIdentity => {
             let identity = string_value(&eval(field("identity")?, context, current)?, "identity")?;
             let prefix = field("prefix")?
                 .as_str()
@@ -1959,12 +2527,30 @@ fn eval<'a>(
                 value == format!("{prefix}{identity}"),
             )))
         }
-        "corpus_eq_ref" => Ok(EvalValue::Owned(Value::Bool(values_equal(
+        RefinementHandler::CorpusEqRef => Ok(EvalValue::Owned(Value::Bool(values_equal(
             &eval(field("corpus")?, context, current)?,
             &eval(field("expected")?, context, current)?,
         )?))),
-        unknown => Err(error(format!("unsupported refinement opcode {unknown}"))),
     }
+}
+
+fn first_failed_assertion(
+    assertions: &[Value],
+    request: &Value,
+    result: Option<&Value>,
+    normalizer: &Normalizer<'_>,
+) -> Result<Option<usize>, ContractError> {
+    let context = EvalContext {
+        request,
+        result,
+        normalizer,
+    };
+    for (index, assertion) in assertions.iter().enumerate() {
+        if !bool_value(&eval(assertion, &context, None)?, "assertion")? {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
 }
 
 fn evaluate_assertions(
@@ -1973,19 +2559,12 @@ fn evaluate_assertions(
     result: Option<&Value>,
     normalizer: &Normalizer<'_>,
 ) -> Result<(), ContractError> {
-    let context = EvalContext {
-        request,
-        result,
-        normalizer,
-    };
-    for (index, assertion) in assertions.iter().enumerate() {
-        if !bool_value(&eval(assertion, &context, None)?, "assertion")? {
-            return Err(error(format!(
-                "producer refinement assertion {index} failed"
-            )));
-        }
+    match first_failed_assertion(assertions, request, result, normalizer)? {
+        Some(index) => Err(error(format!(
+            "producer refinement assertion {index} failed"
+        ))),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Validate an operation request using the schema and request assertions
@@ -2765,6 +3344,27 @@ pub struct ProtocolMethod {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UnavailableProtocolMethod {
+    pub name: String,
+    pub availability: &'static str,
+    pub reason: &'static str,
+    pub semantic_bytes: u64,
+    pub semantic_digest: String,
+    pub request_schema_sha256: String,
+    pub result_schema_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoundedCheckpointInfo {
+    pub status: &'static str,
+    pub availability: &'static str,
+    pub executable: bool,
+    pub unavailable_methods: Vec<UnavailableProtocolMethod>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProtocolLimits {
     pub max_vector_dimensions: u64,
     pub max_vector_comparisons: u64,
@@ -2801,19 +3401,29 @@ pub struct BoundedProtocolInfo {
     pub classification: &'static str,
     pub wal: bool,
     pub methods: Vec<ProtocolMethod>,
+    pub checkpoint: BoundedCheckpointInfo,
     pub limits: ProtocolLimits,
     pub method_inventory_sha256: String,
 }
 
 pub fn protocol_methods() -> Result<Vec<ProtocolMethod>, ContractError> {
+    pinned_contract()?;
+    // The contract operations remain available for validation and future
+    // dispatch, but no bounded retrieval algorithm is executable at this
+    // checkpoint.  Keep this inventory empty so capability negotiation cannot
+    // mistake the contract for a runnable method set.
+    Ok(Vec::new())
+}
+
+fn unavailable_protocol_methods() -> Result<Vec<UnavailableProtocolMethod>, ContractError> {
     let contract = pinned_contract()?;
     let digests = expected_operation_digests();
-    let mut methods = Vec::with_capacity(METHODS.len());
-    for method in METHODS {
+    let mut methods = Vec::with_capacity(BOUNDED_OPERATIONS.len());
+    for method in BOUNDED_OPERATIONS {
         let operation = contract
             .operations
             .get(method)
-            .ok_or_else(|| error("pinned method inventory is incomplete"))?;
+            .ok_or_else(|| error("pinned operation inventory is incomplete"))?;
         let digest = digests
             .get(method)
             .ok_or_else(|| error("pinned operation digest is missing"))?;
@@ -2827,18 +3437,18 @@ pub fn protocol_methods() -> Result<Vec<ProtocolMethod>, ContractError> {
             result_schema_sha256: schema_digest(&operation.result),
         });
     }
-    if methods.len() != METHODS.len()
-        || methods
-            .iter()
-            .map(|method| method.name.as_str())
-            .collect::<Vec<_>>()
-            != METHODS.to_vec()
-    {
-        return Err(error(
-            "bounded method inventory is not exactly the pinned three",
-        ));
-    }
-    Ok(methods)
+    Ok(methods
+        .into_iter()
+        .map(|method| UnavailableProtocolMethod {
+            name: method.name,
+            availability: "unavailable",
+            reason: "algorithm_dispatch_not_implemented",
+            semantic_bytes: method.semantic_bytes,
+            semantic_digest: method.semantic_digest,
+            request_schema_sha256: method.request_schema_sha256,
+            result_schema_sha256: method.result_schema_sha256,
+        })
+        .collect())
 }
 
 pub fn method_inventory_lines() -> Result<String, ContractError> {
@@ -2865,6 +3475,7 @@ pub fn method_inventory_sha256() -> Result<String, ContractError> {
 
 pub fn protocol_info() -> Result<BoundedProtocolInfo, ContractError> {
     let methods = protocol_methods()?;
+    let unavailable_methods = unavailable_protocol_methods()?;
     Ok(BoundedProtocolInfo {
         protocol_version: "aira-graphdb-bounded-retrieval@1",
         contract_version: CONTRACT_VERSION,
@@ -2877,6 +3488,12 @@ pub fn protocol_info() -> Result<BoundedProtocolInfo, ContractError> {
         classification: "read",
         wal: false,
         methods,
+        checkpoint: BoundedCheckpointInfo {
+            status: "checkpoint",
+            availability: "unavailable",
+            executable: false,
+            unavailable_methods,
+        },
         limits: ProtocolLimits {
             max_vector_dimensions: MAX_VECTOR_DIMENSIONS,
             max_vector_comparisons: MAX_VECTOR_COMPARISONS,

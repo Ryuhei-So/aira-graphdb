@@ -1,21 +1,21 @@
 {
   "artifacts": [
     {
-      "bytes": 59523,
+      "bytes": 60556,
       "localFile": "bounded-retrieval-contract.json",
-      "sha256": "3ef47549760243ef968f160bc6d944225d23fd8eee7f33a8368f95da85a06aaf",
+      "sha256": "dd5386c8718d71c6a2588bb095d99789115272dbe66ceda3ee232753d72cada7",
       "sourcePath": "packages/memgraphrag/tests/fixtures/bounded-retrieval/bounded-retrieval-contract.json"
     },
     {
-      "bytes": 12061,
+      "bytes": 79681,
       "localFile": "bounded-retrieval-fixture.json",
-      "sha256": "9bdfbee39b4d1ba01f82df101de287756a9c089796bbfaa571aa88ec3437b210",
+      "sha256": "a003939ca7bac27da2f390b5e5eef7f9c43e0291516e1a55e05a93b151d36f5c",
       "sourcePath": "packages/memgraphrag/tests/fixtures/bounded-retrieval/bounded-retrieval-fixture.json"
     },
     {
-      "bytes": 3047,
+      "bytes": 3384,
       "localFile": "bounded-retrieval-fixture.manifest.json",
-      "sha256": "6b9faa96f424ef14c08176c2ace115ad7dd0f18b2a9ec72ed3b545ae2fe67f4a",
+      "sha256": "66452c6f10209f9640c981ddf9b2e750d66b12c64fa349c8fd70968cdd40e526",
       "sourcePath": "packages/memgraphrag/tests/fixtures/bounded-retrieval/bounded-retrieval-fixture.manifest.json"
     }
   ],
@@ -63,23 +63,23 @@
     }
   ],
   "fixtureManifestFile": "bounded-retrieval-fixture.manifest.json",
-  "fixtureManifestSha256": "6b9faa96f424ef14c08176c2ace115ad7dd0f18b2a9ec72ed3b545ae2fe67f4a",
+  "fixtureManifestSha256": "66452c6f10209f9640c981ddf9b2e750d66b12c64fa349c8fd70968cdd40e526",
   "operationSemanticDigests": {
     "candidate_search_bounded@1": {
-      "bytes": 20276,
-      "sha256": "4255d5a4076b27d264841579c6dbd3064f90b3e1a89b0386acaad44cb562eb1a"
+      "bytes": 19371,
+      "sha256": "adf3daa1cdf472097e76dae153a6c855ccefe378398e82f8d83a9b39f5917928"
     },
     "fact_expand_bounded@1": {
-      "bytes": 12258,
-      "sha256": "296423c9a1b5d5627175e537f0df5be884b17ea15ab9efe4b6875843194bc60d"
+      "bytes": 12273,
+      "sha256": "4b13eebe0bed3620e91df122c2a4deb01fa1de2520c41a92fbb2f2f131b21e22"
     },
     "ppr_materialize_bounded@1": {
-      "bytes": 14685,
-      "sha256": "cd1f4bfeb39a01b4f12db1da9a7a05d8179f27eba878d1fd7aa935eb151834ab"
+      "bytes": 16204,
+      "sha256": "8ca961650d6ffe6ef656ce236f8630b879fd956d7774e7229e9a720e75120bdb"
     }
   },
   "pinVersion": "aira-graphdb-bounded-retrieval-pin@1",
   "sourceBranch": "production-runtime",
-  "sourceCommit": "a2f53107658db177a6fb0c388827f9a1121921be",
+  "sourceCommit": "c8199660d5cdac12b617825e4a3e111ee3daa4c7",
   "sourceRepository": "https://github.com/Ryuhei-So/aira-synapse"
 }

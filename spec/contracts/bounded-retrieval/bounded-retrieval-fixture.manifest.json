@@ -1,7 +1,7 @@
 {
-  "contractBytes": 59523,
+  "contractBytes": 60556,
   "contractFile": "bounded-retrieval-contract.json",
-  "contractSha256": "3ef47549760243ef968f160bc6d944225d23fd8eee7f33a8368f95da85a06aaf",
+  "contractSha256": "dd5386c8718d71c6a2588bb095d99789115272dbe66ceda3ee232753d72cada7",
   "contractVersion": "aira-synapse-bounded-retrieval-contract@1",
   "dependencies": [
     {
@@ -46,23 +46,38 @@
       "unicodeVersion": "16.0.0"
     }
   ],
-  "fixtureBytes": 12061,
+  "fixtureBytes": 79681,
   "fixtureFile": "bounded-retrieval-fixture.json",
-  "fixtureSha256": "9bdfbee39b4d1ba01f82df101de287756a9c089796bbfaa571aa88ec3437b210",
-  "fixtureVersion": "aira-synapse-bounded-retrieval-fixture@1",
-  "manifestVersion": "aira-synapse-bounded-retrieval-manifest@1",
+  "fixtureSha256": "a003939ca7bac27da2f390b5e5eef7f9c43e0291516e1a55e05a93b151d36f5c",
+  "fixtureVersion": "aira-synapse-bounded-retrieval-fixture@2",
+  "manifestVersion": "aira-synapse-bounded-retrieval-manifest@2",
   "operationSemanticDigests": {
     "candidate_search_bounded@1": {
-      "bytes": 20276,
-      "sha256": "4255d5a4076b27d264841579c6dbd3064f90b3e1a89b0386acaad44cb562eb1a"
+      "bytes": 19371,
+      "sha256": "adf3daa1cdf472097e76dae153a6c855ccefe378398e82f8d83a9b39f5917928"
     },
     "fact_expand_bounded@1": {
-      "bytes": 12258,
-      "sha256": "296423c9a1b5d5627175e537f0df5be884b17ea15ab9efe4b6875843194bc60d"
+      "bytes": 12273,
+      "sha256": "4b13eebe0bed3620e91df122c2a4deb01fa1de2520c41a92fbb2f2f131b21e22"
     },
     "ppr_materialize_bounded@1": {
-      "bytes": 14685,
-      "sha256": "cd1f4bfeb39a01b4f12db1da9a7a05d8179f27eba878d1fd7aa935eb151834ab"
+      "bytes": 16204,
+      "sha256": "8ca961650d6ffe6ef656ce236f8630b879fd956d7774e7229e9a720e75120bdb"
     }
-  }
+  },
+  "witnessCoverage": {
+    "candidate_search_bounded@1": {
+      "exchange": 21,
+      "request": 10
+    },
+    "fact_expand_bounded@1": {
+      "exchange": 8,
+      "request": 8
+    },
+    "ppr_materialize_bounded@1": {
+      "exchange": 20,
+      "request": 9
+    }
+  },
+  "witnessVersion": "aira-synapse-bounded-retrieval-witness@1"
 }

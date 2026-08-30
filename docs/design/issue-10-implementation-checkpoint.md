@@ -10,25 +10,45 @@ commit, path, byte length, and SHA-256; the domain contract is consumed only
 through that delegated dependency. Versioned Synapse plans remain the query-
 policy authority.
 
+The fixture also carries one producer-owned negative witness for every
+canonical request/exchange assertion. Native derives the expected identity
+sequence from the pinned assertion arrays, applies the closed replacement
+patches, and requires each witness to fail its exact assertion. It has no
+parallel rule or mutation catalog.
+
 ## Authority and flow
 
 - Synapse owns plan construction, normalization, ordering policy, and all
   retrieval semantics. The pinned retrieval artifact is the producer
   contract for those semantics; native accepts only explicit, complete
   operation requests and must not supply policy defaults.
-- Native owns descriptor-backed lookup/arithmetic, checked allocation, the
-  monotonic operation deadline, exact work counters, and bounded response
-  framing for `candidate_search_bounded@1`, `fact_expand_bounded@1`, and
-  `ppr_materialize_bounded@1`.
+- Native owns the contract boundary, descriptor-backed lookup/arithmetic,
+  checked allocation, the monotonic operation deadline, exact work counters,
+  and bounded response framing that the three future operations will use.
+  Those operations are contract-only at this checkpoint; no bounded retrieval
+  method is executable yet.
 - Hub remains the generation-session, lease, availability, retry, and circuit
   authority. This issue adds no Hub behavior and no production cutover.
 
 The implementation checkpoint is contract-first: freeze one Rust contract
 module and executable negative tests before adding the three algorithms. That
-module is the sole native authority for method inventory, request validation,
-hard limits, checked work/allocation formulas, counters, deadline checks,
-response bounds, and `protocol_info` metadata. Domain shapes are consumed from
-the pinned Synapse artifacts rather than restated independently.
+module is the sole native authority for the executable method inventory,
+request validation, hard limits, checked work/allocation formulas, counters,
+deadline checks, response bounds, and `protocol_info` metadata. The pinned
+producer `refinementNodes` declaration is parsed generically and is the sole
+structural authority for node roles and fields. Native owns only the executable
+opcode-handler inventory and supported primitive field-marker inventory, with
+an exact parsed-opcode-to-handler equality check. Domain shapes are consumed
+from the pinned Synapse artifacts rather than restated independently.
+
+At this checkpoint `protocol_info.boundedRetrieval.methods` is an empty
+executable inventory. The three contract operations appear only under
+`protocol_info.boundedRetrieval.checkpoint`, with
+`status=checkpoint`, `availability=unavailable`, `executable=false`, and
+per-operation `unavailableMethods` metadata. Dispatch returns
+`REQUEST_EXECUTION_FAILED` for each of those names until a separately reviewed
+algorithm checkpoint lands; consumers must not treat the contract metadata as
+capability negotiation.
 
 ## Invariants and state
 
@@ -69,7 +89,9 @@ drain and does not rewrite data.
 
 Before algorithm wiring, executable tests must prove:
 
-1. exact method/digest/read/WAL-free inventory and rejection of unknown fields;
+1. empty executable bounded-method inventory plus explicit unavailable
+   checkpoint metadata, exact operation digests, and rejection of unknown
+   fields;
 2. every count, byte, work, allocation, generation, and deadline boundary at
    the limit and immediately above it, including checked overflow;
 3. wrong slot order/cardinality/id/namespace/corpus, unsupported normalization
@@ -83,7 +105,11 @@ Before algorithm wiring, executable tests must prove:
 5. response overflow, allocation failpoints, native death/partial frame, and
    RecoveryPending-shaped state cannot change canonical/blob/sidecar bytes;
 6. no bounded code path calls `memory_load`, emits a global projection, scans a
-   legacy response snapshot, or duplicates Synapse policy constants;
+   legacy response snapshot, or duplicates Synapse policy constants; parsed
+   producer refinement rules drive validation, every canonical opcode has
+   exactly one native handler, canonical rule/opcode coverage is generated
+   from the pinned declaration, and missing, duplicate, reordered, unknown,
+   shape-breaking, or non-failing producer witnesses are rejected;
 7. one decreasing session remainder is enforced across candidate, optional
    expansion, and PPR operations without reset, including exact-deadline ties;
 8. while each real-native read operation runs, a queued writer may let the Hub

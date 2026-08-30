@@ -3562,14 +3562,14 @@ impl Server {
     fn descriptor_method_specs() -> impl Iterator<Item = &'static MethodSpec> {
         METHOD_SPECS
             .iter()
-            // The descriptor checkpoint exposes only health. The three
-            // bounded retrieval methods are added here when their contract
-            // implementation lands; no legacy read is implicitly admitted.
+            // The descriptor checkpoint exposes only health. Bounded
+            // retrieval remains a contract-only, unavailable checkpoint and
+            // is intentionally absent from this executable inventory.
             .filter(|spec| matches!(spec.name, "ping" | "protocol_info"))
     }
 
     fn descriptor_method_inventory() -> Vec<Value> {
-        let mut methods = Self::descriptor_method_specs()
+        Self::descriptor_method_specs()
             .map(|spec| {
                 json!({
                     "name": spec.name,
@@ -3577,24 +3577,13 @@ impl Server {
                     "wal": spec.wal,
                 })
             })
-            .collect::<Vec<_>>();
-        methods.extend(
-            bounded_retrieval::protocol_methods()
-                .expect("pinned bounded retrieval contract must be valid")
-                .into_iter()
-                .map(|method| serde_json::to_value(method).expect("protocol method serializes")),
-        );
-        methods
+            .collect::<Vec<_>>()
     }
 
     fn descriptor_method_inventory_sha256() -> String {
-        let mut encoded = Self::descriptor_method_specs()
+        let encoded = Self::descriptor_method_specs()
             .map(|spec| format!("{}\t{}\t{}\n", spec.name, spec.classification, spec.wal))
             .collect::<String>();
-        encoded.push_str(
-            &bounded_retrieval::method_inventory_lines()
-                .expect("pinned bounded retrieval contract must be valid"),
-        );
         Self::sha256_hex(encoded.as_bytes())
     }
 
@@ -5410,16 +5399,12 @@ impl Server {
         progress: &mut dyn CommitProgress,
     ) -> RpcResponse {
         let is_mutation = Self::is_mutating_method(&req.method);
-        if bounded_retrieval::METHODS.contains(&req.method.as_str()) {
-            if !matches!(self.access_mode, AccessMode::DescriptorReadOnly(_)) {
-                return self
-                    .response_for_result(req.id, Err(Self::unsupported_method_error(&req.method)));
-            }
+        if bounded_retrieval::BOUNDED_OPERATIONS.contains(&req.method.as_str()) {
             return self.response_for_result(
                 req.id,
                 Err(AppError {
                     code: bounded_retrieval::REQUEST_EXECUTION_FAILED.to_string(),
-                    message: "bounded retrieval contract checkpoint has no algorithm dispatch"
+                    message: "bounded retrieval checkpoint is unavailable; algorithm dispatch is not implemented"
                         .to_string(),
                     failure_class: Some("CLIENT_INPUT".to_string()),
                 }),
@@ -5543,13 +5528,13 @@ impl Server {
                         },
                         "methods": methods,
                     });
+                    protocol["boundedRetrieval"] = bounded_retrieval::protocol_info_value()
+                        .map_err(|error| {
+                            Self::execution_io_error(format!(
+                                "load bounded retrieval contract failed: {error}"
+                            ))
+                        })?;
                     if let Some(handshake) = descriptor_handshake {
-                        protocol["boundedRetrieval"] = bounded_retrieval::protocol_info_value()
-                            .map_err(|error| {
-                                Self::execution_io_error(format!(
-                                    "load bounded retrieval contract failed: {error}"
-                                ))
-                            })?;
                         protocol["accessMode"] = json!(ACCESS_MODE_DESCRIPTOR_READ_ONLY);
                         protocol["readOnly"] = json!(true);
                         protocol["canonicalSha256"] = json!(handshake.canonical_sha256);
@@ -8734,22 +8719,44 @@ mod tests {
         }));
         assert_eq!(
             result["methodInventorySha256"],
-            json!("72347885cb32ba419b1699b828522dc5abcbda9629682c05462175208f998bee")
+            json!("126080ca61644282fd7ed09b10d5fd0571eba49c6dc19132d4cc6168d07eaf1f")
         );
         let bounded_names = methods
             .iter()
             .filter_map(|method| method["name"].as_str())
-            .filter(|name| bounded_retrieval::METHODS.contains(name))
+            .filter(|name| bounded_retrieval::BOUNDED_OPERATIONS.contains(name))
             .collect::<Vec<_>>();
-        assert_eq!(bounded_names, bounded_retrieval::METHODS);
+        assert!(bounded_names.is_empty());
         assert_eq!(
             result["boundedRetrieval"]["methods"]
                 .as_array()
                 .unwrap()
                 .len(),
-            3
+            0
         );
-        for method in bounded_retrieval::METHODS {
+        assert_eq!(
+            result["boundedRetrieval"]["checkpoint"]["status"],
+            json!("checkpoint")
+        );
+        assert_eq!(
+            result["boundedRetrieval"]["checkpoint"]["availability"],
+            json!("unavailable")
+        );
+        assert_eq!(
+            result["boundedRetrieval"]["checkpoint"]["executable"],
+            json!(false)
+        );
+        let unavailable = result["boundedRetrieval"]["checkpoint"]["unavailableMethods"]
+            .as_array()
+            .expect("unavailable bounded operations");
+        assert_eq!(
+            unavailable
+                .iter()
+                .map(|method| method["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            bounded_retrieval::BOUNDED_OPERATIONS
+        );
+        for method in bounded_retrieval::BOUNDED_OPERATIONS {
             let response = server.handle_prepared(RpcRequest {
                 id: 40,
                 method: method.to_string(),
@@ -8802,6 +8809,51 @@ mod tests {
         assert_eq!(before, after, "descriptor reads must not create sidecars");
         cleanup(&canonical_path);
         let _ = fs::remove_file(blob_path);
+    }
+
+    #[test]
+    fn bounded_retrieval_checkpoint_dispatch_is_unavailable_in_normal_mode() {
+        let path = temp_path("agdb-native-bounded-checkpoint");
+        let mut server = Server::open(path.clone()).expect("open server");
+
+        let info = server.handle_prepared(RpcRequest {
+            id: 0,
+            method: "protocol_info".to_string(),
+            params: json!({}),
+        });
+        assert!(info.ok, "normal protocol_info failed: {info:?}");
+        let result = info.result.expect("normal protocol result");
+        assert_eq!(
+            result["boundedRetrieval"]["checkpoint"]["availability"],
+            json!("unavailable")
+        );
+        assert_eq!(
+            result["boundedRetrieval"]["checkpoint"]["executable"],
+            json!(false)
+        );
+        assert!(
+            result["boundedRetrieval"]["methods"]
+                .as_array()
+                .expect("bounded executable inventory")
+                .is_empty()
+        );
+
+        for method in bounded_retrieval::BOUNDED_OPERATIONS {
+            let response = server.handle_prepared(RpcRequest {
+                id: 1,
+                method: method.to_string(),
+                params: json!({}),
+            });
+            assert!(!response.ok, "{method} must be unavailable");
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code.as_str()),
+                Some("REQUEST_EXECUTION_FAILED"),
+                "{method} must use the checkpoint failure code"
+            );
+            assert!(response.result.is_none());
+        }
+
+        cleanup(&path);
     }
 
     #[cfg(unix)]
