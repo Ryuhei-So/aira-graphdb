@@ -30,6 +30,9 @@ use aira_graphdb::native_persistence_contract::{
 };
 use aira_graphdb::query::{CypherDialect, execute_query_with_dialect};
 
+#[path = "aira-graphdb-native/bounded_retrieval_runtime.rs"]
+mod bounded_retrieval_runtime;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct GraphNode {
@@ -1399,6 +1402,24 @@ struct Server {
     adjacent_edge_keys_by_node: HashMap<String, Vec<String>>,
     vector_keys_by_corpus_namespace: HashMap<String, Vec<String>>,
     passage_keys_by_corpus: HashMap<String, Vec<String>>,
+    /// Producer domain objects are retained in the canonical snapshot. The
+    /// descriptor reader keeps only fixed-size identity digests to array
+    /// offsets, never a second copy of domain ids, text, or objects.
+    bounded_snapshot_indices: HashMap<[u8; 32], usize>,
+    /// Exact per-corpus edge counts used for request admission. Descriptor
+    /// mode deliberately does not retain edge keys or adjacency.
+    bounded_edge_counts_by_corpus: HashMap<String, u64>,
+    /// Exact graph-endpoint counts are generation metadata used for O(1)
+    /// bounded-read admission.  No node ids or adjacency are duplicated here.
+    bounded_endpoint_counts_by_corpus: HashMap<String, u64>,
+    bounded_catalog_ready: bool,
+    /// Native-owned absolute monotonic deadline shared by every bounded frame
+    /// on this descriptor reader. Caller remainders may shorten but never
+    /// recreate or extend it.
+    bounded_session_deadline: Option<Instant>,
+    /// The caller-owned numeric remainder is tracked independently so only an
+    /// actual increase is rejected; clock jitter cannot recreate a deadline.
+    bounded_session_owner_remaining_ms: Option<u64>,
     access_mode: AccessMode,
 }
 
@@ -1932,6 +1953,12 @@ impl Server {
             adjacent_edge_keys_by_node: HashMap::new(),
             vector_keys_by_corpus_namespace: HashMap::new(),
             passage_keys_by_corpus: HashMap::new(),
+            bounded_snapshot_indices: HashMap::new(),
+            bounded_edge_counts_by_corpus: HashMap::new(),
+            bounded_endpoint_counts_by_corpus: HashMap::new(),
+            bounded_catalog_ready: false,
+            bounded_session_deadline: None,
+            bounded_session_owner_remaining_ms: None,
             access_mode: AccessMode::Normal,
         })
     }
@@ -3122,9 +3149,9 @@ impl Server {
             vector_blob_size: blob_raw.len() as u64,
             legacy_generation0: config.legacy_generation0,
             legacy_binding_sha256: config.legacy_binding_sha256.clone(),
-            method_inventory_sha256: Self::descriptor_method_inventory_sha256(),
+            method_inventory_sha256: Self::descriptor_method_inventory_sha256()?,
         };
-        Ok(Self {
+        let mut server = Self {
             db_path: None,
             audit_log_path: None,
             state,
@@ -3146,8 +3173,16 @@ impl Server {
             adjacent_edge_keys_by_node: HashMap::new(),
             vector_keys_by_corpus_namespace: HashMap::new(),
             passage_keys_by_corpus: HashMap::new(),
+            bounded_snapshot_indices: HashMap::new(),
+            bounded_edge_counts_by_corpus: HashMap::new(),
+            bounded_endpoint_counts_by_corpus: HashMap::new(),
+            bounded_catalog_ready: false,
+            bounded_session_deadline: None,
+            bounded_session_owner_remaining_ms: None,
             access_mode: AccessMode::DescriptorReadOnly(handshake),
-        })
+        };
+        server.initialize_bounded_catalog()?;
+        Ok(server)
     }
 
     fn decode_vector_values(
@@ -3562,14 +3597,14 @@ impl Server {
     fn descriptor_method_specs() -> impl Iterator<Item = &'static MethodSpec> {
         METHOD_SPECS
             .iter()
-            // The descriptor checkpoint exposes only health. Bounded
-            // retrieval remains a contract-only, unavailable checkpoint and
-            // is intentionally absent from this executable inventory.
+            // Core descriptor methods expose health here. Producer-pinned
+            // bounded retrieval methods are appended separately after their
+            // exact semantic and schema digests have been verified.
             .filter(|spec| matches!(spec.name, "ping" | "protocol_info"))
     }
 
-    fn descriptor_method_inventory() -> Vec<Value> {
-        Self::descriptor_method_specs()
+    fn descriptor_method_inventory() -> Result<Vec<Value>, AppError> {
+        let mut methods = Self::descriptor_method_specs()
             .map(|spec| {
                 json!({
                     "name": spec.name,
@@ -3577,14 +3612,39 @@ impl Server {
                     "wal": spec.wal,
                 })
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        methods.extend(
+            bounded_retrieval::executable_protocol_methods()
+                .map_err(|error| {
+                    Self::execution_io_error(format!(
+                        "load executable bounded method inventory failed: {error}"
+                    ))
+                })?
+                .into_iter()
+                .map(|method| {
+                    json!({
+                        "name": method.name,
+                        "classification": method.classification,
+                        "wal": method.wal,
+                    })
+                }),
+        );
+        Ok(methods)
     }
 
-    fn descriptor_method_inventory_sha256() -> String {
-        let encoded = Self::descriptor_method_specs()
+    fn descriptor_method_inventory_sha256() -> io::Result<String> {
+        let mut encoded = Self::descriptor_method_specs()
             .map(|spec| format!("{}\t{}\t{}\n", spec.name, spec.classification, spec.wal))
             .collect::<String>();
-        Self::sha256_hex(encoded.as_bytes())
+        for method in bounded_retrieval::executable_protocol_methods()
+            .map_err(|error| io::Error::other(format!("load bounded inventory failed: {error}")))?
+        {
+            encoded.push_str(&format!(
+                "{}\t{}\t{}\n",
+                method.name, method.classification, method.wal
+            ));
+        }
+        Ok(Self::sha256_hex(encoded.as_bytes()))
     }
 
     /// WAL admission and protocol_info both use METHOD_SPECS. Unknown
@@ -4300,6 +4360,10 @@ impl Server {
 
     fn mark_cache_dirty(&mut self) {
         self.cache_dirty = true;
+        self.bounded_catalog_ready = false;
+        self.bounded_snapshot_indices.clear();
+        self.bounded_edge_counts_by_corpus.clear();
+        self.bounded_endpoint_counts_by_corpus.clear();
     }
 
     fn ensure_cache(&mut self) {
@@ -5461,21 +5525,20 @@ impl Server {
                         AccessMode::DescriptorReadOnly(handshake) => Some(handshake),
                         AccessMode::Normal => None,
                     };
-                    let methods = descriptor_handshake
-                        .is_some()
-                        .then(Self::descriptor_method_inventory)
-                        .unwrap_or_else(|| {
-                            METHOD_SPECS
-                                .iter()
-                                .map(|spec| {
-                                    json!({
-                                        "name": spec.name,
-                                        "classification": spec.classification,
-                                        "wal": spec.wal,
-                                    })
+                    let methods = if descriptor_handshake.is_some() {
+                        Self::descriptor_method_inventory()?
+                    } else {
+                        METHOD_SPECS
+                            .iter()
+                            .map(|spec| {
+                                json!({
+                                    "name": spec.name,
+                                    "classification": spec.classification,
+                                    "wal": spec.wal,
                                 })
-                                .collect()
-                        });
+                            })
+                            .collect()
+                    };
                     let mut protocol = json!({
                         "protocolVersion": "native-method-policy@1",
                         "generation": self.state.generation,
@@ -5528,12 +5591,16 @@ impl Server {
                         },
                         "methods": methods,
                     });
-                    protocol["boundedRetrieval"] = bounded_retrieval::protocol_info_value()
-                        .map_err(|error| {
-                            Self::execution_io_error(format!(
-                                "load bounded retrieval contract failed: {error}"
-                            ))
-                        })?;
+                    protocol["boundedRetrieval"] = if descriptor_handshake.is_some() {
+                        bounded_retrieval::executable_protocol_info_value()
+                    } else {
+                        bounded_retrieval::protocol_info_value()
+                    }
+                    .map_err(|error| {
+                        Self::execution_io_error(format!(
+                            "load bounded retrieval contract failed: {error}"
+                        ))
+                    })?;
                     if let Some(handshake) = descriptor_handshake {
                         protocol["accessMode"] = json!(ACCESS_MODE_DESCRIPTOR_READ_ONLY);
                         protocol["readOnly"] = json!(true);
@@ -7137,6 +7204,13 @@ fn run_descriptor_read(config: DescriptorReadConfig) -> io::Result<()> {
                 continue;
             }
         };
+        if bounded_retrieval::BOUNDED_OPERATIONS.contains(&incoming.method.as_str()) {
+            let payload = server.handle_bounded_frame(line.as_bytes());
+            output_bytes = account_descriptor_complete_frame(output_bytes, payload.len())?;
+            stdout.write_all(&payload)?;
+            stdout.flush()?;
+            continue;
+        }
         let response = if incoming.progress_protocol_version.is_some() {
             server.fatal = true;
             server.response_for_result(
@@ -7163,6 +7237,25 @@ fn run_descriptor_read(config: DescriptorReadConfig) -> io::Result<()> {
     // Descriptor mode has no transaction, WAL, audit, cache, or persistence
     // authority. EOF therefore only closes inherited read descriptors.
     Ok(())
+}
+
+fn account_descriptor_complete_frame(current: u64, frame_len: usize) -> io::Result<u64> {
+    let frame_bytes = u64::try_from(frame_len)
+        .map_err(|_| io::Error::other("descriptor protocol output length does not fit u64"))?;
+    if frame_bytes > MAX_DESCRIPTOR_PROTOCOL_FRAME_BYTES as u64 {
+        return Err(io::Error::other(
+            "descriptor protocol output frame exceeds 2MiB",
+        ));
+    }
+    let total = current
+        .checked_add(frame_bytes)
+        .ok_or_else(|| io::Error::other("descriptor protocol output byte counter overflow"))?;
+    if total > MAX_DESCRIPTOR_PROTOCOL_BYTES {
+        return Err(io::Error::other(
+            "descriptor protocol cumulative output exceeds 64MiB",
+        ));
+    }
+    Ok(total)
 }
 
 fn account_descriptor_output(current: u64, payload_len: usize) -> io::Result<u64> {
@@ -8719,43 +8812,37 @@ mod tests {
         }));
         assert_eq!(
             result["methodInventorySha256"],
-            json!("126080ca61644282fd7ed09b10d5fd0571eba49c6dc19132d4cc6168d07eaf1f")
+            json!(Server::descriptor_method_inventory_sha256().unwrap())
         );
         let bounded_names = methods
             .iter()
             .filter_map(|method| method["name"].as_str())
             .filter(|name| bounded_retrieval::BOUNDED_OPERATIONS.contains(name))
             .collect::<Vec<_>>();
-        assert!(bounded_names.is_empty());
+        assert_eq!(bounded_names, bounded_retrieval::BOUNDED_OPERATIONS);
         assert_eq!(
             result["boundedRetrieval"]["methods"]
                 .as_array()
                 .unwrap()
                 .len(),
-            0
+            bounded_retrieval::BOUNDED_OPERATIONS.len()
         );
         assert_eq!(
             result["boundedRetrieval"]["checkpoint"]["status"],
-            json!("checkpoint")
+            json!("ready")
         );
         assert_eq!(
             result["boundedRetrieval"]["checkpoint"]["availability"],
-            json!("unavailable")
+            json!("available")
         );
         assert_eq!(
             result["boundedRetrieval"]["checkpoint"]["executable"],
-            json!(false)
+            json!(true)
         );
         let unavailable = result["boundedRetrieval"]["checkpoint"]["unavailableMethods"]
             .as_array()
             .expect("unavailable bounded operations");
-        assert_eq!(
-            unavailable
-                .iter()
-                .map(|method| method["name"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            bounded_retrieval::BOUNDED_OPERATIONS
-        );
+        assert!(unavailable.is_empty());
         for method in bounded_retrieval::BOUNDED_OPERATIONS {
             let response = server.handle_prepared(RpcRequest {
                 id: 40,
@@ -8764,7 +8851,7 @@ mod tests {
             });
             assert!(
                 !response.ok,
-                "{method} must stop at the contract checkpoint"
+                "raw RpcRequest lacks the bounded generation/budget envelope"
             );
             assert_eq!(
                 response.error.as_ref().map(|error| error.code.as_str()),

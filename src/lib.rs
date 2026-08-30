@@ -15,4 +15,5 @@ pub mod runtime;
 pub mod server;
 pub mod storage;
 pub mod tx;
+pub mod unicode16_lowercase;
 pub mod watchdog;

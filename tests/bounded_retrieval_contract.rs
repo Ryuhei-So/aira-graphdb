@@ -754,7 +754,8 @@ fn operation_specific_request_caps_are_bounded() {
     );
     ppr["plan"]["maxIterations"] = json!(contract::MAX_ITERATIONS);
     ppr["plan"]["passageLimit"] = json!(contract::MAX_RETURNED_PASSAGES);
-    ppr["plan"]["entityLimit"] = json!(contract::MAX_RETURNED_FACTS);
+    ppr["plan"]["entityLimit"] =
+        json!(contract::MAX_COMBINED_OBJECTS - contract::MAX_RETURNED_PASSAGES);
     contract::validate_semantic_request(contract::PPR_MATERIALIZE, &ppr).expect("PPR boundary");
     contract::ResourceUsage::for_request(contract::PPR_MATERIALIZE, &ppr).expect("PPR caps");
     ppr["plan"]["maxIterations"] = json!(contract::MAX_ITERATIONS + 1);
@@ -798,6 +799,7 @@ fn output_caps_and_checked_work_formula_cover_boundaries_and_overflow() {
         iterations: 4,
         nodes_initialized: 5,
         edges_visited: 6,
+        graph_scan_units: 44,
         objects_considered_for_encoding: 7,
     };
     assert_eq!(work.checked_work_units().unwrap(), 56);
@@ -813,8 +815,8 @@ fn output_caps_and_checked_work_formula_cover_boundaries_and_overflow() {
     );
     assert!(
         contract::WorkCounts {
-            nodes_initialized: u64::MAX,
-            edges_visited: 1,
+            graph_scan_units: u64::MAX,
+            objects_considered_for_encoding: 1,
             ..Default::default()
         }
         .checked_work_units()
@@ -822,8 +824,8 @@ fn output_caps_and_checked_work_formula_cover_boundaries_and_overflow() {
     );
     assert!(
         contract::WorkCounts {
-            iterations: u64::MAX,
-            nodes_initialized: 2,
+            graph_scan_units: u64::MAX,
+            objects_considered_for_encoding: 1,
             ..Default::default()
         }
         .checked_work_units()
@@ -835,6 +837,7 @@ fn output_caps_and_checked_work_formula_cover_boundaries_and_overflow() {
         ("iterations", contract::MAX_ITERATIONS),
         ("nodes", contract::MAX_GRAPH_NODES),
         ("edges", contract::MAX_GRAPH_EDGES),
+        ("graph_scan", contract::MAX_GRAPH_SCAN_UNITS),
         ("objects", contract::MAX_COMBINED_OBJECTS),
     ] {
         let mut value = contract::WorkCounts::default();
@@ -844,6 +847,7 @@ fn output_caps_and_checked_work_formula_cover_boundaries_and_overflow() {
             "iterations" => value.iterations = maximum,
             "nodes" => value.nodes_initialized = maximum,
             "edges" => value.edges_visited = maximum,
+            "graph_scan" => value.graph_scan_units = maximum,
             "objects" => value.objects_considered_for_encoding = maximum,
             _ => unreachable!(),
         }
@@ -854,6 +858,7 @@ fn output_caps_and_checked_work_formula_cover_boundaries_and_overflow() {
             "iterations" => value.iterations += 1,
             "nodes" => value.nodes_initialized += 1,
             "edges" => value.edges_visited += 1,
+            "graph_scan" => value.graph_scan_units += 1,
             "objects" => value.objects_considered_for_encoding += 1,
             _ => unreachable!(),
         }
@@ -868,11 +873,30 @@ fn checked_allocation_formula_covers_each_boundary_and_overflow() {
         seed_entries: 3,
         result_entries: 4,
         ppr_score_entries: 5,
-        heap_entries: 6,
-        response_buffer_bytes: 7,
+        ppr_node_entries: 6,
+        ppr_edge_entries: 7,
+        heap_entries: 8,
+        retained_object_entries: 1,
+        scratch_bytes: 10,
+        response_buffer_bytes: 9,
     };
-    assert_eq!(input.checked_capacity_bytes().unwrap(), 935);
-    assert_eq!(input.check().unwrap(), 935);
+    assert_eq!(input.checked_capacity_bytes().unwrap(), 264_859);
+    assert_eq!(input.check().unwrap(), 264_859);
+
+    let measured_production_shape = contract::AllocationInput {
+        result_entries: 15,
+        ppr_score_entries: 941_858,
+        ppr_node_entries: 941_858,
+        ppr_edge_entries: 2_148_338,
+        heap_entries: 15,
+        retained_object_entries: 15,
+        response_buffer_bytes: contract::MAX_RESPONSE_FRAME_BYTES,
+        ..Default::default()
+    };
+    assert!(
+        measured_production_shape.check().unwrap() < contract::MAX_TRANSIENT_BYTES,
+        "measured generation 302 request-local reconstruction must fit the frozen cap"
+    );
 
     let response_boundary = contract::AllocationInput {
         response_buffer_bytes: contract::MAX_RESPONSE_FRAME_BYTES,
@@ -939,7 +963,40 @@ fn checked_allocation_formula_covers_each_boundary_and_overflow() {
     );
     assert!(
         contract::AllocationInput {
+            ppr_node_entries: u64::MAX,
+            ..Default::default()
+        }
+        .checked_capacity_bytes()
+        .is_err()
+    );
+    assert!(
+        contract::AllocationInput {
+            ppr_edge_entries: u64::MAX,
+            ..Default::default()
+        }
+        .checked_capacity_bytes()
+        .is_err()
+    );
+    assert!(
+        contract::AllocationInput {
             heap_entries: u64::MAX,
+            ..Default::default()
+        }
+        .checked_capacity_bytes()
+        .is_err()
+    );
+    assert!(
+        contract::AllocationInput {
+            retained_object_entries: u64::MAX,
+            ..Default::default()
+        }
+        .checked_capacity_bytes()
+        .is_err()
+    );
+    assert!(
+        contract::AllocationInput {
+            scratch_bytes: u64::MAX,
+            response_buffer_bytes: 1,
             ..Default::default()
         }
         .checked_capacity_bytes()
@@ -1118,7 +1175,7 @@ fn protocol_info_separates_unavailable_checkpoint_operations_from_executable_met
     }
     assert!(info.checkpoint.unavailable_methods.iter().all(|method| {
         method.availability == "unavailable"
-            && method.reason == "algorithm_dispatch_not_implemented"
+            && method.reason == "descriptor_read_required"
             && method.semantic_digest.len() == 64
             && method.request_schema_sha256.len() == 64
             && method.result_schema_sha256.len() == 64

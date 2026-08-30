@@ -61,6 +61,105 @@ fn fixture() -> (PathBuf, PathBuf, String) {
     (canonical_path, blob_path, blob_sha256)
 }
 
+fn bounded_fixture() -> (PathBuf, PathBuf, Vec<u8>, Vec<u8>, Value) {
+    let producer: Value = serde_json::from_slice(include_bytes!(
+        "../spec/contracts/bounded-retrieval/bounded-retrieval-fixture.json"
+    ))
+    .unwrap();
+    let candidate = &producer["exchanges"]["candidate_search_bounded@1"]["result"];
+    let canonical_path = temp_path("bounded-canonical.json");
+    let blob_path = temp_path("bounded-vectors.vblob");
+    let mut passages = Vec::new();
+    let mut facts = Vec::new();
+    let mut schemas = Vec::new();
+    let mut vectors = serde_json::Map::new();
+    let mut blob = b"AGVB".to_vec();
+    blob.extend_from_slice(&1u16.to_le_bytes());
+    let mut offset = 0_u64;
+    for slot in candidate["slots"].as_array().unwrap() {
+        let namespace = slot["namespace"].as_str().unwrap();
+        for hit in slot["hits"].as_array().unwrap() {
+            let id = hit["id"].as_str().unwrap();
+            match namespace {
+                "passage" => passages.push(hit["item"].clone()),
+                "fact" => facts.push(hit["item"].clone()),
+                "schema" => schemas.push(hit["item"].clone()),
+                _ => unreachable!(),
+            }
+            blob.extend_from_slice(&1.0f64.to_le_bytes());
+            vectors.insert(
+                format!("fixture-corpus:{id}"),
+                json!({
+                    "id": id,
+                    "corpusId": "fixture-corpus",
+                    "namespace": namespace,
+                    "blobRef": {"offset": offset, "len": 1},
+                    "metadata": {},
+                }),
+            );
+            offset += 8;
+        }
+    }
+    let edges = [
+        ("e1", "passage:p1", "fact:f1"),
+        ("e2", "passage:p2", "fact:f2"),
+        ("e3", "fact:f1", "passage:p2"),
+        ("e4", "fact:f2", "passage:p1"),
+    ]
+    .into_iter()
+    .map(|(id, source, target)| {
+        (
+            format!("fixture-corpus:{id}"),
+            json!({
+                "edgeId": id, "corpusId": "fixture-corpus",
+                "sourceNodeId": source, "targetNodeId": target,
+                "relation": "fixture", "weight": 1.0, "bridgeKind": null,
+            }),
+        )
+    })
+    .collect::<serde_json::Map<_, _>>();
+    let nodes = edges
+        .values()
+        .flat_map(|edge| {
+            [
+                edge["sourceNodeId"].as_str().unwrap(),
+                edge["targetNodeId"].as_str().unwrap(),
+            ]
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .map(|node_id| {
+            (
+                format!("fixture-corpus:{node_id}"),
+                json!({
+                    "nodeId": node_id,
+                    "corpusId": "fixture-corpus",
+                    "layer": node_id.split_once(':').unwrap().0,
+                    "ref": {},
+                    "label": node_id,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let blob_sha256 = sha256_hex(&blob);
+    let canonical = json!({
+        "nodes": nodes, "edges": edges, "vectors": vectors, "passages": {},
+        "snapshots": {"fixture-corpus": {
+            "corpusId": "fixture-corpus", "schemaVersion": 1,
+            "passages": passages, "facts": facts, "schemas": schemas,
+        }},
+        "checkpoints": {}, "generation": 1,
+        "vectorBlob": {
+            "basename": "bounded-vectors.vblob", "size": blob.len(),
+            "sha256": blob_sha256, "format": 1,
+        }
+    });
+    let canonical_bytes = serde_json::to_vec(&canonical).unwrap();
+    fs::write(&canonical_path, &canonical_bytes).unwrap();
+    fs::write(&blob_path, &blob).unwrap();
+    (canonical_path, blob_path, canonical_bytes, blob, producer)
+}
+
 fn legacy_fixture() -> (PathBuf, PathBuf) {
     let canonical_path = temp_path("legacy-canonical.json");
     let blob_path = temp_path("legacy-vectors.vblob");
@@ -179,17 +278,34 @@ fn real_native_descriptor_mode_handshakes_rejects_mutation_and_eof_writes_nothin
     assert_eq!(info["result"]["accessMode"], "descriptor-read-only");
     assert_eq!(info["result"]["generation"], 1);
     assert_eq!(info["result"]["vectorBlobSha256"], blob_sha256);
-    assert_eq!(
-        info["result"]["methodInventorySha256"],
-        "126080ca61644282fd7ed09b10d5fd0571eba49c6dc19132d4cc6168d07eaf1f"
-    );
     let inventory = info["result"]["methods"].as_array().unwrap();
     assert_eq!(
         inventory
             .iter()
             .map(|method| method["name"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["ping", "protocol_info"]
+        vec![
+            "ping",
+            "protocol_info",
+            "candidate_search_bounded@1",
+            "fact_expand_bounded@1",
+            "ppr_materialize_bounded@1",
+        ]
+    );
+    let inventory_lines = inventory
+        .iter()
+        .map(|method| {
+            format!(
+                "{}\t{}\t{}\n",
+                method["name"].as_str().unwrap(),
+                method["classification"].as_str().unwrap(),
+                method["wal"].as_bool().unwrap(),
+            )
+        })
+        .collect::<String>();
+    assert_eq!(
+        info["result"]["methodInventorySha256"],
+        sha256_hex(inventory_lines.as_bytes())
     );
     let mutation = send(
         &mut stdin,
@@ -207,6 +323,48 @@ fn real_native_descriptor_mode_handshakes_rejects_mutation_and_eof_writes_nothin
     assert_eq!(legacy_read["error"]["code"], "DESCRIPTOR_READ_ONLY_METHOD");
     drop(stdin);
     assert!(child.wait().unwrap().success());
+    assert!(sidecars.iter().all(|path| !path.exists()));
+    remove_fixture(&canonical);
+    let _ = fs::remove_file(blob);
+}
+
+#[test]
+fn real_native_executes_three_bounded_reads_without_snapshot_or_byte_mutation() {
+    let (canonical, blob, canonical_before, blob_before, producer) = bounded_fixture();
+    let sidecars = [
+        canonical.with_extension("native-audit.log"),
+        canonical.with_extension("agdb.wal"),
+    ];
+    let (mut child, mut stdin, mut stdout) = spawn_descriptor(&canonical, &blob);
+    for (index, method) in [
+        "candidate_search_bounded@1",
+        "fact_expand_bounded@1",
+        "ppr_materialize_bounded@1",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = send(
+            &mut stdin,
+            &mut stdout,
+            json!({
+                "id": index + 1,
+                "method": method,
+                "expectedGeneration": 1,
+                "remainingBudgetMs": 60_000 - index * 1_000,
+                "params": producer["exchanges"][method]["request"].clone(),
+            }),
+        );
+        assert_eq!(response["ok"], true, "{method}: {response}");
+        assert_eq!(response["generation"], 1);
+        assert!(response.get("result").is_some());
+        assert!(response.get("counters").is_some());
+        assert!(serde_json::to_vec(&response).unwrap().len() < 2 * 1024 * 1024);
+    }
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    assert_eq!(fs::read(&canonical).unwrap(), canonical_before);
+    assert_eq!(fs::read(&blob).unwrap(), blob_before);
     assert!(sidecars.iter().all(|path| !path.exists()));
     remove_fixture(&canonical);
     let _ = fs::remove_file(blob);

@@ -44,6 +44,14 @@ pub const MAX_FACTS_INSPECTED: u64 = 1_500_000;
 pub const MAX_GRAPH_NODES: u64 = 1_500_000;
 pub const MAX_GRAPH_EDGES: u64 = 4_000_000;
 pub const MAX_ITERATIONS: u64 = 128;
+// Complete request-local graph work: 57 fixed node passes (including the
+// 44-pass worst-case endpoint merge-sort), 50 fixed edge passes (including
+// the 46-pass worst-case canonical edge merge-sort), then each iteration
+// initializes/scans four node arrays and distributes every edge.
+pub const MAX_GRAPH_SCAN_UNITS: u64 = 57 * MAX_GRAPH_NODES
+    + 50 * MAX_GRAPH_EDGES
+    + MAX_ITERATIONS * (4 * MAX_GRAPH_NODES + MAX_GRAPH_EDGES)
+    + 1;
 pub const MAX_SEARCH_RESULT_LIMIT: u64 = 100;
 pub const MAX_EXPANSION_RESULTS: u64 = 64;
 pub const MAX_SEEDS: u64 = 512;
@@ -2726,6 +2734,15 @@ impl ResourceUsage {
                     .into_iter()
                     .max()
                     .unwrap_or(0);
+                usage.combined_objects = slots.iter().try_fold(0_u64, |total, slot| {
+                    let limit = slot
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| error("candidate limit is not a safe integer"))?;
+                    total
+                        .checked_add(limit)
+                        .ok_or_else(|| error("candidate aggregate result count overflow"))
+                })?;
             }
             FACT_EXPAND => {
                 let plan = params
@@ -2764,6 +2781,10 @@ impl ResourceUsage {
                     .get("entityLimit")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| error("PPR entityLimit is not a safe integer"))?;
+                usage.combined_objects = usage
+                    .returned_passages
+                    .checked_add(usage.returned_facts)
+                    .ok_or_else(|| error("PPR aggregate result count overflow"))?;
             }
             _ => return Err(error(format!("unsupported bounded operation {method}"))),
         }
@@ -2823,23 +2844,16 @@ pub struct WorkCounts {
     pub iterations: u64,
     pub nodes_initialized: u64,
     pub edges_visited: u64,
+    pub graph_scan_units: u64,
     pub objects_considered_for_encoding: u64,
 }
 
 impl WorkCounts {
     /// Exactly the work expression frozen by the data-plane design.
     pub fn checked_work_units(&self) -> Result<u64, ContractError> {
-        let graph_iteration_units = self
-            .nodes_initialized
-            .checked_add(self.edges_visited)
-            .ok_or_else(|| error("iteration work addition overflow"))?;
-        let repeated_graph_work = self
-            .iterations
-            .checked_mul(graph_iteration_units)
-            .ok_or_else(|| error("iteration work multiplication overflow"))?;
         self.vector_comparisons
             .checked_add(self.facts_inspected)
-            .and_then(|value| value.checked_add(repeated_graph_work))
+            .and_then(|value| value.checked_add(self.graph_scan_units))
             .and_then(|value| value.checked_add(self.objects_considered_for_encoding))
             .ok_or_else(|| error("aggregate work addition overflow"))
     }
@@ -2850,6 +2864,7 @@ impl WorkCounts {
             || self.iterations > MAX_ITERATIONS
             || self.nodes_initialized > MAX_GRAPH_NODES
             || self.edges_visited > MAX_GRAPH_EDGES
+            || self.graph_scan_units > MAX_GRAPH_SCAN_UNITS
             || self.objects_considered_for_encoding > MAX_COMBINED_OBJECTS
         {
             return Err(error("work count exceeds native hard cap"));
@@ -2864,7 +2879,16 @@ pub struct AllocationInput {
     pub seed_entries: u64,
     pub result_entries: u64,
     pub ppr_score_entries: u64,
+    pub ppr_node_entries: u64,
+    pub ppr_edge_entries: u64,
     pub heap_entries: u64,
+    /// Domain objects retained while the bounded response is assembled.
+    /// Budget the producer-facing per-object maximum so admission completes
+    /// before any graph-sized work begins.
+    pub retained_object_entries: u64,
+    /// Request-local parser/normalizer scratch that is not retained in the
+    /// result but can coexist with retained values at peak allocation.
+    pub scratch_bytes: u64,
     pub response_buffer_bytes: u64,
 }
 
@@ -2872,6 +2896,13 @@ const VECTOR_VALUE_BYTES: u64 = 8;
 const SEED_ENTRY_BYTES: u64 = 64;
 const RESULT_ENTRY_BYTES: u64 = 64;
 const SCORE_VALUE_BYTES: u64 = 8;
+const PPR_SCORE_ARRAYS: u64 = 3;
+// Conservative native request-local reconstruction budgets.  Node entries
+// cover borrowed ids, the id->index table, adjacency heads, degree/damping
+// values, and allocator overhead. Edge entries cover indexed adjacency and
+// allocator overhead. These are transient-cap authorities, not struct sizes.
+const PPR_NODE_ENTRY_BYTES: u64 = 192;
+const PPR_EDGE_ENTRY_BYTES: u64 = 64;
 const HEAP_ENTRY_BYTES: u64 = 64;
 
 impl AllocationInput {
@@ -2890,18 +2921,34 @@ impl AllocationInput {
             .ok_or_else(|| error("result allocation multiplication overflow"))?;
         let scores = self
             .ppr_score_entries
-            .checked_mul(2)
+            .checked_mul(PPR_SCORE_ARRAYS)
             .and_then(|value| value.checked_mul(SCORE_VALUE_BYTES))
             .ok_or_else(|| error("PPR score allocation multiplication overflow"))?;
+        let ppr_nodes = self
+            .ppr_node_entries
+            .checked_mul(PPR_NODE_ENTRY_BYTES)
+            .ok_or_else(|| error("PPR node allocation multiplication overflow"))?;
+        let ppr_edges = self
+            .ppr_edge_entries
+            .checked_mul(PPR_EDGE_ENTRY_BYTES)
+            .ok_or_else(|| error("PPR edge allocation multiplication overflow"))?;
         let heaps = self
             .heap_entries
             .checked_mul(HEAP_ENTRY_BYTES)
             .ok_or_else(|| error("heap allocation multiplication overflow"))?;
+        let retained_objects = self
+            .retained_object_entries
+            .checked_mul(MAX_OBJECT_BYTES)
+            .ok_or_else(|| error("retained object allocation multiplication overflow"))?;
         vector
             .checked_add(seeds)
             .and_then(|value| value.checked_add(results))
             .and_then(|value| value.checked_add(scores))
+            .and_then(|value| value.checked_add(ppr_nodes))
+            .and_then(|value| value.checked_add(ppr_edges))
             .and_then(|value| value.checked_add(heaps))
+            .and_then(|value| value.checked_add(retained_objects))
+            .and_then(|value| value.checked_add(self.scratch_bytes))
             .and_then(|value| value.checked_add(self.response_buffer_bytes))
             .ok_or_else(|| error("transient allocation addition overflow"))
     }
@@ -3048,6 +3095,7 @@ pub struct WorkCounters {
     pub iterations: u64,
     pub nodes_initialized: u64,
     pub edges_visited: u64,
+    pub graph_scan_units: u64,
     pub objects_considered_for_encoding: u64,
     pub work_units: u64,
     pub response_bytes: u64,
@@ -3065,6 +3113,7 @@ impl WorkCounters {
             iterations: work.iterations,
             nodes_initialized: work.nodes_initialized,
             edges_visited: work.edges_visited,
+            graph_scan_units: work.graph_scan_units,
             objects_considered_for_encoding: work.objects_considered_for_encoding,
             work_units,
             response_bytes,
@@ -3175,10 +3224,11 @@ impl LimitedWriter {
     fn new(limit: u64) -> Result<Self, ContractError> {
         let capacity =
             usize::try_from(limit).map_err(|_| error("byte limit does not fit usize"))?;
-        Ok(Self {
-            bytes: Vec::with_capacity(capacity),
-            limit,
-        })
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| error("bounded writer allocation failed"))?;
+        Ok(Self { bytes, limit })
     }
 }
 
@@ -3372,6 +3422,7 @@ pub struct ProtocolLimits {
     pub max_facts_inspected: u64,
     pub max_graph_nodes: u64,
     pub max_graph_edges: u64,
+    pub max_graph_scan_units: u64,
     pub max_iterations: u64,
     pub max_search_result_limit: u64,
     pub max_expansion_results: u64,
@@ -3408,41 +3459,44 @@ pub struct BoundedProtocolInfo {
 
 pub fn protocol_methods() -> Result<Vec<ProtocolMethod>, ContractError> {
     pinned_contract()?;
-    // The contract operations remain available for validation and future
-    // dispatch, but no bounded retrieval algorithm is executable at this
-    // checkpoint.  Keep this inventory empty so capability negotiation cannot
-    // mistake the contract for a runnable method set.
+    // Normal owner mode has no bounded dispatch. Descriptor readers use the
+    // explicit executable variant below after all three handlers are wired.
     Ok(Vec::new())
 }
 
-fn unavailable_protocol_methods() -> Result<Vec<UnavailableProtocolMethod>, ContractError> {
+pub fn executable_protocol_methods() -> Result<Vec<ProtocolMethod>, ContractError> {
     let contract = pinned_contract()?;
     let digests = expected_operation_digests();
-    let mut methods = Vec::with_capacity(BOUNDED_OPERATIONS.len());
-    for method in BOUNDED_OPERATIONS {
-        let operation = contract
-            .operations
-            .get(method)
-            .ok_or_else(|| error("pinned operation inventory is incomplete"))?;
-        let digest = digests
-            .get(method)
-            .ok_or_else(|| error("pinned operation digest is missing"))?;
-        methods.push(ProtocolMethod {
-            name: method.to_string(),
-            classification: "read",
-            wal: false,
-            semantic_bytes: digest.bytes,
-            semantic_digest: digest.sha256.clone(),
-            request_schema_sha256: schema_digest(&operation.request),
-            result_schema_sha256: schema_digest(&operation.result),
-        });
-    }
-    Ok(methods
+    BOUNDED_OPERATIONS
+        .iter()
+        .map(|method| {
+            let operation = contract
+                .operations
+                .get(*method)
+                .ok_or_else(|| error("pinned operation inventory is incomplete"))?;
+            let digest = digests
+                .get(*method)
+                .ok_or_else(|| error("pinned operation digest is missing"))?;
+            Ok(ProtocolMethod {
+                name: (*method).to_string(),
+                classification: "read",
+                wal: false,
+                semantic_bytes: digest.bytes,
+                semantic_digest: digest.sha256.clone(),
+                request_schema_sha256: schema_digest(&operation.request),
+                result_schema_sha256: schema_digest(&operation.result),
+            })
+        })
+        .collect()
+}
+
+fn unavailable_protocol_methods() -> Result<Vec<UnavailableProtocolMethod>, ContractError> {
+    Ok(executable_protocol_methods()?
         .into_iter()
         .map(|method| UnavailableProtocolMethod {
             name: method.name,
             availability: "unavailable",
-            reason: "algorithm_dispatch_not_implemented",
+            reason: "descriptor_read_required",
             semantic_bytes: method.semantic_bytes,
             semantic_digest: method.semantic_digest,
             request_schema_sha256: method.request_schema_sha256,
@@ -3501,6 +3555,7 @@ pub fn protocol_info() -> Result<BoundedProtocolInfo, ContractError> {
             max_facts_inspected: MAX_FACTS_INSPECTED,
             max_graph_nodes: MAX_GRAPH_NODES,
             max_graph_edges: MAX_GRAPH_EDGES,
+            max_graph_scan_units: MAX_GRAPH_SCAN_UNITS,
             max_iterations: MAX_ITERATIONS,
             max_search_result_limit: MAX_SEARCH_RESULT_LIMIT,
             max_expansion_results: MAX_EXPANSION_RESULTS,
@@ -3519,7 +3574,40 @@ pub fn protocol_info() -> Result<BoundedProtocolInfo, ContractError> {
     })
 }
 
+pub fn executable_protocol_info() -> Result<BoundedProtocolInfo, ContractError> {
+    let mut info = protocol_info()?;
+    info.methods = executable_protocol_methods()?;
+    info.checkpoint = BoundedCheckpointInfo {
+        status: "ready",
+        availability: "available",
+        executable: true,
+        unavailable_methods: Vec::new(),
+    };
+    info.method_inventory_sha256 = sha256_hex(
+        info.methods
+            .iter()
+            .map(|method| {
+                format!(
+                    "{}\t{}\t{}\t{}\t{}\n",
+                    method.name,
+                    method.classification,
+                    method.wal,
+                    method.semantic_digest,
+                    method.request_schema_sha256,
+                )
+            })
+            .collect::<String>()
+            .as_bytes(),
+    );
+    Ok(info)
+}
+
 pub fn protocol_info_value() -> Result<Value, ContractError> {
     serde_json::to_value(protocol_info()?)
+        .map_err(|e| error(format!("protocol metadata encode failed: {e}")))
+}
+
+pub fn executable_protocol_info_value() -> Result<Value, ContractError> {
+    serde_json::to_value(executable_protocol_info()?)
         .map_err(|e| error(format!("protocol metadata encode failed: {e}")))
 }
