@@ -2,15 +2,20 @@
 
 This note authorizes implementation of the native boundary described by
 `bounded-retrieval-data-plane.md`; it does not create another semantic
-authority. The byte-pinned Synapse artifacts under
-`spec/contracts/bounded-domain/` remain the domain-shape authority, and the
-versioned Synapse plans remain the query-policy authority.
+authority. The byte-pinned retrieval contract, fixture, and manifest under
+`spec/contracts/bounded-retrieval/` are the semantic authority for the exact
+operation set, producer refinement IR, and operation digests. The five
+dependencies named by that manifest are pinned by source repository, branch,
+commit, path, byte length, and SHA-256; the domain contract is consumed only
+through that delegated dependency. Versioned Synapse plans remain the query-
+policy authority.
 
 ## Authority and flow
 
 - Synapse owns plan construction, normalization, ordering policy, and all
-  retrieval semantics. Native accepts only explicit, complete operation
-  requests and must not supply policy defaults.
+  retrieval semantics. The pinned retrieval artifact is the producer
+  contract for those semantics; native accepts only explicit, complete
+  operation requests and must not supply policy defaults.
 - Native owns descriptor-backed lookup/arithmetic, checked allocation, the
   monotonic operation deadline, exact work counters, and bounded response
   framing for `candidate_search_bounded@1`, `fact_expand_bounded@1`, and

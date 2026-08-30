@@ -22,6 +22,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use aira_graphdb::bounded_retrieval_contract as bounded_retrieval;
 use aira_graphdb::graph::{InMemoryGraphStore, Properties, Value as GraphValue};
 use aira_graphdb::native_persistence_contract::{
     COMMIT_EVIDENCE_SCHEMA, CommitEvidence, JSON_SAFE_INTEGER_MAX, NativeProgressFrame,
@@ -3568,7 +3569,7 @@ impl Server {
     }
 
     fn descriptor_method_inventory() -> Vec<Value> {
-        Self::descriptor_method_specs()
+        let mut methods = Self::descriptor_method_specs()
             .map(|spec| {
                 json!({
                     "name": spec.name,
@@ -3576,13 +3577,24 @@ impl Server {
                     "wal": spec.wal,
                 })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        methods.extend(
+            bounded_retrieval::protocol_methods()
+                .expect("pinned bounded retrieval contract must be valid")
+                .into_iter()
+                .map(|method| serde_json::to_value(method).expect("protocol method serializes")),
+        );
+        methods
     }
 
     fn descriptor_method_inventory_sha256() -> String {
-        let encoded = Self::descriptor_method_specs()
+        let mut encoded = Self::descriptor_method_specs()
             .map(|spec| format!("{}\t{}\t{}\n", spec.name, spec.classification, spec.wal))
             .collect::<String>();
+        encoded.push_str(
+            &bounded_retrieval::method_inventory_lines()
+                .expect("pinned bounded retrieval contract must be valid"),
+        );
         Self::sha256_hex(encoded.as_bytes())
     }
 
@@ -5398,6 +5410,21 @@ impl Server {
         progress: &mut dyn CommitProgress,
     ) -> RpcResponse {
         let is_mutation = Self::is_mutating_method(&req.method);
+        if bounded_retrieval::METHODS.contains(&req.method.as_str()) {
+            if !matches!(self.access_mode, AccessMode::DescriptorReadOnly(_)) {
+                return self
+                    .response_for_result(req.id, Err(Self::unsupported_method_error(&req.method)));
+            }
+            return self.response_for_result(
+                req.id,
+                Err(AppError {
+                    code: bounded_retrieval::REQUEST_EXECUTION_FAILED.to_string(),
+                    message: "bounded retrieval contract checkpoint has no algorithm dispatch"
+                        .to_string(),
+                    failure_class: Some("CLIENT_INPUT".to_string()),
+                }),
+            );
+        }
         let Some(spec) = Self::method_spec(&req.method) else {
             return self
                 .response_for_result(req.id, Err(Self::unsupported_method_error(&req.method)));
@@ -5517,6 +5544,12 @@ impl Server {
                         "methods": methods,
                     });
                     if let Some(handshake) = descriptor_handshake {
+                        protocol["boundedRetrieval"] = bounded_retrieval::protocol_info_value()
+                            .map_err(|error| {
+                                Self::execution_io_error(format!(
+                                    "load bounded retrieval contract failed: {error}"
+                                ))
+                            })?;
                         protocol["accessMode"] = json!(ACCESS_MODE_DESCRIPTOR_READ_ONLY);
                         protocol["readOnly"] = json!(true);
                         protocol["canonicalSha256"] = json!(handshake.canonical_sha256);
@@ -8701,8 +8734,37 @@ mod tests {
         }));
         assert_eq!(
             result["methodInventorySha256"],
-            json!("126080ca61644282fd7ed09b10d5fd0571eba49c6dc19132d4cc6168d07eaf1f")
+            json!("72347885cb32ba419b1699b828522dc5abcbda9629682c05462175208f998bee")
         );
+        let bounded_names = methods
+            .iter()
+            .filter_map(|method| method["name"].as_str())
+            .filter(|name| bounded_retrieval::METHODS.contains(name))
+            .collect::<Vec<_>>();
+        assert_eq!(bounded_names, bounded_retrieval::METHODS);
+        assert_eq!(
+            result["boundedRetrieval"]["methods"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        for method in bounded_retrieval::METHODS {
+            let response = server.handle_prepared(RpcRequest {
+                id: 40,
+                method: method.to_string(),
+                params: json!({}),
+            });
+            assert!(
+                !response.ok,
+                "{method} must stop at the contract checkpoint"
+            );
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code.as_str()),
+                Some("REQUEST_EXECUTION_FAILED")
+            );
+            assert!(response.result.is_none());
+        }
         let legacy_read = server.handle_prepared(RpcRequest {
             id: 2,
             method: "get_nodes".to_string(),

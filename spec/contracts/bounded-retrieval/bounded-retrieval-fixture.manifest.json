@@ -1,0 +1,68 @@
+{
+  "contractBytes": 59523,
+  "contractFile": "bounded-retrieval-contract.json",
+  "contractSha256": "3ef47549760243ef968f160bc6d944225d23fd8eee7f33a8368f95da85a06aaf",
+  "contractVersion": "aira-synapse-bounded-retrieval-contract@1",
+  "dependencies": [
+    {
+      "bytes": 6211,
+      "contractVersion": "aira-synapse-domain-contract@1",
+      "id": "aira-synapse-domain-contract@1",
+      "path": "packages/memgraphrag/tests/fixtures/bounded-domain-contract.json",
+      "sha256": "2d05969a93037c6c22f46b77e068d5d5d2fa5f85988eb923e7f7d7d78ab46ef1"
+    },
+    {
+      "bytes": 455,
+      "contractVersion": "aira-synapse-domain-contract@1",
+      "id": "aira-synapse-bounded-domain-manifest@1",
+      "manifestVersion": "aira-synapse-bounded-domain-manifest@1",
+      "path": "packages/memgraphrag/tests/fixtures/bounded-domain-fixture.manifest.json",
+      "sha256": "b50a00b5a87f91305b41d97b6f91cd19741e4bbc8ea1b4e4e976c83f40b4e821"
+    },
+    {
+      "bytes": 2018,
+      "id": "V15UnicodeLowercaseManifest@1",
+      "manifestVersion": "V15UnicodeLowercaseManifest@1",
+      "normalizationDigest": "v15-entity-normalization-ecmascript-tolowercase-unicode16.0.0@1",
+      "path": "packages/memgraphrag/tests/fixtures/unicode16-lowercase.manifest.json",
+      "sha256": "4f323ec6366aba4f497d4de5eec26759a898242b3e26e46d23a232881ca28960",
+      "unicodeVersion": "16.0.0"
+    },
+    {
+      "bytes": 68942,
+      "id": "v15-entity-normalization-ecmascript-tolowercase-unicode16.0.0@1:native-rust-lookup",
+      "normalizationDigest": "v15-entity-normalization-ecmascript-tolowercase-unicode16.0.0@1",
+      "path": "packages/memgraphrag/tests/fixtures/unicode16-lowercase.lookup.rs",
+      "sha256": "4637b1b21285887f291ab36c19edb5bb94d1660364eb948159117c0d493d8f59",
+      "unicodeVersion": "16.0.0"
+    },
+    {
+      "bytes": 5560651,
+      "formatVersion": "U16LOW1",
+      "id": "v15-entity-normalization-ecmascript-tolowercase-unicode16.0.0@1:conformance",
+      "normalizationDigest": "v15-entity-normalization-ecmascript-tolowercase-unicode16.0.0@1",
+      "path": "packages/memgraphrag/tests/fixtures/unicode16-lowercase.conformance.bin",
+      "sha256": "c89cc745f040ba8518473fb8b1511596a34e48616e2f3f3609237fdd74e4ae8a",
+      "unicodeVersion": "16.0.0"
+    }
+  ],
+  "fixtureBytes": 12061,
+  "fixtureFile": "bounded-retrieval-fixture.json",
+  "fixtureSha256": "9bdfbee39b4d1ba01f82df101de287756a9c089796bbfaa571aa88ec3437b210",
+  "fixtureVersion": "aira-synapse-bounded-retrieval-fixture@1",
+  "manifestVersion": "aira-synapse-bounded-retrieval-manifest@1",
+  "operationSemanticDigests": {
+    "candidate_search_bounded@1": {
+      "bytes": 20276,
+      "sha256": "4255d5a4076b27d264841579c6dbd3064f90b3e1a89b0386acaad44cb562eb1a"
+    },
+    "fact_expand_bounded@1": {
+      "bytes": 12258,
+      "sha256": "296423c9a1b5d5627175e537f0df5be884b17ea15ab9efe4b6875843194bc60d"
+    },
+    "ppr_materialize_bounded@1": {
+      "bytes": 14685,
+      "sha256": "cd1f4bfeb39a01b4f12db1da9a7a05d8179f27eba878d1fd7aa935eb151834ab"
+    }
+  }
+}

@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod auth;
 pub mod bench;
+pub mod bounded_retrieval_contract;
 pub mod conformance;
 pub mod contracts;
 pub mod errors;
