@@ -1,15 +1,15 @@
 # Bounded retrieval data plane
 
-Status: design/contract checkpoint only.  This document authorizes the bounded
-contract validation boundary, but no bounded retrieval algorithm dispatch.
+Status: descriptor-read execution implemented; Hub session wiring and
+production availability remain downstream checkpoints.
 
 This design replaces the first issue-4 `retrieve_bounded` contract.  Aira
 Synapse is the sole query-policy authority.  Aira GraphDB defines two or three
 versioned, bounded data operations over one committed generation, depending on
 whether Synapse requests fact expansion.  Literature Hub owns the generation
-session, availability policy, and retry circuit.  The current issue-10
-checkpoint defines and validates that contract but does not expose the
-operations as executable capabilities.
+session, availability policy, and retry circuit. Issue 10 exposes execution
+only through a generation-pinned descriptor reader; normal owner mode remains
+explicitly unavailable.
 
 ## Decision
 
@@ -23,14 +23,13 @@ one exclusive owner reader lease:
 3. `ppr_materialize_bounded@1` runs an explicit graph plan and materializes only
    its selected passages and facts.
 
-The operations do not name, default, or validate a Synapse profile.  At the
-current checkpoint, `protocol_info.boundedRetrieval.methods` is empty.  The
-contract schema/digest metadata is exposed only in
-`boundedRetrieval.checkpoint.unavailableMethods`, alongside
-`status=checkpoint`, `availability=unavailable`, and `executable=false`.
-Dispatch returns `REQUEST_EXECUTION_FAILED` until algorithm wiring is reviewed.
-A profile id may be echoed as opaque audit data but never changes native
-behavior.
+The operations do not name, default, or validate a Synapse profile. Descriptor
+mode advertises the exact three executable methods only after the pinned
+contract, generation, domain indexes, and endpoint counts validate. Normal
+mode advertises the same producer-derived metadata only under
+`boundedRetrieval.checkpoint.unavailableMethods`, with
+`reason=descriptor_read_required`, and rejects dispatch. A profile id may be
+echoed as opaque audit data but never changes native behavior.
 
 Rejected alternatives:
 
@@ -308,24 +307,68 @@ limits.  The 512 MiB transient ceiling plus measured native steady PSS and
 concurrent service allowance must remain below `MemoryHigh`; otherwise deploy
 is blocked rather than raising the cgroup boundary.
 
-At generation load, native builds an immutable read catalog containing domain
-id references, encoded-size metadata, corpus/namespace counts, and canonical
-adjacency.  This is part of steady-state PSS and is measured separately from
-per-request transient memory.  It must not duplicate domain text or vectors.
+At generation load, native builds only fixed-size domain identity digests to
+array offsets and exact per-corpus endpoint/count metadata needed for O(1)
+admission. It does not retain a second copy of domain ids. Canonical
+adjacency is reconstructed after count, allocation, and deadline admission and
+is request-owned. Generation metadata must not duplicate domain text, node ids,
+vectors, or adjacency.
 
-Counters use checked integers.  Preflight counts reject a plan before work when
-the corpus cannot fit its requested/hard bound.  Aggregate work is exactly
-`vectorComparisons + factsInspected + iterations * (nodesInitialized +
-edgesVisited) + objectsConsideredForEncoding`; every multiplication and sum is
-checked before allocation/work.  `maxTransientBytes` is the checked sum of all
-request-owned vector/seed/result capacities, two PPR score arrays, heaps, and
-the response buffer; the immutable read catalog is steady-state memory and is
-reported separately.  Allocation checks cover both capacity and bytes before
-allocation.  Response serialization uses borrowed typed objects and an
-upper-bounded writer; no full `serde_json::Value` result clone is allowed.  If
-one complete object cannot fit, the whole request fails with a response-limit
-error.  Bytes include the JSON-RPC envelope and newline.  No truncation or
-partial success is valid.
+Descriptor mode never calls the legacy owner cache builder. Candidate search
+and PPR scan the immutable canonical vector/edge maps directly after admission;
+each inspected vector or edge advances the bounded work/deadline authority.
+The generation catalog rejects a total edge population above the native graph
+cap, so a request-local cross-corpus scan cannot escape the advertised ceiling.
+Only transient fixed-size endpoint digests are used while deriving per-corpus
+counts; they are discarded before the descriptor starts serving frames.
+
+Endpoint discovery preserves the deterministic first-seen order of the
+canonical edge index before interruptible sorting. Per-source weight totals are
+computed during the already-counted adjacency pass, so an iteration performs no
+hidden edge traversal before its counted distribution pass.
+Request-local adjacency uses counted CSR construction: node index, degree and
+score arrays, offsets, cursors, flat edges, hub damping, teleport, and every
+iteration buffer all go through one allocation-before-deadline and
+element-by-element work/deadline helper. `maxGraphScanUnits` is derived from 57
+fixed node passes, 50 fixed edge passes (including the 46-pass worst-case
+canonical edge merge-sort), and `maxIterations * (4 * nodes + edges)`, plus the
+CSR sentinel; it is not an independently tuned ceiling.
+
+This choice is measurement-derived on generation 302 (941,858 endpoint nodes,
+2,148,338 edges). A resident dense PPR catalog cost 2.712 seconds to build and
+274,140 KiB steady RSS, while request-local reconstruction completed the
+representative positive-seed read in 3.208 seconds and uniform fallback in
+3.947 seconds with no steady charge. Exact sparse-frontier execution preserved
+the full-score digest but took 7.069 seconds after expanding to 176,507 active
+scores. The request-local form is therefore authoritative unless a later
+version changes the contract from new measurements.
+
+Counters use checked integers. Preflight counts reject a plan before work when
+the corpus cannot fit its requested/hard bound. `graphScanUnits` advances on
+every bounded node or edge pass, including endpoint discovery, adjacency
+construction, interruptible UTF-16 endpoint ordering, iteration
+source/edge/teleport/L1 passes, and final ranking.
+Aggregate work is exactly `vectorComparisons + factsInspected + graphScanUnits
++ objectsConsideredForEncoding`; every addition is checked. `maxTransientBytes`
+is the checked sum of all
+request-owned vector/seed/result capacities, three PPR score arrays,
+node/index/adjacency reconstruction, bounded ranking heaps, the maximum encoded
+bytes of every retained domain object, and the response buffer. Allocation
+checks cover both capacity and bytes before any O(graph) request work or
+allocation. An object attempt increments its work counter before encoding and
+checks the deadline before materialization. Response serialization borrows the
+bounded result and uses an upper-bounded writer; it checks the deadline before
+and after encoding, and discards a late success frame. The legacy full snapshot
+is never cloned or serialized. If one complete object cannot fit, the whole
+request fails with a response-limit error. Bytes include the JSON-RPC envelope
+and newline. No truncation or partial success is valid.
+
+`vectorComparisons` includes every canonical vector-map record inspected for a
+slot, including a record rejected by corpus/namespace before cosine arithmetic;
+this makes request-local lookup work visible rather than hiding a full-map scan.
+Fact entity normalization charges a six-object scratch ceiling, rejects an
+input or expanded output above the object cap, uses fallible allocation, and
+checks the same deadline inside the producer-pinned Unicode algorithm.
 
 Version 1 promises a hard monotonic deadline, not immediate client
 cancellation.  Work checks the deadline at least every 1024 units and before
@@ -333,6 +376,12 @@ every allocation/materialization step.  A disconnect may leave work running
 only until that deadline; the owner does not reuse the native request slot or
 report success meanwhile.  Immediate cancellation requires a later reviewed
 worker/cancel protocol.
+
+The descriptor session stores two distinct authorities: the caller's last
+numeric remainder (which may not increase) and native's absolute monotonic
+deadline. Each later frame clamps the absolute deadline to
+`min(existing, now + remainder)`; millisecond transport jitter can never extend
+or spuriously recreate it.
 
 ## Failure and retry authority
 
@@ -884,9 +933,10 @@ Before native algorithm wiring:
   rejected before manifest dirtying, WAL append, or native mutation; canonical
   JSON, referenced blob, owner manifest, WAL, lock, and audit authority remain
   byte-identical on rejection;
-- real `protocol_info` keeps the bounded executable method list empty and
-  exposes each contract operation only as unavailable checkpoint metadata with
-  its exact schema/semantic digest;
+- normal-mode `protocol_info` keeps the bounded executable method list empty
+  and exposes each operation as descriptor-read-required; descriptor mode
+  exposes exactly the three producer-pinned operations with their exact
+  schema/semantic digests;
 - real-native tests cover nonzero generation, stale generation,
   RecoveryPending, writer waiting across all three operations, deadline via
   fake monotonic clock, allocation failpoints, response budget, partial frame,
