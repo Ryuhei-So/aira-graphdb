@@ -1,0 +1,2695 @@
+{
+  "exchanges": {
+    "candidate_search_bounded@1": {
+      "request": {
+        "corpusId": "fixture-corpus",
+        "slots": [
+          {
+            "limit": 2,
+            "namespace": "passage",
+            "queryVector": [
+              0
+            ],
+            "slotId": "passage",
+            "threshold": -1
+          },
+          {
+            "limit": 2,
+            "namespace": "fact",
+            "queryVector": [
+              0
+            ],
+            "slotId": "fact",
+            "threshold": -1
+          },
+          {
+            "limit": 2,
+            "namespace": "schema",
+            "queryVector": [
+              0
+            ],
+            "slotId": "schema",
+            "threshold": -1
+          }
+        ]
+      },
+      "result": {
+        "slots": [
+          {
+            "hits": [
+              {
+                "id": "passage:p1",
+                "item": {
+                  "corpusId": "fixture-corpus",
+                  "createdAt": "2026-01-01T00:00:00.000Z",
+                  "entityMentions": [
+                    "Alpha"
+                  ],
+                  "factIds": [
+                    "fixture-fact-inactive"
+                  ],
+                  "metadata": {
+                    "chunkId": "fixture-chunk-1",
+                    "chunkIndex": 0,
+                    "documentId": "fixture-document-1",
+                    "language": "en",
+                    "offsetEnd": 36,
+                    "offsetStart": 0,
+                    "sectionPath": [
+                      "Results"
+                    ],
+                    "sourceUrl": "https://example.invalid/fixture-document-1",
+                    "title": "Bounded retrieval fixture"
+                  },
+                  "normalizedText": "a bounded retrieval fixture passage.",
+                  "passageId": "p1",
+                  "qualityFlags": [
+                    "fixture"
+                  ],
+                  "text": "A bounded retrieval fixture passage.",
+                  "updatedAt": "2026-01-02T00:00:00.000Z"
+                },
+                "score": -0.1
+              },
+              {
+                "id": "passage:p2",
+                "item": {
+                  "corpusId": "fixture-corpus",
+                  "createdAt": "2026-01-01T00:00:00.000Z",
+                  "entityMentions": [
+                    "Alpha"
+                  ],
+                  "factIds": [
+                    "fixture-fact-inactive"
+                  ],
+                  "metadata": {
+                    "chunkId": "fixture-chunk-1",
+                    "chunkIndex": 0,
+                    "documentId": "fixture-document-1",
+                    "language": "en",
+                    "offsetEnd": 36,
+                    "offsetStart": 0,
+                    "sectionPath": [
+                      "Results"
+                    ],
+                    "sourceUrl": "https://example.invalid/fixture-document-1",
+                    "title": "Bounded retrieval fixture"
+                  },
+                  "normalizedText": "a bounded retrieval fixture passage.",
+                  "passageId": "p2",
+                  "qualityFlags": [
+                    "fixture"
+                  ],
+                  "text": "A bounded retrieval fixture passage.",
+                  "updatedAt": "2026-01-02T00:00:00.000Z"
+                },
+                "score": -0.2
+              }
+            ],
+            "namespace": "passage",
+            "slotId": "passage"
+          },
+          {
+            "hits": [
+              {
+                "id": "fact:f1",
+                "item": {
+                  "confidence": 0.75,
+                  "corpusId": "fixture-corpus",
+                  "createdAt": "2026-01-01T00:00:00.000Z",
+                  "factId": "f1",
+                  "headEntity": "Alpha",
+                  "headType": "Entity",
+                  "passageIds": [
+                    "fixture-passage-1"
+                  ],
+                  "relation": "relates-to",
+                  "schemaId": "fixture-schema-1",
+                  "sourceDocumentIds": [
+                    "fixture-document-1"
+                  ],
+                  "state": "inactive",
+                  "tailEntity": "Beta",
+                  "tailType": "Entity",
+                  "updatedAt": "2026-01-02T00:00:00.000Z"
+                },
+                "score": -0.3
+              },
+              {
+                "id": "fact:f2",
+                "item": {
+                  "confidence": 0.75,
+                  "corpusId": "fixture-corpus",
+                  "createdAt": "2026-01-01T00:00:00.000Z",
+                  "factId": "f2",
+                  "headEntity": "Alpha",
+                  "headType": "Entity",
+                  "passageIds": [
+                    "fixture-passage-1"
+                  ],
+                  "relation": "relates-to",
+                  "schemaId": "fixture-schema-1",
+                  "sourceDocumentIds": [
+                    "fixture-document-1"
+                  ],
+                  "state": "inactive",
+                  "tailEntity": "Beta",
+                  "tailType": "Entity",
+                  "updatedAt": "2026-01-02T00:00:00.000Z"
+                },
+                "score": -0.3
+              }
+            ],
+            "namespace": "fact",
+            "slotId": "fact"
+          },
+          {
+            "hits": [
+              {
+                "id": "schema:s1",
+                "item": {
+                  "aliases": [
+                    {
+                      "confidence": 1,
+                      "isCanonical": true,
+                      "label": "relates to",
+                      "language": "en",
+                      "source": "manual"
+                    }
+                  ],
+                  "canonicalKey": "entity::relates-to::entity",
+                  "corpusId": "fixture-corpus",
+                  "createdAt": "2026-01-01T00:00:00.000Z",
+                  "factIds": [
+                    "fixture-fact-inactive"
+                  ],
+                  "frequency": 3,
+                  "headType": "Entity",
+                  "relation": "relates-to",
+                  "schemaId": "s1",
+                  "sourceDocumentIds": [
+                    "fixture-document-1"
+                  ],
+                  "stabilizationThreshold": 2,
+                  "state": "stable",
+                  "tailType": "Entity",
+                  "updatedAt": "2026-01-02T00:00:00.000Z",
+                  "version": 1
+                },
+                "score": 0.4
+              },
+              {
+                "id": "schema:s2",
+                "item": {
+                  "aliases": [
+                    {
+                      "confidence": 1,
+                      "isCanonical": true,
+                      "label": "relates to",
+                      "language": "en",
+                      "source": "manual"
+                    }
+                  ],
+                  "canonicalKey": "entity::relates-to::entity",
+                  "corpusId": "fixture-corpus",
+                  "createdAt": "2026-01-01T00:00:00.000Z",
+                  "factIds": [
+                    "fixture-fact-inactive"
+                  ],
+                  "frequency": 3,
+                  "headType": "Entity",
+                  "relation": "relates-to",
+                  "schemaId": "s2",
+                  "sourceDocumentIds": [
+                    "fixture-document-1"
+                  ],
+                  "stabilizationThreshold": 2,
+                  "state": "stable",
+                  "tailType": "Entity",
+                  "updatedAt": "2026-01-02T00:00:00.000Z",
+                  "version": 1
+                },
+                "score": 0.2
+              }
+            ],
+            "namespace": "schema",
+            "slotId": "schema"
+          }
+        ]
+      }
+    },
+    "fact_expand_bounded@1": {
+      "request": {
+        "corpusId": "fixture-corpus",
+        "plan": {
+          "attenuation": 0.3,
+          "excludedSeedFactIds": [
+            "excluded"
+          ],
+          "limit": 2,
+          "normalizationContractDigest": "v15-entity-normalization-ecmascript-tolowercase-unicode16.0.0@1",
+          "seedEntities": [
+            {
+              "key": "alpha",
+              "score": 1
+            },
+            {
+              "key": "beta",
+              "score": 0.5
+            }
+          ]
+        }
+      },
+      "result": {
+        "facts": [
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f1",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "factId": "f1",
+            "score": 0.3
+          },
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f2",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "factId": "f2",
+            "score": 0.3
+          }
+        ]
+      }
+    },
+    "ppr_materialize_bounded@1": {
+      "request": {
+        "corpusId": "fixture-corpus",
+        "plan": {
+          "convergenceEpsilon": 0.01,
+          "entityLimit": 2,
+          "hubDegreeThreshold": 100,
+          "maxIterations": 20,
+          "passageLimit": 2,
+          "seeds": [
+            {
+              "nodeId": "fact:f1",
+              "score": 1
+            },
+            {
+              "nodeId": "fact:f2",
+              "score": 0.5
+            }
+          ],
+          "teleportProbability": 0.15
+        }
+      },
+      "result": {
+        "converged": true,
+        "iterations": 1,
+        "l1Delta": 0.001,
+        "rankedFacts": [
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f1",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "nodeId": "fact:f1",
+            "rank": 1,
+            "score": 0.5
+          },
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f2",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "nodeId": "fact:f2",
+            "rank": 2,
+            "score": 0.5
+          }
+        ],
+        "rankedPassages": [
+          {
+            "nodeId": "passage:p1",
+            "passage": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "p1",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "rank": 1,
+            "score": 0.75
+          },
+          {
+            "nodeId": "passage:p2",
+            "passage": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "p2",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "rank": 2,
+            "score": 0.5
+          }
+        ]
+      }
+    }
+  },
+  "fixtureVersion": "aira-synapse-bounded-retrieval-fixture@2",
+  "witnessVersion": "aira-synapse-bounded-retrieval-witness@1",
+  "witnesses": [
+    {
+      "assertionIndex": 0,
+      "operation": "candidate_search_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/corpusId",
+        "root": "request",
+        "value": ""
+      }
+    },
+    {
+      "assertionIndex": 1,
+      "operation": "candidate_search_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/slots/0/queryVector",
+        "root": "request",
+        "value": []
+      }
+    },
+    {
+      "assertionIndex": 2,
+      "operation": "candidate_search_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/slots/0/threshold",
+        "root": "request",
+        "value": 2
+      }
+    },
+    {
+      "assertionIndex": 3,
+      "operation": "candidate_search_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/slots/0/limit",
+        "root": "request",
+        "value": 0
+      }
+    },
+    {
+      "assertionIndex": 4,
+      "operation": "candidate_search_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/slots/1/queryVector",
+        "root": "request",
+        "value": []
+      }
+    },
+    {
+      "assertionIndex": 5,
+      "operation": "candidate_search_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/slots/1/threshold",
+        "root": "request",
+        "value": 2
+      }
+    },
+    {
+      "assertionIndex": 6,
+      "operation": "candidate_search_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/slots/1/limit",
+        "root": "request",
+        "value": 0
+      }
+    },
+    {
+      "assertionIndex": 7,
+      "operation": "candidate_search_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/slots/2/queryVector",
+        "root": "request",
+        "value": []
+      }
+    },
+    {
+      "assertionIndex": 8,
+      "operation": "candidate_search_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/slots/2/threshold",
+        "root": "request",
+        "value": 2
+      }
+    },
+    {
+      "assertionIndex": 9,
+      "operation": "candidate_search_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/slots/2/limit",
+        "root": "request",
+        "value": 0
+      }
+    },
+    {
+      "assertionIndex": 0,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/0/hits",
+        "root": "result",
+        "value": [
+          {
+            "id": "passage:p1",
+            "item": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "p1",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "score": -0.1
+          },
+          {
+            "id": "passage:p2",
+            "item": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "p2",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "score": -0.2
+          },
+          {
+            "id": "passage:fixture-passage-3",
+            "item": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "fixture-passage-3",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "score": -0.5
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 1,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/0/hits",
+        "root": "result",
+        "value": [
+          {
+            "id": "passage:p1",
+            "item": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "p1",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "score": -0.1
+          },
+          {
+            "id": "passage:p1",
+            "item": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "p1",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "score": -0.2
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 2,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/0/hits",
+        "root": "result",
+        "value": [
+          {
+            "id": "passage:p1",
+            "item": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "p1",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "score": 0.5
+          },
+          {
+            "id": "passage:p2",
+            "item": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "p2",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "score": 0.75
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 3,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/0/hits/0/id",
+        "root": "result",
+        "value": "passage:wrong"
+      }
+    },
+    {
+      "assertionIndex": 4,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/0/hits/0/item/corpusId",
+        "root": "result",
+        "value": "other-corpus"
+      }
+    },
+    {
+      "assertionIndex": 5,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/0/threshold",
+        "root": "request",
+        "value": 0
+      }
+    },
+    {
+      "assertionIndex": 6,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/0/hits/0/score",
+        "root": "result",
+        "value": 2
+      }
+    },
+    {
+      "assertionIndex": 7,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/1/hits",
+        "root": "result",
+        "value": [
+          {
+            "id": "fact:f1",
+            "item": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f1",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "score": -0.3
+          },
+          {
+            "id": "fact:f2",
+            "item": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f2",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "score": -0.3
+          },
+          {
+            "id": "fact:fixture-fact-3",
+            "item": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "fixture-fact-3",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "score": -0.5
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 8,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/1/hits",
+        "root": "result",
+        "value": [
+          {
+            "id": "fact:f1",
+            "item": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f1",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "score": -0.3
+          },
+          {
+            "id": "fact:f1",
+            "item": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f1",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "score": -0.4
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 9,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/1/hits",
+        "root": "result",
+        "value": [
+          {
+            "id": "fact:f1",
+            "item": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f1",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "score": 0.5
+          },
+          {
+            "id": "fact:f2",
+            "item": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f2",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "score": 0.75
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 10,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/1/hits/0/id",
+        "root": "result",
+        "value": "fact:0"
+      }
+    },
+    {
+      "assertionIndex": 11,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/1/hits/0/item/corpusId",
+        "root": "result",
+        "value": "other-corpus"
+      }
+    },
+    {
+      "assertionIndex": 12,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/1/threshold",
+        "root": "request",
+        "value": 0
+      }
+    },
+    {
+      "assertionIndex": 13,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/1/hits/0/score",
+        "root": "result",
+        "value": 2
+      }
+    },
+    {
+      "assertionIndex": 14,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/2/hits",
+        "root": "result",
+        "value": [
+          {
+            "id": "schema:s1",
+            "item": {
+              "aliases": [
+                {
+                  "confidence": 1,
+                  "isCanonical": true,
+                  "label": "relates to",
+                  "language": "en",
+                  "source": "manual"
+                }
+              ],
+              "canonicalKey": "entity::relates-to::entity",
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "frequency": 3,
+              "headType": "Entity",
+              "relation": "relates-to",
+              "schemaId": "s1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "stabilizationThreshold": 2,
+              "state": "stable",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z",
+              "version": 1
+            },
+            "score": 0.4
+          },
+          {
+            "id": "schema:s2",
+            "item": {
+              "aliases": [
+                {
+                  "confidence": 1,
+                  "isCanonical": true,
+                  "label": "relates to",
+                  "language": "en",
+                  "source": "manual"
+                }
+              ],
+              "canonicalKey": "entity::relates-to::entity",
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "frequency": 3,
+              "headType": "Entity",
+              "relation": "relates-to",
+              "schemaId": "s2",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "stabilizationThreshold": 2,
+              "state": "stable",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z",
+              "version": 1
+            },
+            "score": 0.2
+          },
+          {
+            "id": "schema:fixture-schema-3",
+            "item": {
+              "aliases": [
+                {
+                  "confidence": 1,
+                  "isCanonical": true,
+                  "label": "relates to",
+                  "language": "en",
+                  "source": "manual"
+                }
+              ],
+              "canonicalKey": "entity::relates-to::entity",
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "frequency": 3,
+              "headType": "Entity",
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-3",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "stabilizationThreshold": 2,
+              "state": "stable",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z",
+              "version": 1
+            },
+            "score": -0.5
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 15,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/2/hits",
+        "root": "result",
+        "value": [
+          {
+            "id": "schema:s1",
+            "item": {
+              "aliases": [
+                {
+                  "confidence": 1,
+                  "isCanonical": true,
+                  "label": "relates to",
+                  "language": "en",
+                  "source": "manual"
+                }
+              ],
+              "canonicalKey": "entity::relates-to::entity",
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "frequency": 3,
+              "headType": "Entity",
+              "relation": "relates-to",
+              "schemaId": "s1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "stabilizationThreshold": 2,
+              "state": "stable",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z",
+              "version": 1
+            },
+            "score": 0.4
+          },
+          {
+            "id": "schema:s1",
+            "item": {
+              "aliases": [
+                {
+                  "confidence": 1,
+                  "isCanonical": true,
+                  "label": "relates to",
+                  "language": "en",
+                  "source": "manual"
+                }
+              ],
+              "canonicalKey": "entity::relates-to::entity",
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "frequency": 3,
+              "headType": "Entity",
+              "relation": "relates-to",
+              "schemaId": "s1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "stabilizationThreshold": 2,
+              "state": "stable",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z",
+              "version": 1
+            },
+            "score": 0.30000000000000004
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 16,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/2/hits",
+        "root": "result",
+        "value": [
+          {
+            "id": "schema:s1",
+            "item": {
+              "aliases": [
+                {
+                  "confidence": 1,
+                  "isCanonical": true,
+                  "label": "relates to",
+                  "language": "en",
+                  "source": "manual"
+                }
+              ],
+              "canonicalKey": "entity::relates-to::entity",
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "frequency": 3,
+              "headType": "Entity",
+              "relation": "relates-to",
+              "schemaId": "s1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "stabilizationThreshold": 2,
+              "state": "stable",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z",
+              "version": 1
+            },
+            "score": 0.5
+          },
+          {
+            "id": "schema:s2",
+            "item": {
+              "aliases": [
+                {
+                  "confidence": 1,
+                  "isCanonical": true,
+                  "label": "relates to",
+                  "language": "en",
+                  "source": "manual"
+                }
+              ],
+              "canonicalKey": "entity::relates-to::entity",
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "frequency": 3,
+              "headType": "Entity",
+              "relation": "relates-to",
+              "schemaId": "s2",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "stabilizationThreshold": 2,
+              "state": "stable",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z",
+              "version": 1
+            },
+            "score": 0.75
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 17,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/2/hits/0/id",
+        "root": "result",
+        "value": "schema:wrong"
+      }
+    },
+    {
+      "assertionIndex": 18,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/2/hits/0/item/corpusId",
+        "root": "result",
+        "value": "other-corpus"
+      }
+    },
+    {
+      "assertionIndex": 19,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/2/threshold",
+        "root": "request",
+        "value": 1
+      }
+    },
+    {
+      "assertionIndex": 20,
+      "operation": "candidate_search_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/slots/2/hits/0/score",
+        "root": "result",
+        "value": 2
+      }
+    },
+    {
+      "assertionIndex": 0,
+      "operation": "fact_expand_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/corpusId",
+        "root": "request",
+        "value": ""
+      }
+    },
+    {
+      "assertionIndex": 1,
+      "operation": "fact_expand_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/plan/seedEntities/1/key",
+        "root": "request",
+        "value": "alpha"
+      }
+    },
+    {
+      "assertionIndex": 2,
+      "operation": "fact_expand_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/plan/seedEntities/0/key",
+        "root": "request",
+        "value": ""
+      }
+    },
+    {
+      "assertionIndex": 3,
+      "operation": "fact_expand_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/plan/excludedSeedFactIds",
+        "root": "request",
+        "value": [
+          ""
+        ]
+      }
+    },
+    {
+      "assertionIndex": 4,
+      "operation": "fact_expand_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/plan/seedEntities/0/score",
+        "root": "request",
+        "value": -1
+      }
+    },
+    {
+      "assertionIndex": 5,
+      "operation": "fact_expand_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/plan/attenuation",
+        "root": "request",
+        "value": -1
+      }
+    },
+    {
+      "assertionIndex": 6,
+      "operation": "fact_expand_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/plan/limit",
+        "root": "request",
+        "value": 0
+      }
+    },
+    {
+      "assertionIndex": 7,
+      "operation": "fact_expand_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/plan/normalizationContractDigest",
+        "root": "request",
+        "value": "wrong"
+      }
+    },
+    {
+      "assertionIndex": 0,
+      "operation": "fact_expand_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/facts",
+        "root": "result",
+        "value": [
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f1",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "factId": "f1",
+            "score": 0.3
+          },
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f2",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "factId": "f2",
+            "score": 0.3
+          },
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f3",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "factId": "f3",
+            "score": 0.3
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 1,
+      "operation": "fact_expand_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/facts",
+        "root": "result",
+        "value": [
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f1",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "factId": "f1",
+            "score": 0.3
+          },
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f1",
+              "headEntity": "Beta",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Gamma",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "factId": "f1",
+            "score": 0.15
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 2,
+      "operation": "fact_expand_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/facts",
+        "root": "result",
+        "value": [
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f2",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "factId": "f2",
+            "score": 0.3
+          },
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f1",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "factId": "f1",
+            "score": 0.3
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 3,
+      "operation": "fact_expand_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/facts/0/factId",
+        "root": "result",
+        "value": "0"
+      }
+    },
+    {
+      "assertionIndex": 4,
+      "operation": "fact_expand_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/facts/0/fact/corpusId",
+        "root": "result",
+        "value": "other-corpus"
+      }
+    },
+    {
+      "assertionIndex": 5,
+      "operation": "fact_expand_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/plan/excludedSeedFactIds",
+        "root": "request",
+        "value": [
+          "f1"
+        ]
+      }
+    },
+    {
+      "assertionIndex": 6,
+      "operation": "fact_expand_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/plan/seedEntities",
+        "root": "request",
+        "value": [
+          {
+            "key": "gamma",
+            "score": 1
+          },
+          {
+            "key": "delta",
+            "score": 0.5
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 7,
+      "operation": "fact_expand_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/facts/0/score",
+        "root": "result",
+        "value": 0.4
+      }
+    },
+    {
+      "assertionIndex": 0,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/corpusId",
+        "root": "request",
+        "value": ""
+      }
+    },
+    {
+      "assertionIndex": 1,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/plan/seeds",
+        "root": "request",
+        "value": [
+          {
+            "nodeId": "fact:fixture-fact-inactive",
+            "score": 1
+          },
+          {
+            "nodeId": "fact:fixture-fact-inactive",
+            "score": 0.5
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 2,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/plan/seeds/0/nodeId",
+        "root": "request",
+        "value": ""
+      }
+    },
+    {
+      "assertionIndex": 3,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/plan/teleportProbability",
+        "root": "request",
+        "value": 2
+      }
+    },
+    {
+      "assertionIndex": 4,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/plan/convergenceEpsilon",
+        "root": "request",
+        "value": 0
+      }
+    },
+    {
+      "assertionIndex": 5,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/plan/maxIterations",
+        "root": "request",
+        "value": 0
+      }
+    },
+    {
+      "assertionIndex": 6,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/plan/hubDegreeThreshold",
+        "root": "request",
+        "value": -1
+      }
+    },
+    {
+      "assertionIndex": 7,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/plan/passageLimit",
+        "root": "request",
+        "value": 0
+      }
+    },
+    {
+      "assertionIndex": 8,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "request",
+      "patch": {
+        "path": "/plan/entityLimit",
+        "root": "request",
+        "value": 0
+      }
+    },
+    {
+      "assertionIndex": 0,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/rankedPassages",
+        "root": "result",
+        "value": [
+          {
+            "nodeId": "passage:p1",
+            "passage": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "p1",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "rank": 1,
+            "score": 0.75
+          },
+          {
+            "nodeId": "passage:p2",
+            "passage": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "p2",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "rank": 2,
+            "score": 0.5
+          },
+          {
+            "nodeId": "passage:p3",
+            "passage": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "p3",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "rank": 3,
+            "score": 0.25
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 1,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/rankedFacts",
+        "root": "result",
+        "value": [
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f1",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "nodeId": "fact:f1",
+            "rank": 1,
+            "score": 0.5
+          },
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f2",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "nodeId": "fact:f2",
+            "rank": 2,
+            "score": 0.5
+          },
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f3",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "nodeId": "fact:f3",
+            "rank": 3,
+            "score": 0.25
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 2,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/rankedPassages",
+        "root": "result",
+        "value": [
+          {
+            "nodeId": "passage:p1",
+            "passage": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "p1",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "rank": 1,
+            "score": 0.75
+          },
+          {
+            "nodeId": "passage:p1",
+            "passage": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "p1",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "rank": 2,
+            "score": 0.5
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 3,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/rankedPassages",
+        "root": "result",
+        "value": [
+          {
+            "nodeId": "passage:p2",
+            "passage": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "p2",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "rank": 1,
+            "score": 0.5
+          },
+          {
+            "nodeId": "passage:p1",
+            "passage": {
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "entityMentions": [
+                "Alpha"
+              ],
+              "factIds": [
+                "fixture-fact-inactive"
+              ],
+              "metadata": {
+                "chunkId": "fixture-chunk-1",
+                "chunkIndex": 0,
+                "documentId": "fixture-document-1",
+                "language": "en",
+                "offsetEnd": 36,
+                "offsetStart": 0,
+                "sectionPath": [
+                  "Results"
+                ],
+                "sourceUrl": "https://example.invalid/fixture-document-1",
+                "title": "Bounded retrieval fixture"
+              },
+              "normalizedText": "a bounded retrieval fixture passage.",
+              "passageId": "p1",
+              "qualityFlags": [
+                "fixture"
+              ],
+              "text": "A bounded retrieval fixture passage.",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "rank": 2,
+            "score": 0.75
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 4,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/rankedPassages/1/rank",
+        "root": "result",
+        "value": 1
+      }
+    },
+    {
+      "assertionIndex": 5,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/rankedPassages/0/nodeId",
+        "root": "result",
+        "value": "passage:wrong"
+      }
+    },
+    {
+      "assertionIndex": 6,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/rankedPassages/0/passage/corpusId",
+        "root": "result",
+        "value": "other-corpus"
+      }
+    },
+    {
+      "assertionIndex": 7,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/rankedFacts",
+        "root": "result",
+        "value": [
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f1",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "nodeId": "fact:f1",
+            "rank": 1,
+            "score": 0.5
+          },
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f1",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "nodeId": "fact:f1",
+            "rank": 2,
+            "score": 0.4
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 8,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/rankedFacts",
+        "root": "result",
+        "value": [
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f2",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "nodeId": "fact:f2",
+            "rank": 1,
+            "score": 0.5
+          },
+          {
+            "fact": {
+              "confidence": 0.75,
+              "corpusId": "fixture-corpus",
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "factId": "f1",
+              "headEntity": "Alpha",
+              "headType": "Entity",
+              "passageIds": [
+                "fixture-passage-1"
+              ],
+              "relation": "relates-to",
+              "schemaId": "fixture-schema-1",
+              "sourceDocumentIds": [
+                "fixture-document-1"
+              ],
+              "state": "inactive",
+              "tailEntity": "Beta",
+              "tailType": "Entity",
+              "updatedAt": "2026-01-02T00:00:00.000Z"
+            },
+            "nodeId": "fact:f1",
+            "rank": 2,
+            "score": 0.5
+          }
+        ]
+      }
+    },
+    {
+      "assertionIndex": 9,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/rankedFacts/1/rank",
+        "root": "result",
+        "value": 1
+      }
+    },
+    {
+      "assertionIndex": 10,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/rankedFacts/0/nodeId",
+        "root": "result",
+        "value": "fact:0"
+      }
+    },
+    {
+      "assertionIndex": 11,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/rankedFacts/0/fact/corpusId",
+        "root": "result",
+        "value": "other-corpus"
+      }
+    },
+    {
+      "assertionIndex": 12,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/iterations",
+        "root": "result",
+        "value": 21
+      }
+    },
+    {
+      "assertionIndex": 13,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/l1Delta",
+        "root": "result",
+        "value": -1
+      }
+    },
+    {
+      "assertionIndex": 14,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/iterations",
+        "root": "result",
+        "value": 0
+      }
+    },
+    {
+      "assertionIndex": 15,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "",
+        "root": "result",
+        "value": {
+          "converged": true,
+          "iterations": 0,
+          "l1Delta": 0,
+          "rankedFacts": [
+            {
+              "fact": {
+                "confidence": 0.75,
+                "corpusId": "fixture-corpus",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "factId": "f1",
+                "headEntity": "Alpha",
+                "headType": "Entity",
+                "passageIds": [
+                  "fixture-passage-1"
+                ],
+                "relation": "relates-to",
+                "schemaId": "fixture-schema-1",
+                "sourceDocumentIds": [
+                  "fixture-document-1"
+                ],
+                "state": "inactive",
+                "tailEntity": "Beta",
+                "tailType": "Entity",
+                "updatedAt": "2026-01-02T00:00:00.000Z"
+              },
+              "nodeId": "fact:f1",
+              "rank": 1,
+              "score": 0.5
+            },
+            {
+              "fact": {
+                "confidence": 0.75,
+                "corpusId": "fixture-corpus",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "factId": "f2",
+                "headEntity": "Alpha",
+                "headType": "Entity",
+                "passageIds": [
+                  "fixture-passage-1"
+                ],
+                "relation": "relates-to",
+                "schemaId": "fixture-schema-1",
+                "sourceDocumentIds": [
+                  "fixture-document-1"
+                ],
+                "state": "inactive",
+                "tailEntity": "Beta",
+                "tailType": "Entity",
+                "updatedAt": "2026-01-02T00:00:00.000Z"
+              },
+              "nodeId": "fact:f2",
+              "rank": 2,
+              "score": 0.5
+            }
+          ],
+          "rankedPassages": []
+        }
+      }
+    },
+    {
+      "assertionIndex": 16,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "",
+        "root": "result",
+        "value": {
+          "converged": false,
+          "iterations": 0,
+          "l1Delta": 0.1,
+          "rankedFacts": [],
+          "rankedPassages": []
+        }
+      }
+    },
+    {
+      "assertionIndex": 17,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "",
+        "root": "result",
+        "value": {
+          "converged": true,
+          "iterations": 0,
+          "l1Delta": 0.1,
+          "rankedFacts": [],
+          "rankedPassages": []
+        }
+      }
+    },
+    {
+      "assertionIndex": 18,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "/converged",
+        "root": "result",
+        "value": false
+      }
+    },
+    {
+      "assertionIndex": 19,
+      "operation": "ppr_materialize_bounded@1",
+      "partition": "exchange",
+      "patch": {
+        "path": "",
+        "root": "result",
+        "value": {
+          "converged": false,
+          "iterations": 1,
+          "l1Delta": 0.1,
+          "rankedFacts": [
+            {
+              "fact": {
+                "confidence": 0.75,
+                "corpusId": "fixture-corpus",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "factId": "f1",
+                "headEntity": "Alpha",
+                "headType": "Entity",
+                "passageIds": [
+                  "fixture-passage-1"
+                ],
+                "relation": "relates-to",
+                "schemaId": "fixture-schema-1",
+                "sourceDocumentIds": [
+                  "fixture-document-1"
+                ],
+                "state": "inactive",
+                "tailEntity": "Beta",
+                "tailType": "Entity",
+                "updatedAt": "2026-01-02T00:00:00.000Z"
+              },
+              "nodeId": "fact:f1",
+              "rank": 1,
+              "score": 0.5
+            },
+            {
+              "fact": {
+                "confidence": 0.75,
+                "corpusId": "fixture-corpus",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "factId": "f2",
+                "headEntity": "Alpha",
+                "headType": "Entity",
+                "passageIds": [
+                  "fixture-passage-1"
+                ],
+                "relation": "relates-to",
+                "schemaId": "fixture-schema-1",
+                "sourceDocumentIds": [
+                  "fixture-document-1"
+                ],
+                "state": "inactive",
+                "tailEntity": "Beta",
+                "tailType": "Entity",
+                "updatedAt": "2026-01-02T00:00:00.000Z"
+              },
+              "nodeId": "fact:f2",
+              "rank": 2,
+              "score": 0.5
+            }
+          ],
+          "rankedPassages": [
+            {
+              "nodeId": "passage:p1",
+              "passage": {
+                "corpusId": "fixture-corpus",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "entityMentions": [
+                  "Alpha"
+                ],
+                "factIds": [
+                  "fixture-fact-inactive"
+                ],
+                "metadata": {
+                  "chunkId": "fixture-chunk-1",
+                  "chunkIndex": 0,
+                  "documentId": "fixture-document-1",
+                  "language": "en",
+                  "offsetEnd": 36,
+                  "offsetStart": 0,
+                  "sectionPath": [
+                    "Results"
+                  ],
+                  "sourceUrl": "https://example.invalid/fixture-document-1",
+                  "title": "Bounded retrieval fixture"
+                },
+                "normalizedText": "a bounded retrieval fixture passage.",
+                "passageId": "p1",
+                "qualityFlags": [
+                  "fixture"
+                ],
+                "text": "A bounded retrieval fixture passage.",
+                "updatedAt": "2026-01-02T00:00:00.000Z"
+              },
+              "rank": 1,
+              "score": 0.75
+            },
+            {
+              "nodeId": "passage:p2",
+              "passage": {
+                "corpusId": "fixture-corpus",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "entityMentions": [
+                  "Alpha"
+                ],
+                "factIds": [
+                  "fixture-fact-inactive"
+                ],
+                "metadata": {
+                  "chunkId": "fixture-chunk-1",
+                  "chunkIndex": 0,
+                  "documentId": "fixture-document-1",
+                  "language": "en",
+                  "offsetEnd": 36,
+                  "offsetStart": 0,
+                  "sectionPath": [
+                    "Results"
+                  ],
+                  "sourceUrl": "https://example.invalid/fixture-document-1",
+                  "title": "Bounded retrieval fixture"
+                },
+                "normalizedText": "a bounded retrieval fixture passage.",
+                "passageId": "p2",
+                "qualityFlags": [
+                  "fixture"
+                ],
+                "text": "A bounded retrieval fixture passage.",
+                "updatedAt": "2026-01-02T00:00:00.000Z"
+              },
+              "rank": 2,
+              "score": 0.5
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

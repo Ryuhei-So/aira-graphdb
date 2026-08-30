@@ -1,13 +1,15 @@
 # Bounded retrieval data plane
 
-Status: design checkpoint only.  This document does not authorize native
-method or validator implementation.
+Status: design/contract checkpoint only.  This document authorizes the bounded
+contract validation boundary, but no bounded retrieval algorithm dispatch.
 
 This design replaces the first issue-4 `retrieve_bounded` contract.  Aira
-Synapse is the sole query-policy authority.  Aira GraphDB provides two or three
+Synapse is the sole query-policy authority.  Aira GraphDB defines two or three
 versioned, bounded data operations over one committed generation, depending on
 whether Synapse requests fact expansion.  Literature Hub owns the generation
-session, availability policy, and retry circuit.
+session, availability policy, and retry circuit.  The current issue-10
+checkpoint defines and validates that contract but does not expose the
+operations as executable capabilities.
 
 ## Decision
 
@@ -21,10 +23,14 @@ one exclusive owner reader lease:
 3. `ppr_materialize_bounded@1` runs an explicit graph plan and materializes only
    its selected passages and facts.
 
-The operations do not name, default, or validate a Synapse profile.  Their
-`protocol_info` entries advertise operation schema digests, hard limits,
-`classification=read`, and `wal=false`.  A profile id may be echoed as opaque
-audit data but never changes native behavior.
+The operations do not name, default, or validate a Synapse profile.  At the
+current checkpoint, `protocol_info.boundedRetrieval.methods` is empty.  The
+contract schema/digest metadata is exposed only in
+`boundedRetrieval.checkpoint.unavailableMethods`, alongside
+`status=checkpoint`, `availability=unavailable`, and `executable=false`.
+Dispatch returns `REQUEST_EXECUTION_FAILED` until algorithm wiring is reviewed.
+A profile id may be echoed as opaque audit data but never changes native
+behavior.
 
 Rejected alternatives:
 
@@ -49,6 +55,13 @@ Rejected alternatives:
 - The owner alone reaches native stdio and owns roles, writer exclusion, reader
   lease admission/renewal/release, publication blocking, and native-death
   classification.  Native requests contain no caller role or lease claim.
+- The pinned producer `refinementNodes` declaration is the sole structural
+  authority for refinement node roles and field markers.  Native supplies only
+  its executable opcode-handler inventory and supported primitive marker
+  inventory, and rejects any parsed opcode set that is not exactly equal to
+  the handler set.  Producer-owned assertion witnesses are likewise pinned and
+  executed in declaration-derived order; native does not restate their rule or
+  mutation catalog.
 - Native owns storage lookup, exact vector arithmetic, graph arithmetic,
   domain-object lookup, work counters, checked allocation, and response
   framing for the requested data operations.
@@ -271,11 +284,13 @@ returns a full projection or memory snapshot and never invents `Fact.value`.
 
 ## Hard resource model
 
-One Rust contract module is the authority for validation, `protocol_info`,
-checked allocation formulas, and tests.  Request values may reduce but never
-raise hard maxima.  Initial ceilings are reviewed against the copied production
-generation and provide at least 2x count headroom while remaining below the
-owner cgroup headroom:
+One Rust contract module is the authority for validation, executable
+`protocol_info` inventory, checked allocation formulas, and tests.  Its
+refinement structure is parsed from the pinned producer declaration; it does
+not restate producer node roles or field grammar.  Request values may reduce
+but never raise hard maxima.  Initial ceilings are reviewed against the copied
+production generation and provide at least 2x count headroom while remaining
+below the owner cgroup headroom:
 
 - vector dimensions 4096; total vector comparisons 1,500,000;
 - at most 8 search slots; facts inspected 1,500,000;
@@ -869,8 +884,9 @@ Before native algorithm wiring:
   rejected before manifest dirtying, WAL append, or native mutation; canonical
   JSON, referenced blob, owner manifest, WAL, lock, and audit authority remain
   byte-identical on rejection;
-- real `protocol_info` advertises each operation as read/WAL-free with the exact
-  schema/limit digest;
+- real `protocol_info` keeps the bounded executable method list empty and
+  exposes each contract operation only as unavailable checkpoint metadata with
+  its exact schema/semantic digest;
 - real-native tests cover nonzero generation, stale generation,
   RecoveryPending, writer waiting across all three operations, deadline via
   fake monotonic clock, allocation failpoints, response budget, partial frame,

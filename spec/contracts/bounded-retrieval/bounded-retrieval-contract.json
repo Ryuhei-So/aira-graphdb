@@ -1,0 +1,2224 @@
+{
+  "contractVersion": "aira-synapse-bounded-retrieval-contract@1",
+  "operations": {
+    "candidate_search_bounded@1": {
+      "refinement": {
+        "exchangeAssertions": [
+          {
+            "actual": {
+              "op": "pointer",
+              "path": "/slots/0/hits",
+              "root": "result"
+            },
+            "limit": {
+              "op": "pointer",
+              "path": "/slots/0/limit",
+              "root": "request"
+            },
+            "op": "length_lte_ref"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/0/hits",
+              "root": "result"
+            },
+            "key": {
+              "op": "iteration_pointer",
+              "path": "/id",
+              "scope": "passageHit"
+            },
+            "op": "unique_by",
+            "scope": "passageHit"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/0/hits",
+              "root": "result"
+            },
+            "id": {
+              "op": "iteration_pointer",
+              "path": "/id",
+              "scope": "passageHit"
+            },
+            "idOrder": "unicode_utf16_code_unit_asc",
+            "op": "ordered_score_desc_id_asc",
+            "scope": "passageHit",
+            "score": {
+              "op": "iteration_pointer",
+              "path": "/score",
+              "scope": "passageHit"
+            }
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/0/hits",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/id",
+                "scope": "passageHit"
+              },
+              "op": "eq",
+              "right": {
+                "op": "concat",
+                "values": [
+                  {
+                    "op": "literal",
+                    "value": "passage:"
+                  },
+                  {
+                    "op": "iteration_pointer",
+                    "path": "/item/passageId",
+                    "scope": "passageHit"
+                  }
+                ]
+              }
+            },
+            "scope": "passageHit"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/0/hits",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/item/corpusId",
+                "scope": "passageHit"
+              },
+              "op": "eq",
+              "right": {
+                "op": "pointer",
+                "path": "/corpusId",
+                "root": "request"
+              }
+            },
+            "scope": "passageHit"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/0/hits",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "pointer",
+                "path": "/slots/0/threshold",
+                "root": "request"
+              },
+              "op": "lte",
+              "right": {
+                "op": "iteration_pointer",
+                "path": "/score",
+                "scope": "passageHit"
+              }
+            },
+            "scope": "passageHit"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/0/hits",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/score",
+                "scope": "passageHit"
+              },
+              "op": "lte",
+              "right": {
+                "op": "literal",
+                "value": 1
+              }
+            },
+            "scope": "passageHit"
+          },
+          {
+            "actual": {
+              "op": "pointer",
+              "path": "/slots/1/hits",
+              "root": "result"
+            },
+            "limit": {
+              "op": "pointer",
+              "path": "/slots/1/limit",
+              "root": "request"
+            },
+            "op": "length_lte_ref"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/1/hits",
+              "root": "result"
+            },
+            "key": {
+              "op": "iteration_pointer",
+              "path": "/id",
+              "scope": "factHit"
+            },
+            "op": "unique_by",
+            "scope": "factHit"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/1/hits",
+              "root": "result"
+            },
+            "id": {
+              "op": "iteration_pointer",
+              "path": "/id",
+              "scope": "factHit"
+            },
+            "idOrder": "unicode_utf16_code_unit_asc",
+            "op": "ordered_score_desc_id_asc",
+            "scope": "factHit",
+            "score": {
+              "op": "iteration_pointer",
+              "path": "/score",
+              "scope": "factHit"
+            }
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/1/hits",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/id",
+                "scope": "factHit"
+              },
+              "op": "eq",
+              "right": {
+                "op": "concat",
+                "values": [
+                  {
+                    "op": "literal",
+                    "value": "fact:"
+                  },
+                  {
+                    "op": "iteration_pointer",
+                    "path": "/item/factId",
+                    "scope": "factHit"
+                  }
+                ]
+              }
+            },
+            "scope": "factHit"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/1/hits",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/item/corpusId",
+                "scope": "factHit"
+              },
+              "op": "eq",
+              "right": {
+                "op": "pointer",
+                "path": "/corpusId",
+                "root": "request"
+              }
+            },
+            "scope": "factHit"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/1/hits",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "pointer",
+                "path": "/slots/1/threshold",
+                "root": "request"
+              },
+              "op": "lte",
+              "right": {
+                "op": "iteration_pointer",
+                "path": "/score",
+                "scope": "factHit"
+              }
+            },
+            "scope": "factHit"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/1/hits",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/score",
+                "scope": "factHit"
+              },
+              "op": "lte",
+              "right": {
+                "op": "literal",
+                "value": 1
+              }
+            },
+            "scope": "factHit"
+          },
+          {
+            "actual": {
+              "op": "pointer",
+              "path": "/slots/2/hits",
+              "root": "result"
+            },
+            "limit": {
+              "op": "pointer",
+              "path": "/slots/2/limit",
+              "root": "request"
+            },
+            "op": "length_lte_ref"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/2/hits",
+              "root": "result"
+            },
+            "key": {
+              "op": "iteration_pointer",
+              "path": "/id",
+              "scope": "schemaHit"
+            },
+            "op": "unique_by",
+            "scope": "schemaHit"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/2/hits",
+              "root": "result"
+            },
+            "id": {
+              "op": "iteration_pointer",
+              "path": "/id",
+              "scope": "schemaHit"
+            },
+            "idOrder": "unicode_utf16_code_unit_asc",
+            "op": "ordered_score_desc_id_asc",
+            "scope": "schemaHit",
+            "score": {
+              "op": "iteration_pointer",
+              "path": "/score",
+              "scope": "schemaHit"
+            }
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/2/hits",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/id",
+                "scope": "schemaHit"
+              },
+              "op": "eq",
+              "right": {
+                "op": "concat",
+                "values": [
+                  {
+                    "op": "literal",
+                    "value": "schema:"
+                  },
+                  {
+                    "op": "iteration_pointer",
+                    "path": "/item/schemaId",
+                    "scope": "schemaHit"
+                  }
+                ]
+              }
+            },
+            "scope": "schemaHit"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/2/hits",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/item/corpusId",
+                "scope": "schemaHit"
+              },
+              "op": "eq",
+              "right": {
+                "op": "pointer",
+                "path": "/corpusId",
+                "root": "request"
+              }
+            },
+            "scope": "schemaHit"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/2/hits",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "pointer",
+                "path": "/slots/2/threshold",
+                "root": "request"
+              },
+              "op": "lte",
+              "right": {
+                "op": "iteration_pointer",
+                "path": "/score",
+                "scope": "schemaHit"
+              }
+            },
+            "scope": "schemaHit"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/slots/2/hits",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/score",
+                "scope": "schemaHit"
+              },
+              "op": "lte",
+              "right": {
+                "op": "literal",
+                "value": 1
+              }
+            },
+            "scope": "schemaHit"
+          }
+        ],
+        "requestAssertions": [
+          {
+            "expected": {
+              "op": "literal",
+              "value": true
+            },
+            "op": "field_eq_ref",
+            "value": {
+              "op": "not",
+              "value": {
+                "left": {
+                  "op": "pointer",
+                  "path": "/corpusId",
+                  "root": "request"
+                },
+                "op": "eq",
+                "right": {
+                  "op": "literal",
+                  "value": ""
+                }
+              }
+            }
+          },
+          {
+            "expected": {
+              "op": "literal",
+              "value": true
+            },
+            "op": "field_eq_ref",
+            "value": {
+              "op": "not",
+              "value": {
+                "left": {
+                  "op": "array_length",
+                  "value": {
+                    "op": "pointer",
+                    "path": "/slots/0/queryVector",
+                    "root": "request"
+                  }
+                },
+                "op": "eq",
+                "right": {
+                  "op": "literal",
+                  "value": 0
+                }
+              }
+            }
+          },
+          {
+            "maximum": 1,
+            "minimum": -1,
+            "op": "finite_range",
+            "value": {
+              "op": "pointer",
+              "path": "/slots/0/threshold",
+              "root": "request"
+            }
+          },
+          {
+            "maximum": {
+              "op": "literal",
+              "value": 9007199254740991
+            },
+            "minimum": 1,
+            "op": "safe_integer_range",
+            "value": {
+              "op": "pointer",
+              "path": "/slots/0/limit",
+              "root": "request"
+            }
+          },
+          {
+            "expected": {
+              "op": "literal",
+              "value": true
+            },
+            "op": "field_eq_ref",
+            "value": {
+              "op": "not",
+              "value": {
+                "left": {
+                  "op": "array_length",
+                  "value": {
+                    "op": "pointer",
+                    "path": "/slots/1/queryVector",
+                    "root": "request"
+                  }
+                },
+                "op": "eq",
+                "right": {
+                  "op": "literal",
+                  "value": 0
+                }
+              }
+            }
+          },
+          {
+            "maximum": 1,
+            "minimum": -1,
+            "op": "finite_range",
+            "value": {
+              "op": "pointer",
+              "path": "/slots/1/threshold",
+              "root": "request"
+            }
+          },
+          {
+            "maximum": {
+              "op": "literal",
+              "value": 9007199254740991
+            },
+            "minimum": 1,
+            "op": "safe_integer_range",
+            "value": {
+              "op": "pointer",
+              "path": "/slots/1/limit",
+              "root": "request"
+            }
+          },
+          {
+            "expected": {
+              "op": "literal",
+              "value": true
+            },
+            "op": "field_eq_ref",
+            "value": {
+              "op": "not",
+              "value": {
+                "left": {
+                  "op": "array_length",
+                  "value": {
+                    "op": "pointer",
+                    "path": "/slots/2/queryVector",
+                    "root": "request"
+                  }
+                },
+                "op": "eq",
+                "right": {
+                  "op": "literal",
+                  "value": 0
+                }
+              }
+            }
+          },
+          {
+            "maximum": 1,
+            "minimum": -1,
+            "op": "finite_range",
+            "value": {
+              "op": "pointer",
+              "path": "/slots/2/threshold",
+              "root": "request"
+            }
+          },
+          {
+            "maximum": {
+              "op": "literal",
+              "value": 9007199254740991
+            },
+            "minimum": 1,
+            "op": "safe_integer_range",
+            "value": {
+              "op": "pointer",
+              "path": "/slots/2/limit",
+              "root": "request"
+            }
+          }
+        ],
+        "version": "aira-synapse-refinement-ir@1"
+      },
+      "request": {
+        "fields": {
+          "corpusId": {
+            "kind": "string"
+          },
+          "slots": {
+            "items": [
+              {
+                "fields": {
+                  "limit": {
+                    "kind": "number"
+                  },
+                  "namespace": {
+                    "kind": "literal",
+                    "values": [
+                      "passage"
+                    ]
+                  },
+                  "queryVector": {
+                    "items": {
+                      "kind": "number"
+                    },
+                    "kind": "array"
+                  },
+                  "slotId": {
+                    "kind": "literal",
+                    "values": [
+                      "passage"
+                    ]
+                  },
+                  "threshold": {
+                    "kind": "number"
+                  }
+                },
+                "kind": "object"
+              },
+              {
+                "fields": {
+                  "limit": {
+                    "kind": "number"
+                  },
+                  "namespace": {
+                    "kind": "literal",
+                    "values": [
+                      "fact"
+                    ]
+                  },
+                  "queryVector": {
+                    "items": {
+                      "kind": "number"
+                    },
+                    "kind": "array"
+                  },
+                  "slotId": {
+                    "kind": "literal",
+                    "values": [
+                      "fact"
+                    ]
+                  },
+                  "threshold": {
+                    "kind": "number"
+                  }
+                },
+                "kind": "object"
+              },
+              {
+                "fields": {
+                  "limit": {
+                    "kind": "number"
+                  },
+                  "namespace": {
+                    "kind": "literal",
+                    "values": [
+                      "schema"
+                    ]
+                  },
+                  "queryVector": {
+                    "items": {
+                      "kind": "number"
+                    },
+                    "kind": "array"
+                  },
+                  "slotId": {
+                    "kind": "literal",
+                    "values": [
+                      "schema"
+                    ]
+                  },
+                  "threshold": {
+                    "kind": "number"
+                  }
+                },
+                "kind": "object"
+              }
+            ],
+            "kind": "tuple"
+          }
+        },
+        "kind": "object"
+      },
+      "result": {
+        "fields": {
+          "slots": {
+            "items": [
+              {
+                "fields": {
+                  "hits": {
+                    "items": {
+                      "fields": {
+                        "id": {
+                          "kind": "string"
+                        },
+                        "item": {
+                          "dependency": "aira-synapse-domain-contract@1",
+                          "kind": "externalRef",
+                          "referenceKind": "passage"
+                        },
+                        "score": {
+                          "kind": "number"
+                        }
+                      },
+                      "kind": "object"
+                    },
+                    "kind": "array"
+                  },
+                  "namespace": {
+                    "kind": "literal",
+                    "values": [
+                      "passage"
+                    ]
+                  },
+                  "slotId": {
+                    "kind": "literal",
+                    "values": [
+                      "passage"
+                    ]
+                  }
+                },
+                "kind": "object"
+              },
+              {
+                "fields": {
+                  "hits": {
+                    "items": {
+                      "fields": {
+                        "id": {
+                          "kind": "string"
+                        },
+                        "item": {
+                          "dependency": "aira-synapse-domain-contract@1",
+                          "kind": "externalRef",
+                          "referenceKind": "fact"
+                        },
+                        "score": {
+                          "kind": "number"
+                        }
+                      },
+                      "kind": "object"
+                    },
+                    "kind": "array"
+                  },
+                  "namespace": {
+                    "kind": "literal",
+                    "values": [
+                      "fact"
+                    ]
+                  },
+                  "slotId": {
+                    "kind": "literal",
+                    "values": [
+                      "fact"
+                    ]
+                  }
+                },
+                "kind": "object"
+              },
+              {
+                "fields": {
+                  "hits": {
+                    "items": {
+                      "fields": {
+                        "id": {
+                          "kind": "string"
+                        },
+                        "item": {
+                          "dependency": "aira-synapse-domain-contract@1",
+                          "kind": "externalRef",
+                          "referenceKind": "schema"
+                        },
+                        "score": {
+                          "kind": "number"
+                        }
+                      },
+                      "kind": "object"
+                    },
+                    "kind": "array"
+                  },
+                  "namespace": {
+                    "kind": "literal",
+                    "values": [
+                      "schema"
+                    ]
+                  },
+                  "slotId": {
+                    "kind": "literal",
+                    "values": [
+                      "schema"
+                    ]
+                  }
+                },
+                "kind": "object"
+              }
+            ],
+            "kind": "tuple"
+          }
+        },
+        "kind": "object"
+      }
+    },
+    "fact_expand_bounded@1": {
+      "refinement": {
+        "exchangeAssertions": [
+          {
+            "actual": {
+              "op": "pointer",
+              "path": "/facts",
+              "root": "result"
+            },
+            "limit": {
+              "op": "pointer",
+              "path": "/plan/limit",
+              "root": "request"
+            },
+            "op": "length_lte_ref"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/facts",
+              "root": "result"
+            },
+            "key": {
+              "op": "iteration_pointer",
+              "path": "/factId",
+              "scope": "expandedFact"
+            },
+            "op": "unique_by",
+            "scope": "expandedFact"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/facts",
+              "root": "result"
+            },
+            "id": {
+              "op": "iteration_pointer",
+              "path": "/factId",
+              "scope": "expandedFact"
+            },
+            "idOrder": "unicode_utf16_code_unit_asc",
+            "op": "ordered_score_desc_id_asc",
+            "scope": "expandedFact",
+            "score": {
+              "op": "iteration_pointer",
+              "path": "/score",
+              "scope": "expandedFact"
+            }
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/facts",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/factId",
+                "scope": "expandedFact"
+              },
+              "op": "eq",
+              "right": {
+                "op": "iteration_pointer",
+                "path": "/fact/factId",
+                "scope": "expandedFact"
+              }
+            },
+            "scope": "expandedFact"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/facts",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/fact/corpusId",
+                "scope": "expandedFact"
+              },
+              "op": "eq",
+              "right": {
+                "op": "pointer",
+                "path": "/corpusId",
+                "root": "request"
+              }
+            },
+            "scope": "expandedFact"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/facts",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "op": "not",
+              "value": {
+                "op": "set_contains",
+                "set": {
+                  "op": "pointer",
+                  "path": "/plan/excludedSeedFactIds",
+                  "root": "request"
+                },
+                "value": {
+                  "op": "iteration_pointer",
+                  "path": "/factId",
+                  "scope": "expandedFact"
+                }
+              }
+            },
+            "scope": "expandedFact"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/facts",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "op": "any",
+              "values": [
+                {
+                  "op": "not",
+                  "value": {
+                    "left": {
+                      "key": {
+                        "dependency": "v15-entity-normalization-ecmascript-tolowercase-unicode16.0.0@1",
+                        "op": "normalize_ref",
+                        "value": {
+                          "op": "iteration_pointer",
+                          "path": "/fact/headEntity",
+                          "scope": "expandedFact"
+                        }
+                      },
+                      "keyField": "key",
+                      "map": {
+                        "op": "pointer",
+                        "path": "/plan/seedEntities",
+                        "root": "request"
+                      },
+                      "op": "map_lookup",
+                      "valueField": "score"
+                    },
+                    "op": "eq",
+                    "right": {
+                      "op": "literal",
+                      "value": null
+                    }
+                  }
+                },
+                {
+                  "op": "not",
+                  "value": {
+                    "left": {
+                      "key": {
+                        "dependency": "v15-entity-normalization-ecmascript-tolowercase-unicode16.0.0@1",
+                        "op": "normalize_ref",
+                        "value": {
+                          "op": "iteration_pointer",
+                          "path": "/fact/tailEntity",
+                          "scope": "expandedFact"
+                        }
+                      },
+                      "keyField": "key",
+                      "map": {
+                        "op": "pointer",
+                        "path": "/plan/seedEntities",
+                        "root": "request"
+                      },
+                      "op": "map_lookup",
+                      "valueField": "score"
+                    },
+                    "op": "eq",
+                    "right": {
+                      "op": "literal",
+                      "value": null
+                    }
+                  }
+                }
+              ]
+            },
+            "scope": "expandedFact"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/facts",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/score",
+                "scope": "expandedFact"
+              },
+              "op": "eq",
+              "right": {
+                "left": {
+                  "op": "max",
+                  "values": [
+                    {
+                      "op": "coalesce",
+                      "values": [
+                        {
+                          "key": {
+                            "dependency": "v15-entity-normalization-ecmascript-tolowercase-unicode16.0.0@1",
+                            "op": "normalize_ref",
+                            "value": {
+                              "op": "iteration_pointer",
+                              "path": "/fact/headEntity",
+                              "scope": "expandedFact"
+                            }
+                          },
+                          "keyField": "key",
+                          "map": {
+                            "op": "pointer",
+                            "path": "/plan/seedEntities",
+                            "root": "request"
+                          },
+                          "op": "map_lookup",
+                          "valueField": "score"
+                        },
+                        {
+                          "op": "literal",
+                          "value": 0
+                        }
+                      ]
+                    },
+                    {
+                      "op": "coalesce",
+                      "values": [
+                        {
+                          "key": {
+                            "dependency": "v15-entity-normalization-ecmascript-tolowercase-unicode16.0.0@1",
+                            "op": "normalize_ref",
+                            "value": {
+                              "op": "iteration_pointer",
+                              "path": "/fact/tailEntity",
+                              "scope": "expandedFact"
+                            }
+                          },
+                          "keyField": "key",
+                          "map": {
+                            "op": "pointer",
+                            "path": "/plan/seedEntities",
+                            "root": "request"
+                          },
+                          "op": "map_lookup",
+                          "valueField": "score"
+                        },
+                        {
+                          "op": "literal",
+                          "value": 0
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "op": "multiply",
+                "right": {
+                  "op": "pointer",
+                  "path": "/plan/attenuation",
+                  "root": "request"
+                }
+              }
+            },
+            "scope": "expandedFact"
+          }
+        ],
+        "requestAssertions": [
+          {
+            "expected": {
+              "op": "literal",
+              "value": true
+            },
+            "op": "field_eq_ref",
+            "value": {
+              "op": "not",
+              "value": {
+                "left": {
+                  "op": "pointer",
+                  "path": "/corpusId",
+                  "root": "request"
+                },
+                "op": "eq",
+                "right": {
+                  "op": "literal",
+                  "value": ""
+                }
+              }
+            }
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/plan/seedEntities",
+              "root": "request"
+            },
+            "key": {
+              "op": "iteration_pointer",
+              "path": "/key",
+              "scope": "seed"
+            },
+            "op": "unique_by",
+            "scope": "seed"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/plan/seedEntities",
+              "root": "request"
+            },
+            "op": "for_each",
+            "predicate": {
+              "op": "not",
+              "value": {
+                "left": {
+                  "op": "iteration_pointer",
+                  "path": "/key",
+                  "scope": "seed"
+                },
+                "op": "eq",
+                "right": {
+                  "op": "literal",
+                  "value": ""
+                }
+              }
+            },
+            "scope": "seed"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/plan/excludedSeedFactIds",
+              "root": "request"
+            },
+            "op": "for_each",
+            "predicate": {
+              "op": "not",
+              "value": {
+                "left": {
+                  "op": "iteration_pointer",
+                  "path": "",
+                  "scope": "excluded"
+                },
+                "op": "eq",
+                "right": {
+                  "op": "literal",
+                  "value": ""
+                }
+              }
+            },
+            "scope": "excluded"
+          },
+          {
+            "maximum": 1.7976931348623157e+308,
+            "minimum": 0,
+            "op": "finite_range",
+            "value": {
+              "op": "pointer",
+              "path": "/plan/seedEntities/*/score",
+              "root": "request"
+            }
+          },
+          {
+            "maximum": 1.7976931348623157e+308,
+            "minimum": 0,
+            "op": "finite_range",
+            "value": {
+              "op": "pointer",
+              "path": "/plan/attenuation",
+              "root": "request"
+            }
+          },
+          {
+            "maximum": {
+              "op": "literal",
+              "value": 9007199254740991
+            },
+            "minimum": 1,
+            "op": "safe_integer_range",
+            "value": {
+              "op": "pointer",
+              "path": "/plan/limit",
+              "root": "request"
+            }
+          },
+          {
+            "expected": {
+              "op": "literal",
+              "value": "v15-entity-normalization-ecmascript-tolowercase-unicode16.0.0@1"
+            },
+            "op": "field_eq_ref",
+            "value": {
+              "op": "pointer",
+              "path": "/plan/normalizationContractDigest",
+              "root": "request"
+            }
+          }
+        ],
+        "version": "aira-synapse-refinement-ir@1"
+      },
+      "request": {
+        "fields": {
+          "corpusId": {
+            "kind": "string"
+          },
+          "plan": {
+            "fields": {
+              "attenuation": {
+                "kind": "number"
+              },
+              "excludedSeedFactIds": {
+                "items": {
+                  "kind": "string"
+                },
+                "kind": "array"
+              },
+              "limit": {
+                "kind": "number"
+              },
+              "normalizationContractDigest": {
+                "kind": "string"
+              },
+              "seedEntities": {
+                "items": {
+                  "fields": {
+                    "key": {
+                      "kind": "string"
+                    },
+                    "score": {
+                      "kind": "number"
+                    }
+                  },
+                  "kind": "object"
+                },
+                "kind": "array"
+              }
+            },
+            "kind": "object"
+          }
+        },
+        "kind": "object"
+      },
+      "result": {
+        "fields": {
+          "facts": {
+            "items": {
+              "fields": {
+                "fact": {
+                  "dependency": "aira-synapse-domain-contract@1",
+                  "kind": "externalRef",
+                  "referenceKind": "fact"
+                },
+                "factId": {
+                  "kind": "string"
+                },
+                "score": {
+                  "kind": "number"
+                }
+              },
+              "kind": "object"
+            },
+            "kind": "array"
+          }
+        },
+        "kind": "object"
+      }
+    },
+    "ppr_materialize_bounded@1": {
+      "refinement": {
+        "exchangeAssertions": [
+          {
+            "actual": {
+              "op": "pointer",
+              "path": "/rankedPassages",
+              "root": "result"
+            },
+            "limit": {
+              "op": "pointer",
+              "path": "/plan/passageLimit",
+              "root": "request"
+            },
+            "op": "length_lte_ref"
+          },
+          {
+            "actual": {
+              "op": "pointer",
+              "path": "/rankedFacts",
+              "root": "result"
+            },
+            "limit": {
+              "op": "pointer",
+              "path": "/plan/entityLimit",
+              "root": "request"
+            },
+            "op": "length_lte_ref"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/rankedPassages",
+              "root": "result"
+            },
+            "key": {
+              "op": "iteration_pointer",
+              "path": "/nodeId",
+              "scope": "passageRank"
+            },
+            "op": "unique_by",
+            "scope": "passageRank"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/rankedPassages",
+              "root": "result"
+            },
+            "id": {
+              "op": "iteration_pointer",
+              "path": "/nodeId",
+              "scope": "passageRank"
+            },
+            "idOrder": "unicode_utf16_code_unit_asc",
+            "op": "ordered_score_desc_id_asc",
+            "scope": "passageRank",
+            "score": {
+              "op": "iteration_pointer",
+              "path": "/score",
+              "scope": "passageRank"
+            }
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/rankedPassages",
+              "root": "result"
+            },
+            "op": "rank_is_index_plus_one",
+            "rank": {
+              "op": "iteration_pointer",
+              "path": "/rank",
+              "scope": "passageRank"
+            },
+            "scope": "passageRank"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/rankedPassages",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/nodeId",
+                "scope": "passageRank"
+              },
+              "op": "eq",
+              "right": {
+                "op": "concat",
+                "values": [
+                  {
+                    "op": "literal",
+                    "value": "passage:"
+                  },
+                  {
+                    "op": "iteration_pointer",
+                    "path": "/passage/passageId",
+                    "scope": "passageRank"
+                  }
+                ]
+              }
+            },
+            "scope": "passageRank"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/rankedPassages",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/passage/corpusId",
+                "scope": "passageRank"
+              },
+              "op": "eq",
+              "right": {
+                "op": "pointer",
+                "path": "/corpusId",
+                "root": "request"
+              }
+            },
+            "scope": "passageRank"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/rankedFacts",
+              "root": "result"
+            },
+            "key": {
+              "op": "iteration_pointer",
+              "path": "/nodeId",
+              "scope": "factRank"
+            },
+            "op": "unique_by",
+            "scope": "factRank"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/rankedFacts",
+              "root": "result"
+            },
+            "id": {
+              "op": "iteration_pointer",
+              "path": "/nodeId",
+              "scope": "factRank"
+            },
+            "idOrder": "unicode_utf16_code_unit_asc",
+            "op": "ordered_score_desc_id_asc",
+            "scope": "factRank",
+            "score": {
+              "op": "iteration_pointer",
+              "path": "/score",
+              "scope": "factRank"
+            }
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/rankedFacts",
+              "root": "result"
+            },
+            "op": "rank_is_index_plus_one",
+            "rank": {
+              "op": "iteration_pointer",
+              "path": "/rank",
+              "scope": "factRank"
+            },
+            "scope": "factRank"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/rankedFacts",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/nodeId",
+                "scope": "factRank"
+              },
+              "op": "eq",
+              "right": {
+                "op": "concat",
+                "values": [
+                  {
+                    "op": "literal",
+                    "value": "fact:"
+                  },
+                  {
+                    "op": "iteration_pointer",
+                    "path": "/fact/factId",
+                    "scope": "factRank"
+                  }
+                ]
+              }
+            },
+            "scope": "factRank"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/rankedFacts",
+              "root": "result"
+            },
+            "op": "for_each",
+            "predicate": {
+              "left": {
+                "op": "iteration_pointer",
+                "path": "/fact/corpusId",
+                "scope": "factRank"
+              },
+              "op": "eq",
+              "right": {
+                "op": "pointer",
+                "path": "/corpusId",
+                "root": "request"
+              }
+            },
+            "scope": "factRank"
+          },
+          {
+            "maximum": {
+              "op": "pointer",
+              "path": "/plan/maxIterations",
+              "root": "request"
+            },
+            "minimum": 0,
+            "op": "safe_integer_range",
+            "value": {
+              "op": "pointer",
+              "path": "/iterations",
+              "root": "result"
+            }
+          },
+          {
+            "maximum": 1.7976931348623157e+308,
+            "minimum": 0,
+            "op": "finite_range",
+            "value": {
+              "op": "pointer",
+              "path": "/l1Delta",
+              "root": "result"
+            }
+          },
+          {
+            "expected": {
+              "op": "literal",
+              "value": true
+            },
+            "op": "field_eq_ref",
+            "value": {
+              "op": "any",
+              "values": [
+                {
+                  "op": "not",
+                  "value": {
+                    "left": {
+                      "op": "pointer",
+                      "path": "/iterations",
+                      "root": "result"
+                    },
+                    "op": "eq",
+                    "right": {
+                      "op": "literal",
+                      "value": 0
+                    }
+                  }
+                },
+                {
+                  "left": {
+                    "op": "array_length",
+                    "value": {
+                      "op": "pointer",
+                      "path": "/rankedPassages",
+                      "root": "result"
+                    }
+                  },
+                  "op": "eq",
+                  "right": {
+                    "op": "literal",
+                    "value": 0
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "expected": {
+              "op": "literal",
+              "value": true
+            },
+            "op": "field_eq_ref",
+            "value": {
+              "op": "any",
+              "values": [
+                {
+                  "op": "not",
+                  "value": {
+                    "left": {
+                      "op": "pointer",
+                      "path": "/iterations",
+                      "root": "result"
+                    },
+                    "op": "eq",
+                    "right": {
+                      "op": "literal",
+                      "value": 0
+                    }
+                  }
+                },
+                {
+                  "left": {
+                    "op": "array_length",
+                    "value": {
+                      "op": "pointer",
+                      "path": "/rankedFacts",
+                      "root": "result"
+                    }
+                  },
+                  "op": "eq",
+                  "right": {
+                    "op": "literal",
+                    "value": 0
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "expected": {
+              "op": "literal",
+              "value": true
+            },
+            "op": "field_eq_ref",
+            "value": {
+              "op": "any",
+              "values": [
+                {
+                  "op": "not",
+                  "value": {
+                    "left": {
+                      "op": "pointer",
+                      "path": "/iterations",
+                      "root": "result"
+                    },
+                    "op": "eq",
+                    "right": {
+                      "op": "literal",
+                      "value": 0
+                    }
+                  }
+                },
+                {
+                  "op": "pointer",
+                  "path": "/converged",
+                  "root": "result"
+                }
+              ]
+            }
+          },
+          {
+            "expected": {
+              "op": "literal",
+              "value": true
+            },
+            "op": "field_eq_ref",
+            "value": {
+              "op": "any",
+              "values": [
+                {
+                  "op": "not",
+                  "value": {
+                    "left": {
+                      "op": "pointer",
+                      "path": "/iterations",
+                      "root": "result"
+                    },
+                    "op": "eq",
+                    "right": {
+                      "op": "literal",
+                      "value": 0
+                    }
+                  }
+                },
+                {
+                  "left": {
+                    "op": "pointer",
+                    "path": "/l1Delta",
+                    "root": "result"
+                  },
+                  "op": "eq",
+                  "right": {
+                    "op": "literal",
+                    "value": 0
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "expected": {
+              "left": {
+                "op": "pointer",
+                "path": "/l1Delta",
+                "root": "result"
+              },
+              "op": "lt",
+              "right": {
+                "op": "pointer",
+                "path": "/plan/convergenceEpsilon",
+                "root": "request"
+              }
+            },
+            "op": "field_eq_ref",
+            "value": {
+              "op": "pointer",
+              "path": "/converged",
+              "root": "result"
+            }
+          },
+          {
+            "expected": {
+              "op": "literal",
+              "value": true
+            },
+            "op": "field_eq_ref",
+            "value": {
+              "op": "any",
+              "values": [
+                {
+                  "op": "pointer",
+                  "path": "/converged",
+                  "root": "result"
+                },
+                {
+                  "left": {
+                    "op": "pointer",
+                    "path": "/iterations",
+                    "root": "result"
+                  },
+                  "op": "eq",
+                  "right": {
+                    "op": "pointer",
+                    "path": "/plan/maxIterations",
+                    "root": "request"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "requestAssertions": [
+          {
+            "expected": {
+              "op": "literal",
+              "value": true
+            },
+            "op": "field_eq_ref",
+            "value": {
+              "op": "not",
+              "value": {
+                "left": {
+                  "op": "pointer",
+                  "path": "/corpusId",
+                  "root": "request"
+                },
+                "op": "eq",
+                "right": {
+                  "op": "literal",
+                  "value": ""
+                }
+              }
+            }
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/plan/seeds",
+              "root": "request"
+            },
+            "key": {
+              "op": "iteration_pointer",
+              "path": "/nodeId",
+              "scope": "seed"
+            },
+            "op": "unique_by",
+            "scope": "seed"
+          },
+          {
+            "collection": {
+              "op": "pointer",
+              "path": "/plan/seeds",
+              "root": "request"
+            },
+            "op": "for_each",
+            "predicate": {
+              "op": "not",
+              "value": {
+                "left": {
+                  "op": "iteration_pointer",
+                  "path": "/nodeId",
+                  "scope": "seed"
+                },
+                "op": "eq",
+                "right": {
+                  "op": "literal",
+                  "value": ""
+                }
+              }
+            },
+            "scope": "seed"
+          },
+          {
+            "maximum": 1,
+            "minimum": 0,
+            "op": "finite_range",
+            "value": {
+              "op": "pointer",
+              "path": "/plan/teleportProbability",
+              "root": "request"
+            }
+          },
+          {
+            "maximum": 1.7976931348623157e+308,
+            "minimum": 5e-324,
+            "op": "finite_range",
+            "value": {
+              "op": "pointer",
+              "path": "/plan/convergenceEpsilon",
+              "root": "request"
+            }
+          },
+          {
+            "maximum": {
+              "op": "literal",
+              "value": 9007199254740991
+            },
+            "minimum": 1,
+            "op": "safe_integer_range",
+            "value": {
+              "op": "pointer",
+              "path": "/plan/maxIterations",
+              "root": "request"
+            }
+          },
+          {
+            "maximum": {
+              "op": "literal",
+              "value": 9007199254740991
+            },
+            "minimum": 0,
+            "op": "safe_integer_range",
+            "value": {
+              "op": "pointer",
+              "path": "/plan/hubDegreeThreshold",
+              "root": "request"
+            }
+          },
+          {
+            "maximum": {
+              "op": "literal",
+              "value": 9007199254740991
+            },
+            "minimum": 1,
+            "op": "safe_integer_range",
+            "value": {
+              "op": "pointer",
+              "path": "/plan/passageLimit",
+              "root": "request"
+            }
+          },
+          {
+            "maximum": {
+              "op": "literal",
+              "value": 9007199254740991
+            },
+            "minimum": 1,
+            "op": "safe_integer_range",
+            "value": {
+              "op": "pointer",
+              "path": "/plan/entityLimit",
+              "root": "request"
+            }
+          }
+        ],
+        "version": "aira-synapse-refinement-ir@1"
+      },
+      "request": {
+        "fields": {
+          "corpusId": {
+            "kind": "string"
+          },
+          "plan": {
+            "fields": {
+              "convergenceEpsilon": {
+                "kind": "number"
+              },
+              "entityLimit": {
+                "kind": "number"
+              },
+              "hubDegreeThreshold": {
+                "kind": "number"
+              },
+              "maxIterations": {
+                "kind": "number"
+              },
+              "passageLimit": {
+                "kind": "number"
+              },
+              "seeds": {
+                "items": {
+                  "fields": {
+                    "nodeId": {
+                      "kind": "string"
+                    },
+                    "score": {
+                      "kind": "number"
+                    }
+                  },
+                  "kind": "object"
+                },
+                "kind": "array"
+              },
+              "teleportProbability": {
+                "kind": "number"
+              }
+            },
+            "kind": "object"
+          }
+        },
+        "kind": "object"
+      },
+      "result": {
+        "fields": {
+          "converged": {
+            "kind": "boolean"
+          },
+          "iterations": {
+            "kind": "number"
+          },
+          "l1Delta": {
+            "kind": "number"
+          },
+          "rankedFacts": {
+            "items": {
+              "fields": {
+                "fact": {
+                  "dependency": "aira-synapse-domain-contract@1",
+                  "kind": "externalRef",
+                  "referenceKind": "fact"
+                },
+                "nodeId": {
+                  "kind": "string"
+                },
+                "rank": {
+                  "kind": "number"
+                },
+                "score": {
+                  "kind": "number"
+                }
+              },
+              "kind": "object"
+            },
+            "kind": "array"
+          },
+          "rankedPassages": {
+            "items": {
+              "fields": {
+                "nodeId": {
+                  "kind": "string"
+                },
+                "passage": {
+                  "dependency": "aira-synapse-domain-contract@1",
+                  "kind": "externalRef",
+                  "referenceKind": "passage"
+                },
+                "rank": {
+                  "kind": "number"
+                },
+                "score": {
+                  "kind": "number"
+                }
+              },
+              "kind": "object"
+            },
+            "kind": "array"
+          }
+        },
+        "kind": "object"
+      }
+    }
+  },
+  "refinementIrVersion": "aira-synapse-refinement-ir@1",
+  "refinementNodes": {
+    "all": {
+      "fields": {
+        "values": "expression_array_nonempty"
+      },
+      "role": "expression"
+    },
+    "any": {
+      "fields": {
+        "values": "expression_array_nonempty"
+      },
+      "role": "expression"
+    },
+    "array_at": {
+      "fields": {
+        "array": "expression",
+        "index": "expression"
+      },
+      "role": "expression"
+    },
+    "array_length": {
+      "fields": {
+        "value": "expression"
+      },
+      "role": "expression"
+    },
+    "coalesce": {
+      "fields": {
+        "values": "expression_array_nonempty"
+      },
+      "role": "expression"
+    },
+    "concat": {
+      "fields": {
+        "values": "expression_array_nonempty"
+      },
+      "role": "expression"
+    },
+    "corpus_eq_ref": {
+      "fields": {
+        "corpus": "expression",
+        "expected": "expression"
+      },
+      "role": "assertion"
+    },
+    "eq": {
+      "fields": {
+        "left": "expression",
+        "right": "expression"
+      },
+      "role": "expression"
+    },
+    "field_eq_ref": {
+      "fields": {
+        "expected": "expression",
+        "value": "expression"
+      },
+      "role": "assertion"
+    },
+    "finite_range": {
+      "fields": {
+        "maximum": "number",
+        "minimum": "number",
+        "value": "expression"
+      },
+      "role": "assertion"
+    },
+    "for_each": {
+      "fields": {
+        "collection": "expression",
+        "predicate": "expression",
+        "scope": "string"
+      },
+      "role": "assertion"
+    },
+    "iteration_pointer": {
+      "fields": {
+        "path": "json_pointer",
+        "scope": "string"
+      },
+      "role": "expression"
+    },
+    "length_eq": {
+      "fields": {
+        "actual": "expression",
+        "expected": "expression"
+      },
+      "role": "assertion"
+    },
+    "length_lte_ref": {
+      "fields": {
+        "actual": "expression",
+        "limit": "expression"
+      },
+      "role": "assertion"
+    },
+    "literal": {
+      "fields": {
+        "value": "scalar"
+      },
+      "role": "expression"
+    },
+    "lt": {
+      "fields": {
+        "left": "expression",
+        "right": "expression"
+      },
+      "role": "expression"
+    },
+    "lte": {
+      "fields": {
+        "left": "expression",
+        "right": "expression"
+      },
+      "role": "expression"
+    },
+    "map_lookup": {
+      "fields": {
+        "key": "expression",
+        "keyField": "string",
+        "map": "expression",
+        "valueField": "string"
+      },
+      "role": "expression"
+    },
+    "max": {
+      "fields": {
+        "values": "expression_array_nonempty"
+      },
+      "role": "expression"
+    },
+    "multiply": {
+      "fields": {
+        "left": "expression",
+        "right": "expression"
+      },
+      "role": "expression"
+    },
+    "normalize_ref": {
+      "fields": {
+        "dependency": "string",
+        "value": "expression"
+      },
+      "role": "expression"
+    },
+    "not": {
+      "fields": {
+        "value": "expression"
+      },
+      "role": "expression"
+    },
+    "ordered_score_desc_id_asc": {
+      "fields": {
+        "collection": "expression",
+        "id": "expression",
+        "idOrder": "id_order",
+        "scope": "string",
+        "score": "expression"
+      },
+      "role": "assertion"
+    },
+    "pointer": {
+      "fields": {
+        "path": "json_pointer",
+        "root": "root"
+      },
+      "role": "expression"
+    },
+    "prefixed_identity": {
+      "fields": {
+        "identity": "expression",
+        "prefix": "string",
+        "value": "expression"
+      },
+      "role": "assertion"
+    },
+    "rank_is_index_plus_one": {
+      "fields": {
+        "collection": "expression",
+        "rank": "expression",
+        "scope": "string"
+      },
+      "role": "assertion"
+    },
+    "safe_integer_range": {
+      "fields": {
+        "maximum": "expression",
+        "minimum": "number",
+        "value": "expression"
+      },
+      "role": "assertion"
+    },
+    "set_contains": {
+      "fields": {
+        "set": "expression",
+        "value": "expression"
+      },
+      "role": "expression"
+    },
+    "tuple_tags": {
+      "fields": {
+        "actual": "expression",
+        "expected": "string_array",
+        "field": "string"
+      },
+      "role": "assertion"
+    },
+    "unique_by": {
+      "fields": {
+        "collection": "expression",
+        "key": "expression",
+        "scope": "string"
+      },
+      "role": "assertion"
+    }
+  }
+}
