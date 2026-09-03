@@ -278,4 +278,13 @@ marks a base (the first generation from an empty store).
   lineage set together; the old blobs are still on disk because the lineage
   retains them.
 
+- `blob_lineage {basename}` (health) enumerates the lineage *any* published
+  blob file reaches, from headers alone — the owner's authority for what the
+  predecessor generation still needs after a compaction. Enumeration is not
+  verification: payloads are neither read nor hashed; the head's sha256 comes
+  from its published basename, each parent's descriptor from the child
+  header, cross-checked against the parent's header version and length.
+  Missing parents, unsafe or unpublished names, cycles, and over-long chains
+  are errors, never a shorter answer.
+
 Negative tests: `tests/native_delta_vblob.rs`.

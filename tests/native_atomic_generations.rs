@@ -2575,6 +2575,7 @@ fn protocol_info_is_the_method_policy_and_unknown_is_not_a_read() {
     let expected = vec![
         ("ping", "health", false),
         ("protocol_info", "health", false),
+        ("blob_lineage", "health", false),
         ("batch_begin", "transaction", false),
         ("batch_prepare_commit", "transaction", false),
         ("batch_commit", "commit", false),

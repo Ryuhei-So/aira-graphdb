@@ -1219,3 +1219,126 @@ fn compaction_drops_superseded_bytes_of_updated_and_deleted_vectors() {
     assert!(search_ids(&mut native, 12, [1.0, 1.0]).is_empty());
     assert_eq!(native.finish().code(), Some(0));
 }
+
+// ---------------------------------------------------------------------------
+// blob_lineage {basename}: the owner's authority for what a *predecessor*
+// generation reaches (its own file is no longer the committed descriptor, so
+// protocol_info cannot say). Enumeration from headers, not verification.
+// ---------------------------------------------------------------------------
+
+fn blob_lineage(native: &mut NativeProcess, id: u64, basename: &str) -> Value {
+    native.send(json!({"id": id, "method": "blob_lineage", "params": {"basename": basename}}))
+}
+
+#[test]
+fn blob_lineage_is_a_health_method_that_walks_headers_of_any_published_blob() {
+    let db = TempDb::new("blob-lineage");
+    let segments = write_chain(&db, 3);
+    let mut native = NativeProcess::spawn(&db.path);
+    let info = protocol_info(&mut native, 1);
+    let spec = info["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|method| method["name"] == json!("blob_lineage"))
+        .expect("blob_lineage is advertised");
+    assert_eq!(spec["classification"], json!("health"));
+    assert_eq!(spec["wal"], json!(false));
+
+    // Head: same chain protocol_info reports.
+    let head = blob_lineage(&mut native, 2, &segments[2].0);
+    assert_eq!(head["ok"], json!(true), "{head}");
+    assert_eq!(head["result"]["lineage"], info["vectorBlobLineage"]);
+    // Predecessor: g2 → g1, with the descriptors recorded in the headers.
+    let previous = blob_lineage(&mut native, 3, &segments[1].0);
+    assert_eq!(previous["ok"], json!(true), "{previous}");
+    let chain = previous["result"]["lineage"].as_array().unwrap();
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[0]["basename"], json!(segments[1].0));
+    assert_eq!(chain[0]["size"], json!(segments[1].1.len()));
+    assert_eq!(chain[0]["sha256"], json!(sha256_hex(&segments[1].1)));
+    assert_eq!(chain[1]["basename"], json!(segments[0].0));
+    assert_eq!(chain[1]["format"], json!(2));
+    // Base alone.
+    let base = blob_lineage(&mut native, 4, &segments[0].0);
+    assert_eq!(base["result"]["lineage"].as_array().unwrap().len(), 1);
+    assert_eq!(native.finish().code(), Some(0));
+}
+
+#[test]
+fn blob_lineage_rejects_unsafe_missing_or_foreign_files_and_bounded_chains() {
+    let db = TempDb::new("blob-lineage-reject");
+    let segments = write_chain(&db, 2);
+    fs::write(db.dir.join("notes.vblob"), b"not a blob").unwrap();
+    let mut native = NativeProcess::spawn(&db.path);
+    for (label, basename) in [
+        ("path separator", "../escape.vblob"),
+        ("absolute", "/etc/passwd"),
+        (
+            "missing",
+            "state.g00000000000000000009.0000000000000000000000000000000000000000000000000000000000000000.vblob",
+        ),
+        ("not a blob", "notes.vblob"),
+        ("empty", ""),
+    ] {
+        let response = blob_lineage(&mut native, 10, basename);
+        assert_eq!(response["ok"], json!(false), "{label}: {response}");
+    }
+    let missing_params = native.send(json!({"id": 11, "method": "blob_lineage", "params": {}}));
+    assert_eq!(missing_params["ok"], json!(false));
+    // A chain whose parent link points at a missing file is reported as an
+    // error, never as a shorter chain.
+    let ghost = format!("state.g00000000000000000004.{}.vblob", "11".repeat(32));
+    let orphan = encode_v2(
+        5,
+        Some(Parent {
+            basename: &ghost,
+            size: 1,
+            sha256: &"00".repeat(32),
+            format: 2,
+        }),
+        &[],
+    );
+    let orphan_name = blob_basename(5, &orphan);
+    fs::write(db.dir.join(&orphan_name), &orphan).unwrap();
+    let response = blob_lineage(&mut native, 12, &orphan_name);
+    assert_eq!(
+        response["ok"],
+        json!(false),
+        "missing parent must not truncate the chain: {response}"
+    );
+    // Still answers for the intact chain afterwards (health, no state change).
+    assert_eq!(
+        blob_lineage(&mut native, 13, &segments[1].0)["ok"],
+        json!(true)
+    );
+    assert_eq!(native.finish().code(), Some(0));
+}
+
+#[test]
+fn blob_lineage_enumerates_without_hashing_payloads_but_open_still_verifies() {
+    let db = TempDb::new("blob-lineage-enumerate");
+    let segments = write_chain(&db, 2);
+    let mut native = NativeProcess::spawn(&db.path);
+    // Wait until the native has finished opening (it verifies every segment
+    // then), and only then tamper the base payload: enumeration reads headers
+    // only and keeps answering; a fresh open fails closed.
+    assert_eq!(
+        native.send(json!({"id": 0, "method": "ping", "params": {}}))["ok"],
+        json!(true)
+    );
+    let base_path = db.dir.join(&segments[0].0);
+    let mut raw = fs::read(&base_path).unwrap();
+    let last = raw.len() - 1;
+    raw[last] ^= 0x01;
+    fs::write(&base_path, raw).unwrap();
+    let response = blob_lineage(&mut native, 1, &segments[1].0);
+    assert_eq!(
+        response["ok"],
+        json!(true),
+        "enumeration is not verification: {response}"
+    );
+    assert_eq!(response["result"]["lineage"].as_array().unwrap().len(), 2);
+    assert_eq!(native.finish().code(), Some(0));
+    assert_open_fails_closed(&db, "tampered base after enumeration");
+}

@@ -1533,6 +1533,12 @@ const METHOD_SPECS: &[MethodSpec] = &[
         wire_profile: MethodWireProfile::Normal,
     },
     MethodSpec {
+        name: "blob_lineage",
+        classification: "health",
+        wal: false,
+        wire_profile: MethodWireProfile::Normal,
+    },
+    MethodSpec {
         name: "batch_begin",
         classification: "transaction",
         wal: false,
@@ -3244,6 +3250,104 @@ impl Server {
         }
         Self::unresolved_vector_refs_error(&pending)?;
         Ok((lineage, values))
+    }
+
+    /// Largest header format 2 can carry: fixed fields plus a u16-length
+    /// parent basename. Enumeration reads at most this prefix per file.
+    const VECTOR_BLOB_HEADER_MAX_BYTES: usize = 4 + 2 + 8 + 2 + u16::MAX as usize + 8 + 32 + 2;
+
+    /// Enumerate the lineage any published blob file reaches, from headers
+    /// alone (#482 owner reclamation for the predecessor generation). This is
+    /// enumeration, not verification: payloads are neither read nor hashed,
+    /// which keeps a 7 GB base at header cost. The head's own sha256 comes
+    /// from its published basename; each parent's descriptor comes from the
+    /// child header that named it, cross-checked against the parent's header
+    /// version and file length. Missing parents, unsafe or unpublished names,
+    /// cycles, non-decreasing generations, and over-long chains are errors —
+    /// never a shorter answer.
+    fn enumerate_blob_lineage(&self, basename: &str) -> io::Result<Vec<VectorBlobDescriptor>> {
+        let db_path = self.require_db_path()?;
+        let directory = Self::parent_dir(db_path);
+        Self::validate_blob_basename(basename)?;
+        let head_sha256 = Self::published_blob_sha256(basename)
+            .ok_or_else(|| io::Error::other("blob_lineage requires a published blob basename"))?;
+        let (head_len, head_header) = Self::read_blob_header_prefix(&directory.join(basename))?;
+        let mut lineage = vec![VectorBlobDescriptor {
+            basename: basename.to_string(),
+            size: head_len,
+            sha256: head_sha256,
+            format: head_header.version,
+        }];
+        let mut seen = HashSet::from([basename.to_string()]);
+        let mut child_generation = head_header.generation;
+        let mut next = head_header.parent;
+        while let Some(parent) = next.take() {
+            if lineage.len() >= Self::MAX_VECTOR_BLOB_LINEAGE {
+                return Err(io::Error::other(format!(
+                    "vector blob lineage exceeds {} segments",
+                    Self::MAX_VECTOR_BLOB_LINEAGE
+                )));
+            }
+            Self::validate_blob_basename(&parent.basename)?;
+            if !seen.insert(parent.basename.clone()) {
+                return Err(io::Error::other(
+                    "vector blob lineage references the same segment twice",
+                ));
+            }
+            let (parent_len, parent_header) =
+                Self::read_blob_header_prefix(&directory.join(&parent.basename))?;
+            if parent_len != parent.size || parent_header.version != parent.format {
+                return Err(io::Error::other(
+                    "vector blob parent header does not match the link that named it",
+                ));
+            }
+            match (parent_header.generation, child_generation) {
+                (Some(generation), Some(child)) if generation >= child => {
+                    return Err(io::Error::other(
+                        "vector blob parent generation is not below its child",
+                    ));
+                }
+                _ => {}
+            }
+            if parent_header.generation.is_some() {
+                child_generation = parent_header.generation;
+            }
+            next = parent_header.parent;
+            lineage.push(parent);
+        }
+        Ok(lineage)
+    }
+
+    /// The sha256 a published blob carries in its own basename
+    /// (`<stem>.g<20 digits>.<64 hex>.vblob`), or None for any other name.
+    fn published_blob_sha256(basename: &str) -> Option<String> {
+        let stem = basename.strip_suffix(".vblob")?;
+        let (rest, digest) = stem.rsplit_once('.')?;
+        let (_, generation) = rest.rsplit_once(".g")?;
+        if generation.len() != 20 || !generation.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return None;
+        }
+        Some(digest.to_string())
+    }
+
+    /// Read only the header prefix of a blob file and return its length and
+    /// parsed header.
+    fn read_blob_header_prefix(path: &Path) -> io::Result<(u64, VectorBlobHeader)> {
+        let mut file = Self::open_regular_nofollow(path)
+            .map_err(|err| io::Error::other(format!("open vector blob failed: {err}")))?;
+        let len = file.metadata()?.len();
+        let mut prefix = Vec::with_capacity(Self::VECTOR_BLOB_HEADER_MAX_BYTES.min(len as usize));
+        file.take(Self::VECTOR_BLOB_HEADER_MAX_BYTES as u64)
+            .read_to_end(&mut prefix)?;
+        let header = Self::parse_blob_header(&prefix)?;
+        Ok((len, header))
     }
 
     fn load_vector_values(
@@ -5939,6 +6043,21 @@ impl Server {
             }
             match req.method.as_str() {
                 "ping" => Ok(json!({"pong": true})),
+                "blob_lineage" => {
+                    let basename = req
+                        .params
+                        .get("basename")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            Self::execution_client_error(
+                                "blob_lineage requires a basename string".to_string(),
+                            )
+                        })?;
+                    let lineage = self.enumerate_blob_lineage(basename).map_err(|err| {
+                        Self::execution_client_error(format!("blob_lineage failed: {err}"))
+                    })?;
+                    Ok(json!({ "lineage": lineage }))
+                }
                 "protocol_info" => {
                     let descriptor_handshake = match &self.access_mode {
                         AccessMode::DescriptorReadOnly(handshake) => Some(handshake),
@@ -9042,6 +9161,7 @@ mod tests {
         let expected = [
             "ping",
             "protocol_info",
+            "blob_lineage",
             "batch_begin",
             "batch_prepare_commit",
             "batch_commit",
