@@ -1410,6 +1410,11 @@ struct Server {
     vector_values: HashMap<String, Vec<f64>>,
     /// Committed descriptor first, base last. Empty at generation zero.
     vector_blob_lineage: Vec<VectorBlobDescriptor>,
+    /// Compactions published by this process and why the last one fired;
+    /// surfaced through protocol_info so a "compacts every commit" regime is
+    /// visible without reading stderr.
+    vector_blob_compactions: u64,
+    last_compaction_reason: Option<&'static str>,
     cache_dirty: bool,
     transaction: TransactionState,
     wal_path: Option<PathBuf>,
@@ -1839,9 +1844,56 @@ impl Server {
     const COMPACT_AT_LINEAGE_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 
     /// The one decision behind compaction, kept pure so both axes are unit
-    /// tested without publishing gigabytes.
-    fn lineage_needs_compaction(segments: usize, bytes: u64) -> bool {
-        segments >= Self::COMPACT_AT_LINEAGE_SEGMENTS || bytes >= Self::COMPACT_AT_LINEAGE_BYTES
+    /// tested without publishing gigabytes. The byte axis fires only when
+    /// compaction would actually reclaim something (at least one eighth of
+    /// the live bytes): a live set that alone exceeds the threshold cannot be
+    /// shrunk, and rewriting it on every commit would silently reinstate the
+    /// full-blob cost this layout exists to remove.
+    fn compaction_reason(
+        segments: usize,
+        lineage_bytes: u64,
+        live_bytes: u64,
+        compact_at_bytes: u64,
+    ) -> Option<&'static str> {
+        if segments >= Self::COMPACT_AT_LINEAGE_SEGMENTS {
+            return Some("segments");
+        }
+        let reclaimable = lineage_bytes.saturating_sub(live_bytes);
+        if lineage_bytes >= compact_at_bytes && reclaimable >= live_bytes / 8 {
+            return Some("bytes");
+        }
+        None
+    }
+
+    /// Debug-only, lower-only override of a byte limit so tests can drive the
+    /// byte axis end to end with kilobytes. A release binary ignores the
+    /// environment entirely; a debug binary can only tighten, never loosen.
+    fn bounded_test_override(default: u64, variable: &str) -> u64 {
+        #[cfg(debug_assertions)]
+        {
+            if let Some(value) = std::env::var(variable)
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+            {
+                return value.min(default);
+            }
+        }
+        let _ = variable;
+        default
+    }
+
+    fn effective_compact_at_lineage_bytes() -> u64 {
+        Self::bounded_test_override(
+            Self::COMPACT_AT_LINEAGE_BYTES,
+            "AGDB_NATIVE_TEST_COMPACT_AT_LINEAGE_BYTES",
+        )
+    }
+
+    fn effective_max_vector_blob_lineage_bytes() -> u64 {
+        Self::bounded_test_override(
+            Self::MAX_VECTOR_BLOB_LINEAGE_BYTES,
+            "AGDB_NATIVE_TEST_MAX_VECTOR_BLOB_LINEAGE_BYTES",
+        )
     }
     const WAL_VERSION: u16 = 2;
 
@@ -2012,6 +2064,8 @@ impl Server {
             state,
             vector_values,
             vector_blob_lineage,
+            vector_blob_compactions: 0,
+            last_compaction_reason: None,
             cache_dirty: true,
             transaction: TransactionState::Idle,
             fatal: false,
@@ -2773,21 +2827,17 @@ impl Server {
     fn stream_vector_blob_temp(
         db_path: &Path,
         segment_generation: u64,
-        parent: Option<&VectorBlobDescriptor>,
-        delta_keys: &[&String],
-        vectors: &HashMap<String, VectorRecord>,
-        vector_values: &HashMap<String, Vec<f64>>,
+        header: &[u8],
+        publish: &[(&String, &[f64])],
+        expected_bytes: u64,
         progress: &mut dyn CommitProgress,
     ) -> io::Result<(PathBuf, ArtifactEvidence, HashMap<String, VectorBlobRef>)> {
-        let header = Self::encode_blob_header(segment_generation, parent)?;
-        let total_units = u64::try_from(delta_keys.len())
+        let total_units = u64::try_from(publish.len())
             .map_err(|_| io::Error::other("vector count does not fit progress counter"))?;
         progress.enter_phase("prepare_refs", 0, Some(total_units), 0, None)?;
         let mut offset = 0u64;
-        let mut refs = HashMap::with_capacity(delta_keys.len());
-        for (index, key) in delta_keys.iter().enumerate() {
-            let vector = &vectors[*key];
-            let values = vector_values.get(*key).unwrap_or(&vector.values);
+        let mut refs = HashMap::with_capacity(publish.len());
+        for (index, (key, values)) in publish.iter().enumerate() {
             let len = u32::try_from(values.len())
                 .map_err(|_| io::Error::other("vector dimensions exceed u32"))?;
             refs.insert(
@@ -2814,18 +2864,21 @@ impl Server {
         let total_bytes = header_bytes
             .checked_add(offset)
             .ok_or_else(|| io::Error::other("vector blob size overflow"))?;
+        if total_bytes != expected_bytes {
+            return Err(io::Error::other(
+                "vector segment size does not match the validated publish set",
+            ));
+        }
         let (tmp_path, mut file) = Self::create_streaming_temp(db_path, "blob_temp_sync")?;
         let result = (|| {
             progress.enter_phase("vector_write", 0, Some(total_units), 0, Some(total_bytes))?;
             Self::durability_failpoint("before_blob_temp_sync_write")?;
             let bounded = bounded_publication_writer(&mut file, "blob_publication");
             let mut writer = buffered_artifact_writer(bounded);
-            writer.write_all(&header)?;
+            writer.write_all(header)?;
             let mut completed_bytes = header_bytes;
-            for (index, key) in delta_keys.iter().enumerate() {
-                let vector = &vectors[*key];
-                let values = vector_values.get(*key).unwrap_or(&vector.values);
-                for value in values {
+            for (index, (_, values)) in publish.iter().enumerate() {
+                for value in values.iter() {
                     writer.write_all(&value.to_le_bytes())?;
                 }
                 completed_bytes = completed_bytes
@@ -2840,6 +2893,11 @@ impl Server {
                 )?;
             }
             let evidence = writer.finish()?;
+            if evidence.bytes != total_bytes {
+                return Err(io::Error::other(
+                    "vector segment bytes written diverged from the validated size",
+                ));
+            }
             progress.enter_phase(
                 "vector_sync",
                 total_units,
@@ -3198,14 +3256,12 @@ impl Server {
                     Self::MAX_VECTOR_BLOB_LINEAGE
                 )));
             }
+            let ceiling = Self::effective_max_vector_blob_lineage_bytes();
             total_bytes = total_bytes
                 .checked_add(descriptor.size)
-                .filter(|total| *total <= Self::MAX_VECTOR_BLOB_LINEAGE_BYTES)
+                .filter(|total| *total <= ceiling)
                 .ok_or_else(|| {
-                    io::Error::other(format!(
-                        "vector blob lineage exceeds {} bytes",
-                        Self::MAX_VECTOR_BLOB_LINEAGE_BYTES
-                    ))
+                    io::Error::other(format!("vector blob lineage exceeds {ceiling} bytes"))
                 })?;
             Self::validate_blob_basename(&descriptor.basename)?;
             if !seen.insert(descriptor.basename.clone()) {
@@ -3340,7 +3396,7 @@ impl Server {
     /// Read only the header prefix of a blob file and return its length and
     /// parsed header.
     fn read_blob_header_prefix(path: &Path) -> io::Result<(u64, VectorBlobHeader)> {
-        let mut file = Self::open_regular_nofollow(path)
+        let file = Self::open_regular_nofollow(path)
             .map_err(|err| io::Error::other(format!("open vector blob failed: {err}")))?;
         let len = file.metadata()?.len();
         let mut prefix = Vec::with_capacity(Self::VECTOR_BLOB_HEADER_MAX_BYTES.min(len as usize));
@@ -3632,6 +3688,8 @@ impl Server {
             state,
             vector_values,
             vector_blob_lineage,
+            vector_blob_compactions: 0,
+            last_compaction_reason: None,
             cache_dirty: true,
             transaction: TransactionState::Idle,
             wal_path: None,
@@ -3834,6 +3892,12 @@ impl Server {
         supplied_evidence: &PreparedCommitEvidence,
         progress: &mut dyn CommitProgress,
     ) -> io::Result<DurableGenerationToken> {
+        #[cfg(debug_assertions)]
+        if let Ok(key) = std::env::var("AGDB_NATIVE_TEST_DROP_VECTOR_VALUE") {
+            // Test seam for the equivalence guard: simulate a carried vector
+            // whose values are missing from the live set.
+            self.vector_values.remove(&key);
+        }
         let start = std::time::Instant::now();
         let current_generation = self.state.generation;
         let (prepared_evidence, prepared_identity) = match &self.transaction {
@@ -3898,19 +3962,15 @@ impl Server {
         // vectors written since the last publication (no blobRef yet) are
         // streamed; every other reference is carried forward unchanged.
         // Once the lineage reaches a compaction threshold the parent is cut
-        // instead and every live vector is streamed into a new base.
+        // instead and every live vector is streamed into a new base — but
+        // only after the live set has been proven equivalent to what the
+        // lineage holds, because the old chain is reclaimed one generation
+        // later and a silent loss here would be unrecoverable.
         let lineage_bytes = self
             .vector_blob_lineage
             .iter()
             .try_fold(0u64, |total, descriptor| total.checked_add(descriptor.size))
             .ok_or_else(|| io::Error::other("vector blob lineage byte total overflow"))?;
-        let compacting = self.state.vector_blob.is_some()
-            && Self::lineage_needs_compaction(self.vector_blob_lineage.len(), lineage_bytes);
-        let segment_parent = if compacting {
-            None
-        } else {
-            self.state.vector_blob.clone()
-        };
         if self.state.vector_blob.is_some() {
             match self.vector_blob_lineage.first() {
                 Some(head) if Some(head) == self.state.vector_blob.as_ref() => {}
@@ -3921,29 +3981,123 @@ impl Server {
                 }
             }
         }
-        if segment_parent.is_some() {
-            if self.vector_blob_lineage.len() >= Self::MAX_VECTOR_BLOB_LINEAGE {
-                return Err(io::Error::other(format!(
-                    "vector blob lineage is exhausted at {} segments; compaction is required before another generation can be published",
-                    Self::MAX_VECTOR_BLOB_LINEAGE
-                )));
-            }
+        let f64_bytes = std::mem::size_of::<f64>() as u64;
+        let mut live_bytes = 0u64;
+        for (key, vector) in &self.state.vectors {
+            let len = match &vector.blob_ref {
+                Some(blob_ref) => blob_ref.len as u64,
+                None => self
+                    .vector_values
+                    .get(key)
+                    .map(|values| values.len() as u64)
+                    .unwrap_or(vector.values.len() as u64),
+            };
+            live_bytes = live_bytes
+                .checked_add(len * f64_bytes)
+                .ok_or_else(|| io::Error::other("live vector byte total overflow"))?;
         }
-        let mut delta_keys: Vec<&String> = self
+        let compaction_reason = if self.state.vector_blob.is_some() {
+            Self::compaction_reason(
+                self.vector_blob_lineage.len(),
+                lineage_bytes,
+                live_bytes,
+                Self::effective_compact_at_lineage_bytes(),
+            )
+        } else {
+            None
+        };
+        let compacting = compaction_reason.is_some();
+        let segment_parent = if compacting {
+            None
+        } else {
+            self.state.vector_blob.clone()
+        };
+        if segment_parent.is_some()
+            && self.vector_blob_lineage.len() >= Self::MAX_VECTOR_BLOB_LINEAGE
+        {
+            return Err(io::Error::other(format!(
+                "vector blob lineage is exhausted at {} segments; compaction is required before another generation can be published",
+                Self::MAX_VECTOR_BLOB_LINEAGE
+            )));
+        }
+        // The publish set: every live vector when compacting, otherwise only
+        // the vectors without a blob reference. Each entry's values must be
+        // present and, for a carried vector, exactly the length its reference
+        // promises; nothing is ever emitted as an empty payload.
+        let mut publish_keys: Vec<&String> = self
             .state
             .vectors
             .iter()
-            .filter(|(_, vector)| segment_parent.is_none() || vector.blob_ref.is_none())
+            .filter(|(_, vector)| compacting || vector.blob_ref.is_none())
             .map(|(key, _)| key)
             .collect();
-        delta_keys.sort_unstable();
+        publish_keys.sort_unstable();
+        let mut publish: Vec<(&String, &[f64])> = Vec::with_capacity(publish_keys.len());
+        let mut publish_bytes = 0u64;
+        for key in publish_keys {
+            let vector = &self.state.vectors[key];
+            let values: &[f64] = match (self.vector_values.get(key), &vector.blob_ref) {
+                (Some(values), Some(blob_ref)) => {
+                    if values.len() as u64 != blob_ref.len as u64 {
+                        return Err(io::Error::other(format!(
+                            "compaction cannot prove equivalence: vector {key} has {} live values but its reference promises {}",
+                            values.len(),
+                            blob_ref.len
+                        )));
+                    }
+                    values
+                }
+                (None, Some(_)) => {
+                    return Err(io::Error::other(format!(
+                        "compaction cannot prove equivalence: vector {key} has no live values"
+                    )));
+                }
+                (Some(values), None) => values,
+                (None, None) if !vector.values.is_empty() => &vector.values,
+                (None, None) => {
+                    return Err(io::Error::other(format!(
+                        "vector {key} has no values to publish"
+                    )));
+                }
+            };
+            publish_bytes = publish_bytes
+                .checked_add(values.len() as u64 * f64_bytes)
+                .ok_or_else(|| io::Error::other("vector segment byte total overflow"))?;
+            publish.push((key, values));
+        }
+        if compacting && (publish.len() != self.state.vectors.len() || publish_bytes != live_bytes)
+        {
+            return Err(io::Error::other(
+                "compaction cannot prove equivalence: publish set does not match the live set",
+            ));
+        }
+        let header = Self::encode_blob_header(next_generation, segment_parent.as_ref())?;
+        let segment_bytes = (header.len() as u64)
+            .checked_add(publish_bytes)
+            .ok_or_else(|| io::Error::other("vector segment size overflow"))?;
+        // The generation being published must remain loadable: the lineage
+        // the next open walks (this segment plus, for a delta, everything it
+        // chains onto) is checked against the load ceiling before a byte is
+        // written, so a commit can never publish what open would refuse.
+        let ceiling = Self::effective_max_vector_blob_lineage_bytes();
+        let projected_lineage_bytes = if compacting {
+            segment_bytes
+        } else {
+            lineage_bytes
+                .checked_add(segment_bytes)
+                .ok_or_else(|| io::Error::other("vector blob lineage byte total overflow"))?
+        };
+        if projected_lineage_bytes > ceiling {
+            return Err(io::Error::other(format!(
+                "publishing this generation would leave a {projected_lineage_bytes}-byte lineage above the {ceiling}-byte load ceiling"
+            )));
+        }
         let (blob_tmp, blob_evidence, delta_vector_refs) = Self::stream_vector_blob_temp(
             db_path,
             next_generation,
-            segment_parent.as_ref(),
-            &delta_keys,
-            &self.state.vectors,
-            &self.vector_values,
+            &header,
+            &publish,
+            segment_bytes,
             progress,
         )?;
         let segment_vectors = delta_vector_refs.len();
@@ -4057,6 +4211,8 @@ impl Server {
         self.state.commit_evidence = Some(stored_commit_evidence.clone());
         if compacting {
             self.vector_blob_lineage.clear();
+            self.vector_blob_compactions = self.vector_blob_compactions.saturating_add(1);
+            self.last_compaction_reason = compaction_reason;
         }
         self.vector_blob_lineage.insert(0, blob_descriptor.clone());
         for (key, blob_ref) in prepared_vector_refs {
@@ -4075,10 +4231,11 @@ impl Server {
         progress.enter_phase("complete", 0, None, 0, None)?;
         let total_ms = start.elapsed().as_millis();
         eprintln!(
-            "[persist] generation={} blobBytes={} blobSha256={} segmentVectors={segment_vectors} compacted={compacting} lineageSegments={} jsonBytes={} elapsedMs={total_ms}",
+            "[persist] generation={} blobBytes={} blobSha256={} segmentVectors={segment_vectors} compacted={compacting} compactionReason={} lineageSegments={} jsonBytes={} elapsedMs={total_ms}",
             next_generation,
             blob_descriptor.size,
             blob_descriptor.sha256,
+            compaction_reason.unwrap_or("none"),
             self.vector_blob_lineage.len(),
             json_bytes,
         );
@@ -6089,6 +6246,10 @@ impl Server {
                         // Committed descriptor first, base last: the exact
                         // set of blob files this generation depends on.
                         "vectorBlobLineage": self.vector_blob_lineage,
+                        "vectorBlobCompactions": {
+                            "count": self.vector_blob_compactions,
+                            "lastReason": self.last_compaction_reason,
+                        },
                         "state": match &self.transaction {
                             TransactionState::RecoveryPending { .. } => "recoveryPending",
                             TransactionState::Active { .. } => "active",
@@ -6122,9 +6283,9 @@ impl Server {
                                 "writeFormat": Self::VECTOR_BLOB_VERSION,
                                 "baseFormat": Self::VECTOR_BLOB_VERSION_BASE,
                                 "maxLineage": Self::MAX_VECTOR_BLOB_LINEAGE,
-                                "maxLineageBytes": Self::MAX_VECTOR_BLOB_LINEAGE_BYTES,
+                                "maxLineageBytes": Self::effective_max_vector_blob_lineage_bytes(),
                                 "compactAtSegments": Self::COMPACT_AT_LINEAGE_SEGMENTS,
-                                "compactAtLineageBytes": Self::COMPACT_AT_LINEAGE_BYTES,
+                                "compactAtLineageBytes": Self::effective_compact_at_lineage_bytes(),
                             },
                             "indexingMemory": {
                                 "schema": INDEXING_MEMORY_PROTOCOL_SCHEMA,
@@ -7869,10 +8030,30 @@ mod tests {
     fn lineage_compaction_triggers_on_either_axis_and_below_the_ceilings() {
         let segments = Server::COMPACT_AT_LINEAGE_SEGMENTS;
         let bytes = Server::COMPACT_AT_LINEAGE_BYTES;
-        assert!(!Server::lineage_needs_compaction(segments - 1, bytes - 1));
-        assert!(Server::lineage_needs_compaction(segments, bytes - 1));
-        assert!(Server::lineage_needs_compaction(1, bytes));
-        assert!(Server::lineage_needs_compaction(segments, bytes));
+        let live = bytes / 2;
+        assert_eq!(
+            Server::compaction_reason(segments - 1, bytes - 1, live, bytes),
+            None
+        );
+        assert_eq!(
+            Server::compaction_reason(segments, bytes - 1, live, bytes),
+            Some("segments")
+        );
+        assert_eq!(
+            Server::compaction_reason(1, bytes, live, bytes),
+            Some("bytes")
+        );
+        assert_eq!(
+            Server::compaction_reason(segments, bytes, live, bytes),
+            Some("segments")
+        );
+        // A live set that alone exceeds the threshold cannot be shrunk: no
+        // byte-axis compaction, so no full rewrite on every commit.
+        assert_eq!(Server::compaction_reason(1, bytes + 16, bytes, bytes), None);
+        assert_eq!(
+            Server::compaction_reason(1, bytes + bytes / 8, bytes, bytes),
+            Some("bytes")
+        );
         assert!(segments < Server::MAX_VECTOR_BLOB_LINEAGE);
         assert!(bytes < Server::MAX_VECTOR_BLOB_LINEAGE_BYTES);
     }
