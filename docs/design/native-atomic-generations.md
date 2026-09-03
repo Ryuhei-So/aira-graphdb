@@ -257,9 +257,15 @@ marks a base (the first generation from an empty store).
   closed before a single vector is decoded. Segments are decoded one at a
   time and dropped, so peak memory is one segment plus the decoded vectors,
   never the whole lineage.
-- Publication refuses to extend a lineage already at the bound. Compaction
-  (publishing a parentless full segment) is a separate change; until it lands
-  the bound is the only ceiling, and it fails closed rather than growing.
+- **Compaction.** Once a lineage has reached `COMPACT_AT_LINEAGE_SEGMENTS`
+  segments or `COMPACT_AT_LINEAGE_BYTES` bytes (both strictly below the
+  fail-closed ceilings, checked at compile time), the next commit cuts the
+  parent link and streams every live vector into a new parentless base, so
+  the chain never approaches the ceilings and bytes superseded by updates or
+  deletes stop being carried. Compaction never deletes: the old chain becomes
+  unreachable and the owner's lineage-aware reclamation removes it. A
+  hand-built lineage at the count ceiling is recovered the same way rather
+  than refused. `protocol_info.limits.vectorBlob` reports both thresholds.
 - `protocol_info` reports `vectorBlobLineage` (descriptor first, base last)
   and `limits.vectorBlob`. Reclamation must retain every basename in the
   lineage; the previous "generation and its predecessor" rule would delete

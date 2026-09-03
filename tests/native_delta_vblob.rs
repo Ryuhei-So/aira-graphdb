@@ -677,7 +677,7 @@ fn lineage_at_the_limit_opens_and_one_over_the_limit_fails_closed() {
 }
 
 #[test]
-fn commit_at_the_lineage_limit_fails_closed_without_publishing() {
+fn commit_at_the_lineage_limit_compacts_instead_of_refusing() {
     let probe = TempDb::new("commit-limit-probe");
     seed(&probe);
     let mut native = NativeProcess::spawn(&probe.path);
@@ -686,9 +686,11 @@ fn commit_at_the_lineage_limit_fails_closed_without_publishing() {
         .unwrap();
     assert_eq!(native.finish().code(), Some(0));
 
+    // A lineage at the ceiling can only be hand-built (compaction fires far
+    // earlier), but if one exists the next commit must still recover it by
+    // folding into a base rather than refusing forever.
     let db = TempDb::new("commit-limit");
     write_chain(&db, limit);
-    let json_before = fs::read(&db.path).unwrap();
     let blobs_before = db.blob_paths();
     let mut native = NativeProcess::spawn(&db.path);
     assert_eq!(native.send(batch_begin(0))["ok"], json!(true));
@@ -699,12 +701,25 @@ fn commit_at_the_lineage_limit_fails_closed_without_publishing() {
     let commit = native.commit(2);
     assert_eq!(
         commit["ok"],
-        json!(false),
-        "commit must refuse to extend an exhausted lineage"
+        json!(true),
+        "commit at the ceiling compacts: {commit}"
     );
-    assert_eq!(fs::read(&db.path).unwrap(), json_before);
-    assert_eq!(db.blob_paths(), blobs_before, "no segment may be published");
-    drop(native);
+    assert_eq!(
+        protocol_info(&mut native, 4)["vectorBlobLineage"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(native.finish().code(), Some(0));
+    let (_, _, parent, payload) = decode_header(&fs::read(db.descriptor_path()).unwrap());
+    assert!(parent.is_none());
+    assert_eq!(payload, 2 * 2 * 8);
+    assert_eq!(
+        db.blob_paths().len(),
+        blobs_before.len() + 1,
+        "exactly one new base, nothing deleted"
+    );
 }
 
 #[test]
@@ -1041,4 +1056,166 @@ fn descriptor_mode_rejects_a_chained_segment_and_accepts_a_parentless_one() {
     );
     drop(stdin);
     assert_eq!(child.wait().unwrap().code(), Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// Compaction (packet §8 test 6): once a lineage has reached the compaction
+// threshold, the next commit folds it into one parentless segment holding
+// every live vector, so the chain never approaches the fail-closed ceiling and
+// bytes superseded by updates or deletes become reclaimable.
+// ---------------------------------------------------------------------------
+
+fn compaction_limits() -> (u64, u64, u64) {
+    let probe = TempDb::new("compaction-probe");
+    seed(&probe);
+    let mut native = NativeProcess::spawn(&probe.path);
+    let limits = protocol_info(&mut native, 1)["limits"]["vectorBlob"].clone();
+    assert_eq!(native.finish().code(), Some(0));
+    let compact_at = limits["compactAtSegments"]
+        .as_u64()
+        .expect("compactAtSegments");
+    let max_lineage = limits["maxLineage"].as_u64().expect("maxLineage");
+    let compact_at_bytes = limits["compactAtLineageBytes"]
+        .as_u64()
+        .expect("compactAtLineageBytes");
+    let max_bytes = limits["maxLineageBytes"].as_u64().expect("maxLineageBytes");
+    assert!(
+        compact_at >= 2 && compact_at < max_lineage,
+        "compaction must trigger before the ceiling"
+    );
+    assert!(
+        compact_at_bytes < max_bytes,
+        "byte compaction must trigger before the byte ceiling"
+    );
+    (compact_at, max_lineage, compact_at_bytes)
+}
+
+#[test]
+fn a_commit_over_a_lineage_at_the_segment_threshold_publishes_a_parentless_full_segment() {
+    let (compact_at, _, _) = compaction_limits();
+    let db = TempDb::new("compaction-trigger");
+    // A lineage that has reached the threshold: compact_at segments, base at
+    // generation 1 holding c1:v1. The next commit must fold it.
+    write_chain(&db, compact_at);
+    let old_paths = db.blob_paths();
+    let mut native = NativeProcess::spawn(&db.path);
+    assert_eq!(native.send(batch_begin(0))["ok"], json!(true));
+    assert_eq!(
+        native.send(vector_upsert(1, "v2", "d2", [0.0, 1.0]))["ok"],
+        json!(true)
+    );
+    let commit = native.commit(2);
+    assert_eq!(
+        commit["ok"],
+        json!(true),
+        "compacting commit failed: {commit}"
+    );
+    let generation = commit["result"]["generation"].as_u64().unwrap();
+    assert_eq!(generation, compact_at + 1);
+    let lineage = protocol_info(&mut native, 4)["vectorBlobLineage"].clone();
+    assert_eq!(
+        lineage.as_array().unwrap().len(),
+        1,
+        "lineage collapses to the new base"
+    );
+    assert_eq!(native.finish().code(), Some(0));
+
+    let state = db.state();
+    let head_raw = fs::read(db.descriptor_path()).unwrap();
+    let (version, segment_generation, parent, payload) = decode_header(&head_raw);
+    assert_eq!(
+        (version, segment_generation, parent),
+        (2, Some(generation), None),
+        "parentless base"
+    );
+    assert_eq!(
+        payload,
+        2 * 2 * 8,
+        "every vector (v1 from the old base, v2 new) is in the new base"
+    );
+    assert_eq!(
+        state["vectors"]["c1:v1"]["blobRef"]["gen"],
+        json!(generation),
+        "old refs are rewritten"
+    );
+    assert_eq!(
+        state["vectors"]["c1:v2"]["blobRef"]["gen"],
+        json!(generation)
+    );
+    for path in &old_paths {
+        assert!(
+            path.exists(),
+            "compaction never deletes: reclamation is the owner's job"
+        );
+    }
+
+    // The old chain is now unreachable: remove it wholesale and reopen.
+    for path in old_paths {
+        fs::remove_file(path).unwrap();
+    }
+    let mut native = NativeProcess::spawn(&db.path);
+    assert_eq!(search_ids(&mut native, 10, [1.0, 0.0]), vec!["v1"]);
+    assert_eq!(search_ids(&mut native, 11, [0.0, 1.0]), vec!["v2"]);
+    assert_eq!(native.finish().code(), Some(0));
+}
+
+#[test]
+fn a_commit_that_only_reaches_the_segment_threshold_still_publishes_a_delta() {
+    let (compact_at, _, _) = compaction_limits();
+    let db = TempDb::new("compaction-below");
+    write_chain(&db, compact_at - 1);
+    let mut native = NativeProcess::spawn(&db.path);
+    assert_eq!(native.send(batch_begin(0))["ok"], json!(true));
+    assert_eq!(
+        native.send(vector_upsert(1, "v2", "d2", [0.0, 1.0]))["ok"],
+        json!(true)
+    );
+    let commit = native.commit(2);
+    assert_eq!(commit["ok"], json!(true));
+    let lineage = protocol_info(&mut native, 4)["vectorBlobLineage"].clone();
+    assert_eq!(
+        lineage.as_array().unwrap().len() as u64,
+        compact_at,
+        "reaches, but does not yet fold"
+    );
+    assert_eq!(native.finish().code(), Some(0));
+    let (_, _, parent, payload) = decode_header(&fs::read(db.descriptor_path()).unwrap());
+    assert!(parent.is_some(), "still a delta segment");
+    assert_eq!(payload, 2 * 8);
+}
+
+#[test]
+fn compaction_drops_superseded_bytes_of_updated_and_deleted_vectors() {
+    let (compact_at, _, _) = compaction_limits();
+    let db = TempDb::new("compaction-garbage");
+    write_chain(&db, compact_at);
+    let mut native = NativeProcess::spawn(&db.path);
+    assert_eq!(native.send(batch_begin(0))["ok"], json!(true));
+    // Update v1 (old bytes become garbage) and add then delete v3.
+    assert_eq!(
+        native.send(vector_upsert(1, "v1", "d1", [0.0, 1.0]))["ok"],
+        json!(true)
+    );
+    assert_eq!(
+        native.send(vector_upsert(2, "v3", "d3", [1.0, 1.0]))["ok"],
+        json!(true)
+    );
+    assert_eq!(
+        native.send(vector_delete_by_document(3, "d3"))["ok"],
+        json!(true)
+    );
+    assert_eq!(native.commit(4)["ok"], json!(true));
+    assert_eq!(native.finish().code(), Some(0));
+    let (_, _, parent, payload) = decode_header(&fs::read(db.descriptor_path()).unwrap());
+    assert!(parent.is_none());
+    assert_eq!(
+        payload,
+        2 * 8,
+        "only the live v1 remains; no stale or deleted bytes"
+    );
+    let mut native = NativeProcess::spawn(&db.path);
+    assert_eq!(search_ids(&mut native, 10, [0.0, 1.0]), vec!["v1"]);
+    assert!(search_ids(&mut native, 11, [1.0, 0.0]).is_empty());
+    assert!(search_ids(&mut native, 12, [1.0, 1.0]).is_empty());
+    assert_eq!(native.finish().code(), Some(0));
 }

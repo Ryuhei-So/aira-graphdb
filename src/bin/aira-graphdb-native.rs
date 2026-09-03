@@ -1800,6 +1800,10 @@ impl CrashTracker {
     }
 }
 
+// Compaction must always fire before either fail-closed lineage ceiling.
+const _: () = assert!(Server::COMPACT_AT_LINEAGE_SEGMENTS < Server::MAX_VECTOR_BLOB_LINEAGE);
+const _: () = assert!(Server::COMPACT_AT_LINEAGE_BYTES < Server::MAX_VECTOR_BLOB_LINEAGE_BYTES);
+
 impl Server {
     const VECTOR_BLOB_MAGIC: &'static [u8; 4] = b"AGVB";
     /// Layout every generation publishes: a segment holding only the vectors
@@ -1820,6 +1824,19 @@ impl Server {
     /// descriptors before any segment is read, so a forged or runaway chain
     /// fails closed instead of exhausting memory on open.
     const MAX_VECTOR_BLOB_LINEAGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+    /// Compaction thresholds: once a lineage reaches either, the next commit
+    /// publishes a parentless segment holding every live vector instead of a
+    /// delta, so the chain never approaches the fail-closed ceilings above and
+    /// bytes superseded by updates or deletes become reclaimable. Both sit
+    /// strictly below their ceiling (checked at compile time).
+    const COMPACT_AT_LINEAGE_SEGMENTS: usize = 256;
+    const COMPACT_AT_LINEAGE_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+
+    /// The one decision behind compaction, kept pure so both axes are unit
+    /// tested without publishing gigabytes.
+    fn lineage_needs_compaction(segments: usize, bytes: u64) -> bool {
+        segments >= Self::COMPACT_AT_LINEAGE_SEGMENTS || bytes >= Self::COMPACT_AT_LINEAGE_BYTES
+    }
     const WAL_VERSION: u16 = 2;
 
     fn metadata_link_count(metadata: &fs::Metadata) -> u64 {
@@ -3776,16 +3793,31 @@ impl Server {
         // The previous generation's blob becomes this segment's parent. Only
         // vectors written since the last publication (no blobRef yet) are
         // streamed; every other reference is carried forward unchanged.
-        let segment_parent = self.state.vector_blob.clone();
-        if segment_parent.is_some() {
+        // Once the lineage reaches a compaction threshold the parent is cut
+        // instead and every live vector is streamed into a new base.
+        let lineage_bytes = self
+            .vector_blob_lineage
+            .iter()
+            .try_fold(0u64, |total, descriptor| total.checked_add(descriptor.size))
+            .ok_or_else(|| io::Error::other("vector blob lineage byte total overflow"))?;
+        let compacting = self.state.vector_blob.is_some()
+            && Self::lineage_needs_compaction(self.vector_blob_lineage.len(), lineage_bytes);
+        let segment_parent = if compacting {
+            None
+        } else {
+            self.state.vector_blob.clone()
+        };
+        if self.state.vector_blob.is_some() {
             match self.vector_blob_lineage.first() {
-                Some(head) if Some(head) == segment_parent.as_ref() => {}
+                Some(head) if Some(head) == self.state.vector_blob.as_ref() => {}
                 _ => {
                     return Err(io::Error::other(
                         "vector blob lineage does not start at the committed descriptor",
                     ));
                 }
             }
+        }
+        if segment_parent.is_some() {
             if self.vector_blob_lineage.len() >= Self::MAX_VECTOR_BLOB_LINEAGE {
                 return Err(io::Error::other(format!(
                     "vector blob lineage is exhausted at {} segments; compaction is required before another generation can be published",
@@ -3919,6 +3951,9 @@ impl Server {
         self.state.generation = next_generation;
         self.state.vector_blob = Some(blob_descriptor.clone());
         self.state.commit_evidence = Some(stored_commit_evidence.clone());
+        if compacting {
+            self.vector_blob_lineage.clear();
+        }
         self.vector_blob_lineage.insert(0, blob_descriptor.clone());
         for (key, blob_ref) in prepared_vector_refs {
             let vector = self
@@ -3936,7 +3971,7 @@ impl Server {
         progress.enter_phase("complete", 0, None, 0, None)?;
         let total_ms = start.elapsed().as_millis();
         eprintln!(
-            "[persist] generation={} blobBytes={} blobSha256={} segmentVectors={segment_vectors} lineageSegments={} jsonBytes={} elapsedMs={total_ms}",
+            "[persist] generation={} blobBytes={} blobSha256={} segmentVectors={segment_vectors} compacted={compacting} lineageSegments={} jsonBytes={} elapsedMs={total_ms}",
             next_generation,
             blob_descriptor.size,
             blob_descriptor.sha256,
@@ -5969,6 +6004,8 @@ impl Server {
                                 "baseFormat": Self::VECTOR_BLOB_VERSION_BASE,
                                 "maxLineage": Self::MAX_VECTOR_BLOB_LINEAGE,
                                 "maxLineageBytes": Self::MAX_VECTOR_BLOB_LINEAGE_BYTES,
+                                "compactAtSegments": Self::COMPACT_AT_LINEAGE_SEGMENTS,
+                                "compactAtLineageBytes": Self::COMPACT_AT_LINEAGE_BYTES,
                             },
                             "indexingMemory": {
                                 "schema": INDEXING_MEMORY_PROTOCOL_SCHEMA,
@@ -7709,6 +7746,18 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lineage_compaction_triggers_on_either_axis_and_below_the_ceilings() {
+        let segments = Server::COMPACT_AT_LINEAGE_SEGMENTS;
+        let bytes = Server::COMPACT_AT_LINEAGE_BYTES;
+        assert!(!Server::lineage_needs_compaction(segments - 1, bytes - 1));
+        assert!(Server::lineage_needs_compaction(segments, bytes - 1));
+        assert!(Server::lineage_needs_compaction(1, bytes));
+        assert!(Server::lineage_needs_compaction(segments, bytes));
+        assert!(segments < Server::MAX_VECTOR_BLOB_LINEAGE);
+        assert!(bytes < Server::MAX_VECTOR_BLOB_LINEAGE_BYTES);
+    }
+
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
