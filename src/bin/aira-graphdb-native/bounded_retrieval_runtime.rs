@@ -1565,6 +1565,7 @@ mod tests {
                 ..Default::default()
             },
             vector_values,
+            vector_blob_lineage: Vec::new(),
             cache_dirty: true,
             transaction: TransactionState::Idle,
             wal_path: None,

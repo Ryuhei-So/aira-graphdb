@@ -225,3 +225,47 @@ Tests use the real native persistence code, not a fake that omits file writes.
 17. Production-sized validation performs no whole-state/vector/cache clone.
     A structural test rejects `Server: Clone` and exercises many small mutations
     under a bounded RSS-growth gate.
+
+## Format 2: delta segments with a parent link (literature-hub #482)
+
+Measured on the production corpus (2026-09-03, generation 326→327): one
+document added 3,268,608 bytes of vectors, yet the commit rewrote the full
+7.69 GB blob, re-read it to verify the hash, and reclaimed the previous 7.68 GB
+copy. Publication cost was proportional to the corpus, not to the change.
+
+Decision: a generation publishes a **segment** holding only the vectors first
+written since the previous publication (those without a `blobRef`), plus a
+parent link naming the previous generation's blob exactly
+(basename, size, sha256, format). The descriptor shape
+`{basename, size, sha256, format}` and the owner manifest contract are
+unchanged; `format` is now `2`.
+
+Layout, little-endian: `AGVB` | u16 version=2 | u64 segment generation |
+u16 parent basename length | parent basename | u64 parent size |
+32-byte parent sha256 | u16 parent format | f64 payload. A zero parent length
+marks a base (the first generation from an empty store).
+
+- `blobRef` gains `gen`, the generation of the segment holding the payload.
+  A `blobRef` without `gen` points into a format 1 base. Existing format 1
+  blobs are accepted as the base of a lineage; nothing is migrated.
+- On open the native follows the descriptor through every parent link,
+  verifying each segment against the descriptor that named it. Generations
+  must strictly decrease, no basename may repeat, the chain is bounded by
+  `MAX_VECTOR_BLOB_LINEAGE`, and any missing, truncated, tampered, or
+  mismatched segment fails closed before a single vector is decoded.
+- Publication refuses to extend a lineage already at the bound. Compaction
+  (publishing a parentless full segment) is a separate change; until it lands
+  the bound is the only ceiling, and it fails closed rather than growing.
+- `protocol_info` reports `vectorBlobLineage` (descriptor first, base last)
+  and `limits.vectorBlob`. Reclamation must retain every basename in the
+  lineage; the previous "generation and its predecessor" rule would delete
+  live ancestors.
+- Descriptor read-only mode receives one inherited blob descriptor and cannot
+  carry a lineage: a segment with a parent is rejected; a parentless format 2
+  segment and a format 1 blob remain readable.
+- Rollback to a binary that only knows format 1 fails closed on the first
+  format 2 descriptor (format mismatch). Restore the pre-upgrade JSON and
+  lineage set together; the old blobs are still on disk because the lineage
+  retains them.
+
+Negative tests: `tests/native_delta_vblob.rs`.
