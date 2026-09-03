@@ -561,7 +561,9 @@ fn committed_generation_has_sole_pointer_and_durable_blob_descriptor() {
     let basename = descriptor["basename"].as_str().expect("blob basename");
     assert!(!Path::new(basename).is_absolute());
     assert!(!basename.contains('/'));
-    assert_eq!(descriptor["format"], json!(1));
+    // Format 2 (#482): every generation publishes a delta segment with a
+    // parent link; the format 1 full-blob layout is read-only from here on.
+    assert_eq!(descriptor["format"], json!(2));
 
     let state_raw = std::fs::read_to_string(&db.path).expect("canonical JSON");
     let state: Value = serde_json::from_str(&state_raw).expect("canonical JSON parses");
