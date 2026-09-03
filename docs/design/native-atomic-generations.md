@@ -250,9 +250,13 @@ marks a base (the first generation from an empty store).
   blobs are accepted as the base of a lineage; nothing is migrated.
 - On open the native follows the descriptor through every parent link,
   verifying each segment against the descriptor that named it. Generations
-  must strictly decrease, no basename may repeat, the chain is bounded by
-  `MAX_VECTOR_BLOB_LINEAGE`, and any missing, truncated, tampered, or
-  mismatched segment fails closed before a single vector is decoded.
+  must strictly decrease, no basename may repeat, the chain is bounded in
+  count by `MAX_VECTOR_BLOB_LINEAGE` and in bytes by
+  `MAX_VECTOR_BLOB_LINEAGE_BYTES` (summed from descriptors before a segment is
+  read), and any missing, truncated, tampered, or mismatched segment fails
+  closed before a single vector is decoded. Segments are decoded one at a
+  time and dropped, so peak memory is one segment plus the decoded vectors,
+  never the whole lineage.
 - Publication refuses to extend a lineage already at the bound. Compaction
   (publishing a parentless full segment) is a separate change; until it lands
   the bound is the only ceiling, and it fails closed rather than growing.

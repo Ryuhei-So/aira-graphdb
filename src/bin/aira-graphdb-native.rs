@@ -1816,6 +1816,10 @@ impl Server {
     /// to extend a lineage at this length and open refuses to follow a longer
     /// one, so the bound lives on the file count no caller can bypass.
     const MAX_VECTOR_BLOB_LINEAGE: usize = 4096;
+    /// Upper bound on the bytes one lineage may total, summed from the
+    /// descriptors before any segment is read, so a forged or runaway chain
+    /// fails closed instead of exhausting memory on open.
+    const MAX_VECTOR_BLOB_LINEAGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
     const WAL_VERSION: u16 = 2;
 
     fn metadata_link_count(metadata: &fs::Metadata) -> u64 {
@@ -3028,6 +3032,15 @@ impl Server {
     ) -> io::Result<(fs::File, Vec<u8>)> {
         let mut file = Self::open_regular_nofollow(path)
             .map_err(|err| io::Error::other(format!("open vector blob failed: {err}")))?;
+        if let Some(descriptor) = descriptor {
+            // Refuse before allocating: a file whose length already disagrees
+            // with its descriptor can never validate.
+            if file.metadata()?.len() != descriptor.size {
+                return Err(io::Error::other(
+                    "vector blob size does not match descriptor",
+                ));
+            }
+        }
         let mut raw = Vec::new();
         file.read_to_end(&mut raw)?;
         let header = Self::parse_blob_header(&raw)?;
@@ -3057,22 +3070,102 @@ impl Server {
         Ok(raw)
     }
 
+    /// Vectors still waiting for their payload, keyed by the segment generation
+    /// their `blobRef` names (`None` = format 1 base). Inline values are
+    /// copied straight into `values` and never wait.
+    fn pending_vector_refs<'a>(
+        state: &'a State,
+        values: &mut HashMap<String, Vec<f64>>,
+    ) -> HashMap<Option<u64>, Vec<&'a String>> {
+        let mut pending: HashMap<Option<u64>, Vec<&String>> = HashMap::new();
+        for (key, vector) in &state.vectors {
+            if !vector.values.is_empty() {
+                values.insert(key.clone(), vector.values.clone());
+                continue;
+            }
+            if let Some(blob_ref) = &vector.blob_ref {
+                pending.entry(blob_ref.generation).or_default().push(key);
+            }
+        }
+        pending
+    }
+
+    /// Decode every vector that names this segment, then let the caller drop
+    /// the raw buffer. Holding one segment at a time keeps peak memory at one
+    /// segment plus the decoded map, not the whole lineage.
+    fn apply_vector_segment(
+        state: &State,
+        segment: &LoadedVectorSegment,
+        pending: &mut HashMap<Option<u64>, Vec<&String>>,
+        values: &mut HashMap<String, Vec<f64>>,
+    ) -> io::Result<()> {
+        for key in pending.remove(&segment.generation).unwrap_or_default() {
+            let blob_ref = state.vectors[key]
+                .blob_ref
+                .as_ref()
+                .expect("pending keys carry a blob reference");
+            let start = segment
+                .payload_offset
+                .checked_add(
+                    usize::try_from(blob_ref.offset)
+                        .map_err(|_| io::Error::other("vector blob offset overflow"))?,
+                )
+                .ok_or_else(|| io::Error::other("vector blob offset overflow"))?;
+            let byte_len = (blob_ref.len as usize)
+                .checked_mul(std::mem::size_of::<f64>())
+                .ok_or_else(|| io::Error::other("vector blob length overflow"))?;
+            let end = start
+                .checked_add(byte_len)
+                .ok_or_else(|| io::Error::other("vector blob offset overflow"))?;
+            if end > segment.raw.len() {
+                return Err(io::Error::other("vector blob reference out of bounds"));
+            }
+            let mut out = Vec::with_capacity(blob_ref.len as usize);
+            for chunk in segment.raw[start..end].chunks_exact(std::mem::size_of::<f64>()) {
+                out.push(f64::from_le_bytes(
+                    chunk.try_into().expect("validated f64 chunk length"),
+                ));
+            }
+            values.insert(key.clone(), out);
+        }
+        Ok(())
+    }
+
+    fn unresolved_vector_refs_error(
+        pending: &HashMap<Option<u64>, Vec<&String>>,
+    ) -> io::Result<()> {
+        let mut generations: Vec<&Option<u64>> = pending.keys().collect();
+        generations.sort_unstable();
+        match generations.first() {
+            None => Ok(()),
+            Some(None) => Err(io::Error::other(
+                "vector metadata references the base blob but the lineage has no base",
+            )),
+            Some(Some(generation)) => Err(io::Error::other(format!(
+                "vector metadata references segment generation {generation} outside the lineage"
+            ))),
+        }
+    }
+
     /// Follow the committed descriptor through every parent link to the base.
     /// Each segment is verified against the descriptor that named it (size,
     /// sha256, format), generations must strictly decrease, no basename may
-    /// repeat, and the chain is bounded. Any defect fails closed before a
-    /// single vector is decoded.
+    /// repeat, and the chain is bounded in both count and bytes. The byte
+    /// bound is summed from descriptors *before* a segment is read, and each
+    /// segment is decoded and dropped before the next one is opened.
     fn load_vector_lineage(
         state: &State,
         db_path: &Path,
-    ) -> io::Result<(Vec<VectorBlobDescriptor>, Vec<LoadedVectorSegment>)> {
+    ) -> io::Result<(Vec<VectorBlobDescriptor>, HashMap<String, Vec<f64>>)> {
         let head = state.vector_blob.as_ref().ok_or_else(|| {
             io::Error::other("committed generation is missing its vector blob descriptor")
         })?;
         let directory = Self::parent_dir(db_path);
+        let mut values = HashMap::new();
+        let mut pending = Self::pending_vector_refs(state, &mut values);
         let mut lineage = Vec::new();
-        let mut segments = Vec::new();
         let mut seen = HashSet::new();
+        let mut total_bytes = 0u64;
         let mut child_generation: Option<u64> = None;
         let mut next = Some(head.clone());
         while let Some(descriptor) = next.take() {
@@ -3082,6 +3175,15 @@ impl Server {
                     Self::MAX_VECTOR_BLOB_LINEAGE
                 )));
             }
+            total_bytes = total_bytes
+                .checked_add(descriptor.size)
+                .filter(|total| *total <= Self::MAX_VECTOR_BLOB_LINEAGE_BYTES)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "vector blob lineage exceeds {} bytes",
+                        Self::MAX_VECTOR_BLOB_LINEAGE_BYTES
+                    ))
+                })?;
             Self::validate_blob_basename(&descriptor.basename)?;
             if !seen.insert(descriptor.basename.clone()) {
                 return Err(io::Error::other(
@@ -3114,14 +3216,17 @@ impl Server {
                 child_generation = header.generation;
             }
             next = header.parent;
-            lineage.push(descriptor);
-            segments.push(LoadedVectorSegment {
+            let segment = LoadedVectorSegment {
                 generation: header.generation,
                 payload_offset: header.payload_offset,
                 raw,
-            });
+            };
+            Self::apply_vector_segment(state, &segment, &mut pending, &mut values)?;
+            drop(segment);
+            lineage.push(descriptor);
         }
-        Ok((lineage, segments))
+        Self::unresolved_vector_refs_error(&pending)?;
+        Ok((lineage, values))
     }
 
     fn load_vector_values(
@@ -3140,8 +3245,7 @@ impl Server {
             ));
         }
         if state.vector_blob.is_some() {
-            let (lineage, segments) = Self::load_vector_lineage(state, db_path)?;
-            let values = Self::decode_vector_values(state, &segments)?;
+            let (lineage, values) = Self::load_vector_lineage(state, db_path)?;
             return Ok((values, lineage));
         }
         let segments = match fs::symlink_metadata(legacy_blob_path) {
@@ -3436,62 +3540,24 @@ impl Server {
         Ok(server)
     }
 
+    /// Decode from an already-loaded segment set (descriptor mode and the
+    /// legacy adjacent blob, which are single segments by construction).
     fn decode_vector_values(
         state: &State,
         segments: &[LoadedVectorSegment],
     ) -> io::Result<HashMap<String, Vec<f64>>> {
-        let mut by_generation: HashMap<Option<u64>, usize> = HashMap::new();
-        for (index, segment) in segments.iter().enumerate() {
-            if by_generation.insert(segment.generation, index).is_some() {
+        let mut values = HashMap::new();
+        let mut pending = Self::pending_vector_refs(state, &mut values);
+        let mut seen_generations = HashSet::new();
+        for segment in segments {
+            if !seen_generations.insert(segment.generation) {
                 return Err(io::Error::other(
                     "vector blob lineage contains duplicate segment generations",
                 ));
             }
+            Self::apply_vector_segment(state, segment, &mut pending, &mut values)?;
         }
-        let mut values = HashMap::new();
-        for (key, vector) in &state.vectors {
-            if !vector.values.is_empty() {
-                values.insert(key.clone(), vector.values.clone());
-                continue;
-            }
-            let Some(blob_ref) = &vector.blob_ref else {
-                continue;
-            };
-            let segment = by_generation
-                .get(&blob_ref.generation)
-                .map(|index| &segments[*index])
-                .ok_or_else(|| match blob_ref.generation {
-                    Some(generation) => io::Error::other(format!(
-                        "vector metadata references segment generation {generation} outside the lineage"
-                    )),
-                    None => io::Error::other(
-                        "vector metadata references the base blob but the lineage has no base",
-                    ),
-                })?;
-            let start = segment
-                .payload_offset
-                .checked_add(
-                    usize::try_from(blob_ref.offset)
-                        .map_err(|_| io::Error::other("vector blob offset overflow"))?,
-                )
-                .ok_or_else(|| io::Error::other("vector blob offset overflow"))?;
-            let byte_len = (blob_ref.len as usize)
-                .checked_mul(std::mem::size_of::<f64>())
-                .ok_or_else(|| io::Error::other("vector blob length overflow"))?;
-            let end = start
-                .checked_add(byte_len)
-                .ok_or_else(|| io::Error::other("vector blob offset overflow"))?;
-            if end > segment.raw.len() {
-                return Err(io::Error::other("vector blob reference out of bounds"));
-            }
-            let mut out = Vec::with_capacity(blob_ref.len as usize);
-            for chunk in segment.raw[start..end].chunks_exact(std::mem::size_of::<f64>()) {
-                out.push(f64::from_le_bytes(
-                    chunk.try_into().expect("validated f64 chunk length"),
-                ));
-            }
-            values.insert(key.clone(), out);
-        }
+        Self::unresolved_vector_refs_error(&pending)?;
         Ok(values)
     }
 
@@ -5902,6 +5968,7 @@ impl Server {
                                 "writeFormat": Self::VECTOR_BLOB_VERSION,
                                 "baseFormat": Self::VECTOR_BLOB_VERSION_BASE,
                                 "maxLineage": Self::MAX_VECTOR_BLOB_LINEAGE,
+                                "maxLineageBytes": Self::MAX_VECTOR_BLOB_LINEAGE_BYTES,
                             },
                             "indexingMemory": {
                                 "schema": INDEXING_MEMORY_PROTOCOL_SCHEMA,

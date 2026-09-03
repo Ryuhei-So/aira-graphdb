@@ -862,6 +862,89 @@ fn unknown_blob_version_fails_closed() {
     assert_open_fails_closed(&db, "version 3");
 }
 
+/// Spawn the native against `db`, expect a non-zero exit, and return stderr.
+fn open_failure_stderr(db: &TempDb) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_aira-graphdb-native"))
+        .arg("--db")
+        .arg(&db.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("native binary runs");
+    assert_ne!(output.status.code(), Some(0), "native must fail closed");
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn lineage_byte_ceiling_is_enforced_from_descriptors_before_any_segment_is_read() {
+    let probe = TempDb::new("bytes-probe");
+    seed(&probe);
+    let mut native = NativeProcess::spawn(&probe.path);
+    let max_bytes = protocol_info(&mut native, 1)["limits"]["vectorBlob"]["maxLineageBytes"]
+        .as_u64()
+        .expect("native advertises its lineage byte ceiling");
+    assert_eq!(native.finish().code(), Some(0));
+
+    // Head descriptor alone claims more than the ceiling. The file on disk is
+    // tiny, so a size-first implementation that read it would report a size
+    // mismatch; the ceiling must be reported instead, i.e. before the read.
+    let head_only = TempDb::new("bytes-head");
+    let base = encode_v2(1, None, &[1.0, 0.0]);
+    let base_name = blob_basename(1, &base);
+    fs::write(head_only.dir.join(&base_name), &base).unwrap();
+    write_canonical(
+        &head_only,
+        1,
+        json!({"basename": base_name, "size": max_bytes + 1, "sha256": sha256_hex(&base), "format": 2}),
+        json!({"c1:v1": vector_entry(json!({"offset": 0, "len": 2, "gen": 1}))}),
+    );
+    let stderr = open_failure_stderr(&head_only);
+    assert!(
+        stderr.contains("lineage exceeds") && stderr.contains("bytes"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("size does not match"),
+        "must fail on the ceiling, not after reading: {stderr}"
+    );
+
+    // Two honest segments whose *sum* crosses the ceiling: the child's header
+    // claims a parent of exactly the ceiling. The parent file is small and is
+    // never opened because the running total is rejected first.
+    let summed = TempDb::new("bytes-sum");
+    let parent = encode_v2(1, None, &[1.0, 0.0]);
+    let parent_name = blob_basename(1, &parent);
+    fs::write(summed.dir.join(&parent_name), &parent).unwrap();
+    let child = encode_v2(
+        2,
+        Some(Parent {
+            basename: &parent_name,
+            size: max_bytes,
+            sha256: &sha256_hex(&parent),
+            format: 2,
+        }),
+        &[],
+    );
+    let child_name = blob_basename(2, &child);
+    fs::write(summed.dir.join(&child_name), &child).unwrap();
+    write_canonical(
+        &summed,
+        2,
+        descriptor(&child_name, &child, 2),
+        json!({"c1:v1": vector_entry(json!({"offset": 0, "len": 2, "gen": 1}))}),
+    );
+    let stderr = open_failure_stderr(&summed);
+    assert!(
+        stderr.contains("lineage exceeds") && stderr.contains("bytes"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("size does not match"),
+        "parent must not be read: {stderr}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Descriptor read-only mode: one inherited fd cannot carry a lineage.
 // ---------------------------------------------------------------------------
