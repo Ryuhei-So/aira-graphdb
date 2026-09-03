@@ -1566,6 +1566,8 @@ mod tests {
             },
             vector_values,
             vector_blob_lineage: Vec::new(),
+            vector_blob_compactions: 0,
+            last_compaction_reason: None,
             cache_dirty: true,
             transaction: TransactionState::Idle,
             wal_path: None,

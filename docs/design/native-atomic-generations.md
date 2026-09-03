@@ -257,9 +257,29 @@ marks a base (the first generation from an empty store).
   closed before a single vector is decoded. Segments are decoded one at a
   time and dropped, so peak memory is one segment plus the decoded vectors,
   never the whole lineage.
-- Publication refuses to extend a lineage already at the bound. Compaction
-  (publishing a parentless full segment) is a separate change; until it lands
-  the bound is the only ceiling, and it fails closed rather than growing.
+- **Compaction.** Once a lineage has reached `COMPACT_AT_LINEAGE_SEGMENTS`
+  segments, or `COMPACT_AT_LINEAGE_BYTES` bytes *and* compaction would reclaim
+  at least one eighth of the live bytes (a live set that alone exceeds the
+  threshold cannot be shrunk and must not be rewritten on every commit), the
+  next commit cuts the parent link and streams every live vector into a new
+  parentless base. Both thresholds sit strictly below the fail-closed
+  ceilings (compile-time asserted). Before a byte is written the publish set
+  is proven equivalent to the live set: every carried vector must have live
+  values of exactly the length its reference promises, the set must cover
+  every vector, and the byte total must equal the live total — a missing or
+  short vector fails the commit closed instead of being emitted empty, because
+  the old chain is reclaimed one generation later. The generation being
+  published is also checked against the load ceiling before writing (the new
+  segment plus, for a delta, the lineage it chains onto), so a commit can
+  never publish what the next open would refuse. Compaction never deletes:
+  the old chain becomes unreachable and the owner's lineage-aware reclamation
+  removes it. A hand-built lineage at the count ceiling is recovered the same
+  way rather than refused. `protocol_info.limits.vectorBlob` reports the
+  thresholds and `protocol_info.vectorBlobCompactions` the count and last
+  reason. Debug builds accept lower-only overrides
+  (`AGDB_NATIVE_TEST_COMPACT_AT_LINEAGE_BYTES`,
+  `AGDB_NATIVE_TEST_MAX_VECTOR_BLOB_LINEAGE_BYTES`) so the byte axis is tested
+  end to end with kilobytes; release builds ignore them.
 - `protocol_info` reports `vectorBlobLineage` (descriptor first, base last)
   and `limits.vectorBlob`. Reclamation must retain every basename in the
   lineage; the previous "generation and its predecessor" rule would delete
@@ -271,5 +291,14 @@ marks a base (the first generation from an empty store).
   format 2 descriptor (format mismatch). Restore the pre-upgrade JSON and
   lineage set together; the old blobs are still on disk because the lineage
   retains them.
+
+- `blob_lineage {basename}` (health) enumerates the lineage *any* published
+  blob file reaches, from headers alone — the owner's authority for what the
+  predecessor generation still needs after a compaction. Enumeration is not
+  verification: payloads are neither read nor hashed; the head's sha256 comes
+  from its published basename, each parent's descriptor from the child
+  header, cross-checked against the parent's header version and length.
+  Missing parents, unsafe or unpublished names, cycles, and over-long chains
+  are errors, never a shorter answer.
 
 Negative tests: `tests/native_delta_vblob.rs`.
