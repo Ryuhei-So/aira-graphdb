@@ -1512,9 +1512,12 @@ const MEMORY_READ_PROTOCOL_SCHEMA: &str = "native-memory-read@1";
 const MAX_MEMORY_READ_IDS_PER_REQUEST: usize = MAX_INDEXING_SCHEMA_IDS;
 const MAX_MEMORY_READ_ENTITIES_PER_REQUEST: usize = 64;
 const MAX_MEMORY_READ_LIMIT: usize = MAX_INDEXING_ACTIVE_FACTS;
-// A case fold never shrinks a scalar below one byte, so a stored entity
-// longer than this cannot fold to something equal to an in-bound request
-// entity. Anything beyond it is skipped without allocating.
+// Any stored value that can equal a request entity of at most
+// MAX_INDEXING_DOMAIN_ID_BYTES after folding is far shorter than this (a
+// folded scalar occupies at least one byte and at most three scalars), so
+// a longer stored entity is skipped without allocating and a request
+// entity that fails to fold within it is rejected. The value is generous
+// on purpose; it only prevents unbounded allocation.
 const MAX_MEMORY_READ_FOLDED_ENTITY_BYTES: usize = 4 * 3 * MAX_INDEXING_DOMAIN_ID_BYTES;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -5613,9 +5616,9 @@ impl Server {
                 response_limit,
             )?;
             found.insert(id.to_string(), item.clone());
-            if found.len() == ids.len() {
-                break;
-            }
+            // No early exit once every id is found: the whole section is
+            // scanned so a duplicated stored id is reported regardless of
+            // where it sits, exactly as memory_get_schemas_by_ids does.
         }
         Ok(Value::Array(
             ids.iter().filter_map(|id| found.remove(*id)).collect(),
@@ -7365,6 +7368,12 @@ impl Server {
                         .stored_snapshot_section(corpus_id, "facts")?
                         .into_iter()
                         .flatten();
+                    // Each query folds the head/tail entity of every fact
+                    // into a fresh String (O(corpus) allocations, no ASCII
+                    // fast path). The timing evidence for this scan at 3x
+                    // corpus is deferred to literature-hub #545 PR-C1
+                    // (packet 12.2.4); an index can be added later behind
+                    // the same method without a protocol change.
                     let mut matched: Vec<(&str, &Value)> = Vec::new();
                     for fact in facts {
                         let object = Self::validate_stored_fact_item(fact, corpus_id)?;
@@ -7831,6 +7840,8 @@ fn render_method_policy_table() -> String {
 
 fn parse_cli() -> io::Result<CliMode> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    // The table flag needs no database and wins over every other option,
+    // so --db handling below is never reached for it.
     if args.iter().any(|arg| arg == METHOD_POLICY_TABLE_FLAG) {
         return Ok(CliMode::PrintMethodPolicyTable);
     }

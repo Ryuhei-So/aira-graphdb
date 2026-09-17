@@ -471,6 +471,66 @@ fn find_facts_by_entities_case_folds_with_unicode16_and_orders_by_fact_id() {
 }
 
 #[test]
+fn by_ids_reports_a_duplicated_stored_id_after_the_last_requested_match() {
+    let db = TempDb::new("duplicate-stored-id");
+    // memory_save stores the snapshot as given, so a corrupted section with a
+    // repeated id can be planted; memory_upsert would have merged it.
+    let mut seed = NativeProcess::spawn(&db.path);
+    assert_eq!(seed.send(batch_begin(1))["ok"], json!(true));
+    let save = seed.send(json!({
+        "id": 2,
+        "method": "memory_save",
+        "params": {"snapshot": {
+            "corpusId": "c1",
+            "passages": [
+                {"passageId":"p1","corpusId":"c1","text":"first"},
+                {"passageId":"p2","corpusId":"c1","text":"second"},
+                {"passageId":"p1","corpusId":"c1","text":"duplicate"}
+            ],
+            "facts": [
+                {"factId":"f1","corpusId":"c1","schemaId":"s1","state":"active"},
+                {"factId":"f2","corpusId":"c1","schemaId":"s1","state":"active"},
+                {"factId":"f1","corpusId":"c1","schemaId":"s1","state":"active"}
+            ],
+            "schemas": []
+        }}
+    }));
+    assert_eq!(save["ok"], json!(true), "seed save failed: {save}");
+    assert_eq!(seed.commit(3)["ok"], json!(true));
+    assert_eq!(seed.finish(), Some(0));
+
+    let mut native = NativeProcess::spawn(&db.path);
+    // Every requested id is found before the duplicate is reached; the scan
+    // must still continue and report the corruption.
+    let passages = native.send(read(
+        "memory_get_passages_by_ids",
+        json!({"corpusId":"c1","passageIds":["p1"]}),
+    ));
+    assert_client_rejection(&passages, "duplicated stored passageId");
+    assert!(
+        passages["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("duplicate requested passageId"),
+        "{passages}"
+    );
+    native.ensure_alive();
+    let facts = native.send(read(
+        "memory_get_facts_by_ids",
+        json!({"corpusId":"c1","factIds":["f1"]}),
+    ));
+    assert_client_rejection(&facts, "duplicated stored factId");
+    native.ensure_alive();
+    // An unrelated id is unaffected, like memory_get_schemas_by_ids.
+    let clean = native.send(read(
+        "memory_get_passages_by_ids",
+        json!({"corpusId":"c1","passageIds":["p2"]}),
+    ));
+    assert_eq!(result_ids(&clean, "passageId"), ["p2"]);
+    assert_eq!(native.finish(), Some(0));
+}
+
+#[test]
 fn section_counts_reports_each_section_and_zero_for_unknown_corpus() {
     let db = TempDb::new("section-counts");
     seed_fixture(&db);
