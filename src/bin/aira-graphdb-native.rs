@@ -29,6 +29,7 @@ use aira_graphdb::native_persistence_contract::{
     NativeProgressPolicy, PreparedCommitEvidence, ProgressCounters,
 };
 use aira_graphdb::query::{CypherDialect, execute_query_with_dialect};
+use aira_graphdb::unicode16_lowercase;
 
 #[path = "aira-graphdb-native/bounded_retrieval_runtime.rs"]
 mod bounded_retrieval_runtime;
@@ -1504,6 +1505,17 @@ const MAX_INDEXING_DELTA_ITEMS_PER_SECTION: usize = 4096;
 const MAX_INDEXING_DOMAIN_ID_BYTES: usize = 4096;
 const MAX_INDEXING_CORPUS_ID_BYTES: usize = 1024;
 const MAX_INDEXING_UPDATED_AT_BYTES: usize = 128;
+// Targeted memory reads (literature-hub #545). They share the bounded
+// indexing wire profile (request/response byte caps) and advertise their own
+// count bounds under `limits.memoryRead` so consumers never assume them.
+const MEMORY_READ_PROTOCOL_SCHEMA: &str = "native-memory-read@1";
+const MAX_MEMORY_READ_IDS_PER_REQUEST: usize = MAX_INDEXING_SCHEMA_IDS;
+const MAX_MEMORY_READ_ENTITIES_PER_REQUEST: usize = 64;
+const MAX_MEMORY_READ_LIMIT: usize = MAX_INDEXING_ACTIVE_FACTS;
+// A case fold never shrinks a scalar below one byte, so a stored entity
+// longer than this cannot fold to something equal to an in-bound request
+// entity. Anything beyond it is skipped without allocating.
+const MAX_MEMORY_READ_FOLDED_ENTITY_BYTES: usize = 4 * 3 * MAX_INDEXING_DOMAIN_ID_BYTES;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1677,6 +1689,32 @@ const METHOD_SPECS: &[MethodSpec] = &[
     },
     MethodSpec {
         name: "memory_get_active_facts",
+        classification: "read",
+        wal: false,
+        wire_profile: MethodWireProfile::BoundedIndexing,
+    },
+    // Targeted query-path reads (#545). Presence in protocol_info.methods is
+    // the feature-detection surface; bounds live in limits.memoryRead.
+    MethodSpec {
+        name: "memory_get_passages_by_ids",
+        classification: "read",
+        wal: false,
+        wire_profile: MethodWireProfile::BoundedIndexing,
+    },
+    MethodSpec {
+        name: "memory_get_facts_by_ids",
+        classification: "read",
+        wal: false,
+        wire_profile: MethodWireProfile::BoundedIndexing,
+    },
+    MethodSpec {
+        name: "memory_find_facts_by_entities",
+        classification: "read",
+        wal: false,
+        wire_profile: MethodWireProfile::BoundedIndexing,
+    },
+    MethodSpec {
+        name: "memory_section_counts",
         classification: "read",
         wal: false,
         wire_profile: MethodWireProfile::BoundedIndexing,
@@ -5482,6 +5520,126 @@ impl Server {
         Ok(ids)
     }
 
+    /// Request ids for the targeted memory reads: at most `maximum` entries,
+    /// each a bounded non-empty string. Duplicates are de-duplicated (first
+    /// occurrence wins) instead of rejected, so a caller that built its id
+    /// list from several hit lists needs no client-side set.
+    fn bounded_deduplicated_ids<'a>(
+        params: &'a serde_json::Map<String, Value>,
+        name: &str,
+        maximum: usize,
+    ) -> Result<Vec<&'a str>, AppError> {
+        let items = Self::optional_array(params, name)?
+            .ok_or_else(|| Self::execution_client_error(format!("missing {name}")))?;
+        if items.len() > maximum {
+            return Err(Self::execution_client_error(format!(
+                "{name} length must be in [0, {maximum}]"
+            )));
+        }
+        let mut seen = HashSet::with_capacity(items.len());
+        let mut ids = Vec::with_capacity(items.len());
+        for item in items {
+            let id = item
+                .as_str()
+                .filter(|value| {
+                    !value.is_empty() && value.len() <= MAX_INDEXING_DOMAIN_ID_BYTES
+                })
+                .ok_or_else(|| {
+                    Self::execution_client_error(format!(
+                        "{name} must contain only non-empty strings of at most {MAX_INDEXING_DOMAIN_ID_BYTES} bytes"
+                    ))
+                })?;
+            if seen.insert(id) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Entity equality for `memory_find_facts_by_entities` uses the same
+    /// producer-pinned Unicode 16 lowercase table as `fact_expand_bounded@1`,
+    /// so the rule cannot drift from Synapse's `toLowerCase()`. `None` means
+    /// the value cannot equal any in-bound request entity after folding.
+    fn fold_memory_read_entity(value: &str) -> Option<String> {
+        if value.len() > MAX_MEMORY_READ_FOLDED_ENTITY_BYTES {
+            return None;
+        }
+        unicode16_lowercase::lowercase_bounded(value, MAX_MEMORY_READ_FOLDED_ENTITY_BYTES, || {
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .ok()
+    }
+
+    /// Full stored objects of one snapshot section for the requested ids, in
+    /// request order. Unknown ids are omitted. The reply is byte-budgeted
+    /// while accumulating, before serialization.
+    fn read_section_items_by_ids(
+        &self,
+        request_id: u64,
+        corpus_id: &str,
+        section: &str,
+        id_key: &str,
+        ids: &[&str],
+    ) -> Result<Value, AppError> {
+        if ids.is_empty() {
+            return Ok(json!([]));
+        }
+        let requested = ids.iter().copied().collect::<HashSet<_>>();
+        let mut found: HashMap<String, Value> = HashMap::with_capacity(ids.len());
+        let mut response_bytes = 2_u64;
+        let response_limit = Self::indexing_result_array_limit(request_id)?;
+        let items = self
+            .stored_snapshot_section(corpus_id, section)?
+            .into_iter()
+            .flatten();
+        for item in items {
+            Self::validate_stored_section_item(item, corpus_id, section, id_key)?;
+            let id = item
+                .get(id_key)
+                .and_then(Value::as_str)
+                .expect("stored section item id validated above");
+            if !requested.contains(id) {
+                continue;
+            }
+            if found.contains_key(id) {
+                return Err(Self::execution_client_error(format!(
+                    "stored {section} contain a duplicate requested {id_key}"
+                )));
+            }
+            response_bytes = Self::add_bounded_indexing_response_item(
+                response_bytes,
+                item,
+                !found.is_empty(),
+                response_limit,
+            )?;
+            found.insert(id.to_string(), item.clone());
+            if found.len() == ids.len() {
+                break;
+            }
+        }
+        Ok(Value::Array(
+            ids.iter().filter_map(|id| found.remove(*id)).collect(),
+        ))
+    }
+
+    fn bounded_read_limit(
+        params: &serde_json::Map<String, Value>,
+        maximum: usize,
+    ) -> Result<usize, AppError> {
+        let limit_u64 = params.get("limit").and_then(Value::as_u64).ok_or_else(|| {
+            Self::execution_client_error("limit must be a nonnegative integer".to_string())
+        })?;
+        let limit = usize::try_from(limit_u64).map_err(|_| {
+            Self::execution_client_error(format!("limit must not exceed {maximum}"))
+        })?;
+        if limit > maximum {
+            return Err(Self::execution_client_error(format!(
+                "limit must not exceed {maximum}"
+            )));
+        }
+        Ok(limit)
+    }
+
     fn bounded_required_string<'a>(
         params: &'a serde_json::Map<String, Value>,
         name: &str,
@@ -6297,6 +6455,12 @@ impl Server {
                                 "maxDomainIdBytes": MAX_INDEXING_DOMAIN_ID_BYTES,
                                 "maxCorpusIdBytes": MAX_INDEXING_CORPUS_ID_BYTES,
                                 "maxUpdatedAtBytes": MAX_INDEXING_UPDATED_AT_BYTES,
+                            },
+                            "memoryRead": {
+                                "schema": MEMORY_READ_PROTOCOL_SCHEMA,
+                                "maxIdsPerRequest": MAX_MEMORY_READ_IDS_PER_REQUEST,
+                                "maxEntitiesPerRequest": MAX_MEMORY_READ_ENTITIES_PER_REQUEST,
+                                "maxLimit": MAX_MEMORY_READ_LIMIT,
                             }
                         },
                         "methods": methods,
@@ -7128,6 +7292,138 @@ impl Server {
                     }
                     Ok(Value::Array(active))
                 }
+                "memory_get_passages_by_ids" => {
+                    let params = Self::params_object(&req.params)?;
+                    Self::require_exact_params(params, &["corpusId", "passageIds"])?;
+                    let corpus_id = Self::bounded_required_string(
+                        params,
+                        "corpusId",
+                        MAX_INDEXING_CORPUS_ID_BYTES,
+                    )?;
+                    let ids = Self::bounded_deduplicated_ids(
+                        params,
+                        "passageIds",
+                        MAX_MEMORY_READ_IDS_PER_REQUEST,
+                    )?;
+                    self.read_section_items_by_ids(req.id, corpus_id, "passages", "passageId", &ids)
+                }
+                "memory_get_facts_by_ids" => {
+                    let params = Self::params_object(&req.params)?;
+                    Self::require_exact_params(params, &["corpusId", "factIds"])?;
+                    let corpus_id = Self::bounded_required_string(
+                        params,
+                        "corpusId",
+                        MAX_INDEXING_CORPUS_ID_BYTES,
+                    )?;
+                    let ids = Self::bounded_deduplicated_ids(
+                        params,
+                        "factIds",
+                        MAX_MEMORY_READ_IDS_PER_REQUEST,
+                    )?;
+                    self.read_section_items_by_ids(req.id, corpus_id, "facts", "factId", &ids)
+                }
+                "memory_find_facts_by_entities" => {
+                    let params = Self::params_object(&req.params)?;
+                    Self::require_exact_params(
+                        params,
+                        &["corpusId", "entities", "state", "limit"],
+                    )?;
+                    let corpus_id = Self::bounded_required_string(
+                        params,
+                        "corpusId",
+                        MAX_INDEXING_CORPUS_ID_BYTES,
+                    )?;
+                    let entities = Self::bounded_deduplicated_ids(
+                        params,
+                        "entities",
+                        MAX_MEMORY_READ_ENTITIES_PER_REQUEST,
+                    )?;
+                    let active_only = match params.get("state").and_then(Value::as_str) {
+                        Some("active") => true,
+                        Some("any") => false,
+                        _ => {
+                            return Err(Self::execution_client_error(
+                                "state must be \"active\" or \"any\"".to_string(),
+                            ));
+                        }
+                    };
+                    let limit = Self::bounded_read_limit(params, MAX_MEMORY_READ_LIMIT)?;
+                    if limit == 0 || entities.is_empty() {
+                        return Ok(json!([]));
+                    }
+                    let folded = entities
+                        .iter()
+                        .map(|entity| {
+                            Self::fold_memory_read_entity(entity).ok_or_else(|| {
+                                Self::execution_client_error(
+                                    "entities must fold within the bounded entity size".to_string(),
+                                )
+                            })
+                        })
+                        .collect::<Result<HashSet<_>, _>>()?;
+                    let facts = self
+                        .stored_snapshot_section(corpus_id, "facts")?
+                        .into_iter()
+                        .flatten();
+                    let mut matched: Vec<(&str, &Value)> = Vec::new();
+                    for fact in facts {
+                        let object = Self::validate_stored_fact_item(fact, corpus_id)?;
+                        if active_only
+                            && object.get("state").and_then(Value::as_str) != Some("active")
+                        {
+                            continue;
+                        }
+                        let hit = ["headEntity", "tailEntity"].into_iter().any(|field| {
+                            object
+                                .get(field)
+                                .and_then(Value::as_str)
+                                .and_then(Self::fold_memory_read_entity)
+                                .is_some_and(|entity| folded.contains(&entity))
+                        });
+                        if hit {
+                            let fact_id = object
+                                .get("factId")
+                                .and_then(Value::as_str)
+                                .expect("stored fact factId validated above");
+                            matched.push((fact_id, fact));
+                        }
+                    }
+                    // Stable: equal factIds keep stored order. Truncation
+                    // happens after ordering so the reply is a deterministic
+                    // prefix of the ordered match set.
+                    matched.sort_by(|left, right| left.0.cmp(right.0));
+                    matched.truncate(limit);
+                    let mut response_bytes = 2_u64;
+                    let response_limit = Self::indexing_result_array_limit(req.id)?;
+                    let mut result = Vec::with_capacity(matched.len());
+                    for (_, fact) in matched {
+                        response_bytes = Self::add_bounded_indexing_response_item(
+                            response_bytes,
+                            fact,
+                            !result.is_empty(),
+                            response_limit,
+                        )?;
+                        result.push(fact.clone());
+                    }
+                    Ok(Value::Array(result))
+                }
+                "memory_section_counts" => {
+                    let params = Self::params_object(&req.params)?;
+                    Self::require_exact_params(params, &["corpusId"])?;
+                    let corpus_id = Self::bounded_required_string(
+                        params,
+                        "corpusId",
+                        MAX_INDEXING_CORPUS_ID_BYTES,
+                    )?;
+                    let mut counts = serde_json::Map::with_capacity(3);
+                    for section in ["passages", "facts", "schemas"] {
+                        let count = self
+                            .stored_snapshot_section(corpus_id, section)?
+                            .map_or(0, Vec::len);
+                        counts.insert(section.to_string(), json!(count));
+                    }
+                    Ok(Value::Object(counts))
+                }
                 "memory_activate_facts_by_schema_ids" => {
                     let params = Self::params_object(&req.params)?;
                     let corpus_id = Self::required_string(params, "corpusId")?;
@@ -7456,6 +7752,7 @@ impl Server {
 enum CliMode {
     Normal { db_path: PathBuf },
     DescriptorRead(DescriptorReadConfig),
+    PrintMethodPolicyTable,
 }
 
 fn descriptor_cli_flag(arg: &str) -> bool {
@@ -7507,8 +7804,36 @@ fn parse_descriptor_generation(value: Option<&String>) -> io::Result<u64> {
     Ok(generation)
 }
 
+const METHOD_POLICY_TABLE_FLAG: &str = "--print-method-policy-table";
+const METHOD_POLICY_TABLE_BEGIN: &str = "<!-- METHOD_SPECS:BEGIN (generated; do not edit) -->";
+const METHOD_POLICY_TABLE_END: &str = "<!-- METHOD_SPECS:END -->";
+
+/// The usage-guide method policy table, rendered from METHOD_SPECS so the
+/// documented inventory cannot drift from protocol_info.methods.
+fn render_method_policy_table() -> String {
+    let mut table = String::new();
+    table.push_str(METHOD_POLICY_TABLE_BEGIN);
+    table.push_str("\n| Method | Classification | WAL | Wire profile |\n|---|---|---|---|\n");
+    for spec in METHOD_SPECS {
+        let profile = match spec.wire_profile {
+            MethodWireProfile::Normal => "normal",
+            MethodWireProfile::BoundedIndexing => "bounded-indexing",
+        };
+        table.push_str(&format!(
+            "| `{}` | {} | {} | {} |\n",
+            spec.name, spec.classification, spec.wal, profile
+        ));
+    }
+    table.push_str(METHOD_POLICY_TABLE_END);
+    table.push('\n');
+    table
+}
+
 fn parse_cli() -> io::Result<CliMode> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == METHOD_POLICY_TABLE_FLAG) {
+        return Ok(CliMode::PrintMethodPolicyTable);
+    }
     let descriptor_requested = args.iter().any(|arg| descriptor_like_cli_flag(arg));
     if !descriptor_requested {
         // Keep the historical normal-mode parser deliberately unchanged:
@@ -8021,6 +8346,11 @@ fn main() -> io::Result<()> {
     match parse_cli()? {
         CliMode::Normal { db_path } => run_normal(db_path),
         CliMode::DescriptorRead(config) => run_descriptor_read(config),
+        CliMode::PrintMethodPolicyTable => {
+            let mut stdout = io::stdout().lock();
+            stdout.write_all(render_method_policy_table().as_bytes())?;
+            stdout.flush()
+        }
     }
 }
 
@@ -8124,6 +8454,27 @@ mod tests {
         assert!(helper.contains("incoming_index"));
         assert!(!helper.contains("existing.iter().enumerate()"));
         assert!(!helper.contains("HashMap<String, usize> = HashMap::new()"));
+    }
+
+    #[test]
+    fn usage_guide_method_policy_table_matches_method_specs() {
+        let expected = render_method_policy_table();
+        for guide in ["docs/usage-guide.md", "docs/usage-guide.ja.md"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(guide);
+            let source = fs::read_to_string(&path).expect("read usage guide");
+            let start = source
+                .find(METHOD_POLICY_TABLE_BEGIN)
+                .unwrap_or_else(|| panic!("{guide} has no generated method policy table"));
+            let end = source[start..]
+                .find(METHOD_POLICY_TABLE_END)
+                .map(|offset| start + offset + METHOD_POLICY_TABLE_END.len() + 1)
+                .unwrap_or_else(|| panic!("{guide} generated table is unterminated"));
+            assert_eq!(
+                &source[start..end],
+                expected,
+                "{guide} method policy table drifted; regenerate with `cargo run --bin aira-graphdb-native -- {METHOD_POLICY_TABLE_FLAG}`"
+            );
+        }
     }
 
     #[test]
@@ -9366,6 +9717,10 @@ mod tests {
             "memory_load",
             "memory_get_schemas_by_ids",
             "memory_get_active_facts",
+            "memory_get_passages_by_ids",
+            "memory_get_facts_by_ids",
+            "memory_find_facts_by_entities",
+            "memory_section_counts",
             "memory_activate_facts_by_schema_ids",
             "memory_save_checkpoint",
             "memory_load_checkpoint",
@@ -9391,6 +9746,10 @@ mod tests {
             "memory_upsert",
             "memory_get_schemas_by_ids",
             "memory_get_active_facts",
+            "memory_get_passages_by_ids",
+            "memory_get_facts_by_ids",
+            "memory_find_facts_by_entities",
+            "memory_section_counts",
             "memory_activate_facts_by_schema_ids",
         ]
         .into_iter()
