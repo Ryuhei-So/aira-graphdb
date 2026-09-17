@@ -91,9 +91,73 @@ Search:
 | `vector_upsert` / `vector_search` / `vector_delete_by_document` | Vector insert-search-delete operations |
 | `lexical_index_passages` / `lexical_search` / `lexical_delete_by_document` | Lexical index insert-search-delete operations |
 | `memory_save` / `memory_load` | Save and load memory snapshots |
+| `memory_upsert` / `memory_activate_facts_by_schema_ids` | Bounded indexing-memory mutations (delta upsert, fact activation) |
+| `memory_get_schemas_by_ids` / `memory_get_active_facts` | Bounded indexing-memory reads |
+| `memory_get_passages_by_ids` / `memory_get_facts_by_ids` | Targeted query-path reads: full objects for the requested ids, in request order, unknown ids omitted |
+| `memory_find_facts_by_entities` | Facts whose `headEntity` or `tailEntity` case-folds (Unicode 16) to a requested entity, `factId` ascending |
+| `memory_section_counts` | `{passages, facts, schemas}` item counts for one corpus |
 | `memory_save_checkpoint` / `memory_load_checkpoint` | Save and load checkpoints |
 | `memory_validate_integrity` | Memory integrity check (currently returns an empty list) |
 | `projection_get_transitions` / `projection_get_dangling_nodes` / `projection_get_node_count` | Projection reads: transitions, dangling nodes, and node count |
+
+### Method policy (generated)
+
+The table below is generated from the native `METHOD_SPECS` table, which is the single policy authority for `protocol_info.methods[]`, WAL admission, and per-method wire limits. Regenerate it with:
+
+```bash
+cargo run --bin aira-graphdb-native -- --print-method-policy-table
+```
+
+A unit test (`usage_guide_method_policy_table_matches_method_specs`) fails when this block drifts from the binary.
+
+<!-- METHOD_SPECS:BEGIN (generated; do not edit) -->
+| Method | Classification | WAL | Wire profile |
+|---|---|---|---|
+| `ping` | health | false | normal |
+| `protocol_info` | health | false | normal |
+| `blob_lineage` | health | false | normal |
+| `batch_begin` | transaction | false | normal |
+| `batch_prepare_commit` | transaction | false | normal |
+| `batch_commit` | commit | false | normal |
+| `recovery_discard` | recovery | false | normal |
+| `upsert_nodes` | mutation | true | normal |
+| `upsert_edges` | mutation | true | normal |
+| `get_node` | read | false | normal |
+| `get_nodes` | read | false | normal |
+| `get_edges` | read | false | normal |
+| `get_adjacent` | read | false | normal |
+| `delete_nodes` | mutation | true | normal |
+| `delete_edges` | mutation | true | normal |
+| `delete_by_document` | mutation | true | normal |
+| `delete_by_corpus` | mutation | true | normal |
+| `vector_upsert` | mutation | true | normal |
+| `vector_search` | read | false | normal |
+| `vector_delete_by_document` | mutation | true | normal |
+| `memory_upsert` | mutation | true | bounded-indexing |
+| `memory_save` | mutation | true | normal |
+| `memory_save_file` | mutation | true | normal |
+| `memory_load` | read | false | normal |
+| `memory_get_schemas_by_ids` | read | false | bounded-indexing |
+| `memory_get_active_facts` | read | false | bounded-indexing |
+| `memory_get_passages_by_ids` | read | false | bounded-indexing |
+| `memory_get_facts_by_ids` | read | false | bounded-indexing |
+| `memory_find_facts_by_entities` | read | false | bounded-indexing |
+| `memory_section_counts` | read | false | bounded-indexing |
+| `memory_activate_facts_by_schema_ids` | mutation | true | bounded-indexing |
+| `memory_save_checkpoint` | mutation | true | normal |
+| `memory_load_checkpoint` | read | false | normal |
+| `memory_validate_integrity` | read | false | normal |
+| `projection_get_transitions` | read | false | normal |
+| `projection_get_dangling_nodes` | read | false | normal |
+| `projection_get_node_count` | read | false | normal |
+| `lexical_index_passages` | mutation | true | normal |
+| `lexical_search` | read | false | normal |
+| `lexical_delete_by_document` | mutation | true | normal |
+| `cypher_query` | read | false | normal |
+| `__debug_force_panic__` | debug | false | normal |
+<!-- METHOD_SPECS:END -->
+
+Bounded-indexing methods are capped at `limits.indexingMemory.maxRequestBytes` (64 MiB) per request and `limits.indexingMemory.maxResponseBytes` (8 MiB) per reply, enforced before serialization. The targeted memory reads additionally advertise `limits.memoryRead` (`schema`, `maxIdsPerRequest`, `maxEntitiesPerRequest`, `maxLimit`); consumers must read those values from `protocol_info` rather than assume them.
 
 ## 3. Conformance Report
 

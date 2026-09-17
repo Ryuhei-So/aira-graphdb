@@ -91,9 +91,73 @@ cargo run --bin aira-graphdb-native -- --db /path/to/aira-graphdb-native.db
 | `vector_upsert` / `vector_search` / `vector_delete_by_document` | ベクトルデータ登録・検索・削除 |
 | `lexical_index_passages` / `lexical_search` / `lexical_delete_by_document` | 全文インデックス登録・検索・削除 |
 | `memory_save` / `memory_load` | メモリスナップショット保存・読込 |
+| `memory_upsert` / `memory_activate_facts_by_schema_ids` | 上限付き indexing-memory 変更（差分 upsert、fact の活性化） |
+| `memory_get_schemas_by_ids` / `memory_get_active_facts` | 上限付き indexing-memory 読み取り |
+| `memory_get_passages_by_ids` / `memory_get_facts_by_ids` | クエリ経路向けの限定読み取り: 要求 id の完全オブジェクトを要求順で返し、未知 id は省略 |
+| `memory_find_facts_by_entities` | `headEntity` / `tailEntity` が要求エンティティと Unicode 16 ケースフォールドで一致する fact を `factId` 昇順で返す |
+| `memory_section_counts` | コーパス単位の `{passages, facts, schemas}` 件数 |
 | `memory_save_checkpoint` / `memory_load_checkpoint` | チェックポイント保存・読込 |
 | `memory_validate_integrity` | メモリ整合性検証（現状は空配列を返す） |
 | `projection_get_transitions` / `projection_get_dangling_nodes` / `projection_get_node_count` | 投影情報（遷移/ダングリング/ノード数）の取得 |
+
+### メソッドポリシー（自動生成）
+
+以下の表はネイティブの `METHOD_SPECS` から生成される。`METHOD_SPECS` は `protocol_info.methods[]`、WAL 受理、メソッド別ワイヤ上限の唯一の権威である。再生成コマンド:
+
+```bash
+cargo run --bin aira-graphdb-native -- --print-method-policy-table
+```
+
+このブロックがバイナリと乖離すると単体テスト（`usage_guide_method_policy_table_matches_method_specs`）が失敗する。
+
+<!-- METHOD_SPECS:BEGIN (generated; do not edit) -->
+| Method | Classification | WAL | Wire profile |
+|---|---|---|---|
+| `ping` | health | false | normal |
+| `protocol_info` | health | false | normal |
+| `blob_lineage` | health | false | normal |
+| `batch_begin` | transaction | false | normal |
+| `batch_prepare_commit` | transaction | false | normal |
+| `batch_commit` | commit | false | normal |
+| `recovery_discard` | recovery | false | normal |
+| `upsert_nodes` | mutation | true | normal |
+| `upsert_edges` | mutation | true | normal |
+| `get_node` | read | false | normal |
+| `get_nodes` | read | false | normal |
+| `get_edges` | read | false | normal |
+| `get_adjacent` | read | false | normal |
+| `delete_nodes` | mutation | true | normal |
+| `delete_edges` | mutation | true | normal |
+| `delete_by_document` | mutation | true | normal |
+| `delete_by_corpus` | mutation | true | normal |
+| `vector_upsert` | mutation | true | normal |
+| `vector_search` | read | false | normal |
+| `vector_delete_by_document` | mutation | true | normal |
+| `memory_upsert` | mutation | true | bounded-indexing |
+| `memory_save` | mutation | true | normal |
+| `memory_save_file` | mutation | true | normal |
+| `memory_load` | read | false | normal |
+| `memory_get_schemas_by_ids` | read | false | bounded-indexing |
+| `memory_get_active_facts` | read | false | bounded-indexing |
+| `memory_get_passages_by_ids` | read | false | bounded-indexing |
+| `memory_get_facts_by_ids` | read | false | bounded-indexing |
+| `memory_find_facts_by_entities` | read | false | bounded-indexing |
+| `memory_section_counts` | read | false | bounded-indexing |
+| `memory_activate_facts_by_schema_ids` | mutation | true | bounded-indexing |
+| `memory_save_checkpoint` | mutation | true | normal |
+| `memory_load_checkpoint` | read | false | normal |
+| `memory_validate_integrity` | read | false | normal |
+| `projection_get_transitions` | read | false | normal |
+| `projection_get_dangling_nodes` | read | false | normal |
+| `projection_get_node_count` | read | false | normal |
+| `lexical_index_passages` | mutation | true | normal |
+| `lexical_search` | read | false | normal |
+| `lexical_delete_by_document` | mutation | true | normal |
+| `cypher_query` | read | false | normal |
+| `__debug_force_panic__` | debug | false | normal |
+<!-- METHOD_SPECS:END -->
+
+bounded-indexing メソッドは要求 `limits.indexingMemory.maxRequestBytes`（64 MiB）、応答 `limits.indexingMemory.maxResponseBytes`（8 MiB）で上限が掛かり、シリアライズ前に検査される。限定メモリ読み取りはさらに `limits.memoryRead`（`schema`, `maxIdsPerRequest`, `maxEntitiesPerRequest`, `maxLimit`）を公開する。利用側は値を仮定せず `protocol_info` から読むこと。
 
 ## 3. Conformance レポート
 
