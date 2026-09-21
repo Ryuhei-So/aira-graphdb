@@ -171,6 +171,12 @@ fn invariants() {
     assert!(engine.vector("corpus-1", "vector-b").is_some());
     assert!(lease.vector("corpus-1", "vector-a").is_some());
     assert_eq!(lease.stable_digest(), original_digest);
+    let delete_digest = engine.overlay_digest();
+    assert_eq!(
+        engine.memory_upsert(&representative_delta("doc-a")),
+        Err(PrototypeError::MixedDeleteWithPendingChanges)
+    );
+    assert_eq!(engine.overlay_digest(), delete_digest);
 
     assert_eq!(engine.publish(), Err(PrototypeError::ReadersActive));
     assert_eq!(engine.committed_generation(), 7);
@@ -231,6 +237,45 @@ fn invariants() {
         Err(PrototypeError::LimitExceeded("vector bytes"))
     );
     assert_eq!(byte_limited.overlay_digest(), unchanged);
+
+    let mut non_finite = representative_delta("doc-c");
+    non_finite.vectors[0].values[0] = f64::NAN;
+    let mut rejecting = PrototypeEngine::new(representative_base(13), OverlayLimits::default());
+    let unchanged = rejecting.overlay_digest();
+    assert_eq!(
+        rejecting.memory_upsert(&non_finite),
+        Err(PrototypeError::InvalidDelta("non-finite vector value"))
+    );
+    assert_eq!(rejecting.overlay_digest(), unchanged);
+    assert_eq!(
+        rejecting.delete_document("corpus-1", ""),
+        Err(PrototypeError::LimitExceeded("identifier bytes"))
+    );
+    assert_eq!(rejecting.overlay_digest(), unchanged);
+    assert_eq!(
+        rejecting.memory_upsert(&DocumentDelta {
+            corpus_id: "corpus-1".into(),
+            document_id: "doc-c".into(),
+            ..DocumentDelta::default()
+        }),
+        Err(PrototypeError::InvalidDelta("empty document delta"))
+    );
+    assert_eq!(rejecting.overlay_digest(), unchanged);
+
+    let mut exhausted =
+        PrototypeEngine::new(representative_base(u64::MAX), OverlayLimits::default());
+    exhausted
+        .memory_upsert(&representative_delta("doc-c"))
+        .expect("bounded delta before generation exhaustion");
+    let exhausted_overlay = exhausted.overlay_digest();
+    let exhausted_base = exhausted.base_identity();
+    assert_eq!(
+        exhausted.publish(),
+        Err(PrototypeError::GenerationExhausted)
+    );
+    assert_eq!(exhausted.committed_generation(), u64::MAX);
+    assert_eq!(exhausted.base_identity(), exhausted_base);
+    assert_eq!(exhausted.overlay_digest(), exhausted_overlay);
 }
 
 #[test]
@@ -270,6 +315,23 @@ fn footprint() {
     assert_eq!(failed_allocations, 0);
     assert!(semantic_overlay_bytes < 512 * 1024);
 
+    let mut deleting_engine =
+        PrototypeEngine::new(representative_base(29), OverlayLimits::default());
+    let delete_retained_before = retained_bytes();
+    reset_peak();
+    deleting_engine
+        .delete_document("corpus-1", "doc-a")
+        .expect("bounded delete overlay");
+    let delete_retained_delta = retained_bytes() - delete_retained_before;
+    let delete_peak_delta = PEAK_BYTES.load(Ordering::SeqCst) - delete_retained_before;
+    let delete_requested_bytes = REQUESTED_BYTES.load(Ordering::SeqCst);
+    let delete_semantic_bytes = deleting_engine.overlay_retained_bytes();
+    assert!(delete_retained_delta >= 0);
+    assert!(delete_retained_delta < 512 * 1024);
+    assert!(delete_peak_delta < 1024 * 1024);
+    assert!(delete_requested_bytes < 2 * 1024 * 1024);
+    assert!(delete_semantic_bytes < 512 * 1024);
+
     let mut oversized = representative_delta("doc-rejected");
     oversized.passages[0].text = "x".repeat(2 * 1024 * 1024);
     let mut rejecting_engine = PrototypeEngine::new(
@@ -294,6 +356,6 @@ fn footprint() {
     assert!(rejected_peak_delta < 1024 * 1024);
     assert!(rejected_requested_bytes < 2 * 1024 * 1024);
     println!(
-        "OVERLAY_METRIC {{\"base_items_per_collection\":{base_items},\"base_collections\":2,\"fixed_delta_records\":5,\"allocator_retained_before_bytes\":{retained_before},\"allocator_retained_delta_bytes\":{actual_retained_delta},\"allocator_peak_delta_bytes\":{actual_peak_delta},\"allocator_requested_bytes\":{requested_bytes},\"allocation_count\":{allocation_count},\"failed_allocations\":{failed_allocations},\"semantic_overlay_bytes\":{semantic_overlay_bytes},\"rss_before_kib\":{rss_before_kib},\"rss_after_kib\":{rss_after_kib},\"rejected_retained_delta_bytes\":{rejected_retained_delta},\"rejected_peak_delta_bytes\":{rejected_peak_delta},\"rejected_requested_bytes\":{rejected_requested_bytes}}}"
+        "OVERLAY_METRIC {{\"base_items_per_collection\":{base_items},\"base_collections\":2,\"fixed_delta_records\":5,\"allocator_retained_before_bytes\":{retained_before},\"allocator_retained_delta_bytes\":{actual_retained_delta},\"allocator_peak_delta_bytes\":{actual_peak_delta},\"allocator_requested_bytes\":{requested_bytes},\"allocation_count\":{allocation_count},\"failed_allocations\":{failed_allocations},\"semantic_overlay_bytes\":{semantic_overlay_bytes},\"rss_before_kib\":{rss_before_kib},\"rss_after_kib\":{rss_after_kib},\"delete_retained_delta_bytes\":{delete_retained_delta},\"delete_peak_delta_bytes\":{delete_peak_delta},\"delete_requested_bytes\":{delete_requested_bytes},\"delete_semantic_bytes\":{delete_semantic_bytes},\"rejected_retained_delta_bytes\":{rejected_retained_delta},\"rejected_peak_delta_bytes\":{rejected_peak_delta},\"rejected_requested_bytes\":{rejected_requested_bytes}}}"
     );
 }

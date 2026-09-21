@@ -28,6 +28,8 @@ The test records mirror the existing domain shapes rather than treating every it
 
 Mutation admission preflights item count, vector dimensions, deep record bytes, identifiers, association arrays, tombstones, and conservative hash-table capacity before cloning an input into the overlay. Candidate construction clones only the already bounded overlay. Final accounting runs again before replacement, so failure leaves the prior overlay unchanged. Replaying the same keyed delta is idempotent.
 
+Empty deltas are rejected rather than publishing an empty generation. Non-finite vector values and generation overflow also fail before changing the overlay or base. Once delete metadata exists, a same-document upsert is rejected so a tombstone cannot be silently resurrected.
+
 `memory_upsert` neither clones nor scans the base. Delete-by-document performs an allocation-free discovery/preflight scan of the keyed base, then creates a capped overlay. Its scan time is O(corpus) and remains an explicit missing index, while retained and transient allocation remain bounded by overlay caps.
 
 ## Delete semantics in this prototype
@@ -49,10 +51,10 @@ Measured on 2026-09-21 with the unoptimized test profile:
 
 | Base (per collection) | Base collections | Retained delta | Peak delta | Requested | Semantic overlay | RSS before/after |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 | 2 | 5,463 B | 5,463 B | 5,463 B | 6,907 B | 17,248 / 17,256 KiB |
+| 10,000 | 2 | 5,463 B | 5,463 B | 5,463 B | 6,907 B | 17,256 / 17,264 KiB |
 | 200,000 | 2 | 5,463 B | 5,463 B | 5,463 B | 6,907 B | 260,416 / 260,424 KiB |
 
-The same fixed delta retained and requested exactly the same allocator bytes at both scales. The base `Arc` address stayed identical. A text-cap-rejected five-record delta retained 0 B and had 0 B transient peak/requested allocation inside the operation because preflight rejected it before cloning. RSS is coarse corroboration only; allocator current/peak/requested bytes and source inspection are the acceptance evidence.
+The same fixed delta retained and requested exactly the same allocator bytes at both scales. The base `Arc` address stayed identical. Representative delete retained and peaked at 4,768 B, requested 4,913 B, and had a 5,387 B semantic overlay at both scales; allocation-free predicates replaced uncharged temporary ID sets. A text-cap-rejected five-record delta retained 0 B and had 0 B transient peak/requested allocation inside the operation because preflight rejected it before cloning. RSS is coarse corroboration only; allocator current/peak/requested bytes and source inspection are the acceptance evidence.
 
 ## What this does not prove
 

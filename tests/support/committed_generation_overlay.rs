@@ -321,6 +321,7 @@ pub enum PrototypeError {
     LimitExceeded(&'static str),
     ReadersActive,
     NoPendingChanges,
+    GenerationExhausted,
 }
 
 pub struct CommittedLease {
@@ -421,6 +422,9 @@ impl PrototypeEngine {
     }
 
     pub fn memory_upsert(&mut self, delta: &DocumentDelta) -> Result<(), PrototypeError> {
+        if !self.overlay.deleted_documents.is_empty() {
+            return Err(PrototypeError::MixedDeleteWithPendingChanges);
+        }
         self.validate_delta(delta)?;
         self.preflight_delta(delta)?;
         let mut trial = self.overlay.clone();
@@ -463,6 +467,8 @@ impl PrototypeEngine {
         if !self.overlay.is_empty() {
             return Err(PrototypeError::MixedDeleteWithPendingChanges);
         }
+        self.validate_identifier(corpus_id)?;
+        self.validate_identifier(document_id)?;
         self.preflight_delete(corpus_id, document_id)?;
         let mut trial = Overlay::default();
         bind_document(&mut trial, corpus_id, document_id)?;
@@ -470,10 +476,8 @@ impl PrototypeEngine {
             .deleted_documents
             .insert(RecordKey::new(corpus_id, document_id));
 
-        let mut removed_passages = HashSet::new();
         for (key, value) in &self.base.passages {
             if key.corpus_id == corpus_id && value.metadata.document_id == document_id {
-                removed_passages.insert(value.passage_id.clone());
                 trial.passages.insert(key.clone(), Change::Deleted);
             }
         }
@@ -483,7 +487,6 @@ impl PrototypeEngine {
             }
         }
 
-        let mut removed_facts = HashSet::new();
         for (key, value) in &self.base.facts {
             if key.corpus_id != corpus_id
                 || !value.source_document_ids.iter().any(|id| id == document_id)
@@ -492,11 +495,14 @@ impl PrototypeEngine {
             }
             let mut patched = value.clone();
             patched.source_document_ids.retain(|id| id != document_id);
-            patched
-                .passage_ids
-                .retain(|id| !removed_passages.contains(id));
+            patched.passage_ids.retain(|id| {
+                !self.base.passages.values().any(|passage| {
+                    passage.corpus_id == corpus_id
+                        && passage.passage_id == *id
+                        && passage.metadata.document_id == document_id
+                })
+            });
             if patched.source_document_ids.is_empty() {
-                removed_facts.insert(value.fact_id.clone());
                 trial.facts.insert(key.clone(), Change::Deleted);
             } else {
                 trial.facts.insert(key.clone(), Change::Upsert(patched));
@@ -511,7 +517,20 @@ impl PrototypeEngine {
             }
             let mut patched = value.clone();
             patched.source_document_ids.retain(|id| id != document_id);
-            patched.fact_ids.retain(|id| !removed_facts.contains(id));
+            patched.fact_ids.retain(|id| {
+                !self.base.facts.values().any(|fact| {
+                    fact.corpus_id == corpus_id
+                        && fact.fact_id == *id
+                        && fact
+                            .source_document_ids
+                            .iter()
+                            .any(|doc| doc == document_id)
+                        && fact
+                            .source_document_ids
+                            .iter()
+                            .all(|doc| doc == document_id)
+                })
+            });
             patched.frequency = patched.frequency.saturating_sub(1);
             patched.state = if patched.frequency >= patched.stabilization_threshold {
                 "stable".to_string()
@@ -537,12 +556,17 @@ impl PrototypeEngine {
         if Arc::strong_count(&self.base) != 1 {
             return Err(PrototypeError::ReadersActive);
         }
+        let next_generation = self
+            .base
+            .generation
+            .checked_add(1)
+            .ok_or(PrototypeError::GenerationExhausted)?;
         let base = Arc::get_mut(&mut self.base).ok_or(PrototypeError::ReadersActive)?;
         apply_changes(&mut base.vectors, &mut self.overlay.vectors);
         apply_changes(&mut base.passages, &mut self.overlay.passages);
         apply_changes(&mut base.facts, &mut self.overlay.facts);
         apply_changes(&mut base.schemas, &mut self.overlay.schemas);
-        base.generation += 1;
+        base.generation = next_generation;
         self.overlay = Overlay::default();
         Ok(base.generation)
     }
@@ -583,6 +607,13 @@ impl PrototypeEngine {
         if delta.corpus_id.is_empty() || delta.document_id.is_empty() {
             return Err(PrototypeError::InvalidDelta("empty corpus/document id"));
         }
+        if delta.vectors.is_empty()
+            && delta.passages.is_empty()
+            && delta.facts.is_empty()
+            && delta.schemas.is_empty()
+        {
+            return Err(PrototypeError::InvalidDelta("empty document delta"));
+        }
         self.validate_identifier(&delta.corpus_id)?;
         self.validate_identifier(&delta.document_id)?;
         let submitted_entries = delta
@@ -622,6 +653,9 @@ impl PrototypeEngine {
             )?;
             if vector.values.len() > self.limits.max_vector_dimensions {
                 return Err(PrototypeError::LimitExceeded("vector dimensions"));
+            }
+            if vector.values.iter().any(|value| !value.is_finite()) {
+                return Err(PrototypeError::InvalidDelta("non-finite vector value"));
             }
             if vector.values.len().saturating_mul(size_of::<f64>()) > self.limits.max_vector_bytes {
                 return Err(PrototypeError::LimitExceeded("vector bytes"));
