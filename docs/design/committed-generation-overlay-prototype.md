@@ -30,7 +30,7 @@ Mutation admission preflights item count, vector dimensions, deep record bytes, 
 
 Empty deltas are rejected rather than publishing an empty generation. Non-finite vector values and generation overflow also fail before changing the overlay or base. Once delete metadata exists, a same-document upsert is rejected so a tombstone cannot be silently resurrected.
 
-`memory_upsert` neither clones nor scans the base. Delete-by-document performs an allocation-free discovery/preflight scan of the keyed base, then creates a capped overlay. Its scan time is O(corpus) and remains an explicit missing index, while retained and transient allocation remain bounded by overlay caps.
+`memory_upsert` neither clones nor scans the base. Delete-by-document performs allocation-free discovery/preflight over the keyed base, then creates a capped overlay. To avoid temporary ID sets, its association cleanup uses nested full-base predicates: each affected fact association can scan all passages, and each affected schema association can scan all facts. Worst-case time is therefore superlinear, not merely O(corpus). Runtime performance and the required document indexes remain unproven integration gates, while retained and transient allocation stay bounded by overlay caps.
 
 ## Delete semantics in this prototype
 
