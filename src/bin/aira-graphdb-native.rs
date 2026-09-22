@@ -1527,6 +1527,12 @@ const MAX_SCHEMA_ALIAS_ADDITIONS: usize = MAX_INDEXING_DELTA_ITEMS_PER_SECTION;
 const MAX_SCHEMA_FACT_ID_ADDITIONS: usize = MAX_INDEXING_DELTA_ITEMS_PER_SECTION;
 const MAX_SCHEMA_NODE_ID_BYTES: usize = "schema:".len() + MAX_INDEXING_DOMAIN_ID_BYTES;
 const MAX_SCHEMA_NODE_LABEL_BYTES: usize = 3 * MAX_INDEXING_DOMAIN_ID_BYTES + 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaValidationContext {
+    Stored,
+    Admission,
+}
 // Targeted memory reads (literature-hub #545). They share the bounded
 // indexing wire profile (request/response byte caps) and advertise their own
 // count bounds under `limits.memoryRead` so consumers never assume them.
@@ -5915,12 +5921,12 @@ impl Server {
     fn validate_schema_alias<'a>(
         value: &'a Value,
         label: &str,
-        exact_fields: bool,
+        context: SchemaValidationContext,
     ) -> Result<(&'a str, &'a str, &'a str), AppError> {
         let alias = value
             .as_object()
             .ok_or_else(|| Self::execution_client_error(format!("{label} must be an object")))?;
-        if exact_fields {
+        if context == SchemaValidationContext::Admission {
             Self::require_exact_object_keys(
                 alias,
                 &["label", "language", "source", "confidence", "isCanonical"],
@@ -5967,6 +5973,7 @@ impl Server {
         value: &'a Value,
         corpus_id: &str,
         label: &str,
+        context: SchemaValidationContext,
     ) -> Result<&'a serde_json::Map<String, Value>, AppError> {
         let schema = value
             .as_object()
@@ -6009,7 +6016,7 @@ impl Server {
                 Self::execution_client_error(format!("{label}.aliases must be an array"))
             })?;
         for alias in aliases {
-            Self::validate_schema_alias(alias, "schema alias", false)?;
+            Self::validate_schema_alias(alias, "schema alias", context)?;
         }
         for field in ["factIds", "sourceDocumentIds"] {
             let values = schema.get(field).and_then(Value::as_array).ok_or_else(|| {
@@ -6059,7 +6066,12 @@ impl Server {
         corpus_id: &str,
         contribution_document_id: &str,
     ) -> Result<Value, AppError> {
-        let object = Self::validate_schema_value(schema, corpus_id, "stored schema")?;
+        let object = Self::validate_schema_value(
+            schema,
+            corpus_id,
+            "stored schema",
+            SchemaValidationContext::Stored,
+        )?;
         let source_document_ids = object
             .get("sourceDocumentIds")
             .and_then(Value::as_array)
@@ -6120,7 +6132,12 @@ impl Server {
                     let schema = object.get("schema").ok_or_else(|| {
                         Self::execution_client_error("schema create.schema is missing".to_string())
                     })?;
-                    let schema = Self::validate_schema_value(schema, corpus_id, "schema create")?;
+                    let schema = Self::validate_schema_value(
+                        schema,
+                        corpus_id,
+                        "schema create",
+                        SchemaValidationContext::Admission,
+                    )?;
                     schema
                         .get("schemaId")
                         .and_then(Value::as_str)
@@ -6190,8 +6207,11 @@ impl Server {
                         })?;
                     let mut alias_keys = HashSet::with_capacity(aliases.len());
                     for alias in aliases {
-                        let key =
-                            Self::validate_schema_alias(alias, "schema alias addition", true)?;
+                        let key = Self::validate_schema_alias(
+                            alias,
+                            "schema alias addition",
+                            SchemaValidationContext::Admission,
+                        )?;
                         if !alias_keys.insert(key) {
                             return Err(Self::execution_client_error(
                                 "schema alias additions must be unique".to_string(),
@@ -6285,7 +6305,12 @@ impl Server {
             let schema = stored.get(schema_id).copied().ok_or_else(|| {
                 Self::execution_client_error("schema merge target is absent".to_string())
             })?;
-            let current = Self::validate_schema_value(schema, corpus_id, "stored schema")?;
+            let current = Self::validate_schema_value(
+                schema,
+                corpus_id,
+                "stored schema",
+                SchemaValidationContext::Stored,
+            )?;
             let expected = object["expectedMergeToken"]
                 .as_str()
                 .expect("merge token validated above");
@@ -6436,7 +6461,12 @@ impl Server {
                 ));
             }
             let schema = self.schema_for_hydration(corpus_id, schema_id)?;
-            let schema = Self::validate_schema_value(schema, corpus_id, "stored schema")?;
+            let schema = Self::validate_schema_value(
+                schema,
+                corpus_id,
+                "stored schema",
+                SchemaValidationContext::Stored,
+            )?;
             let expected_label = format!(
                 "{} {} {}",
                 schema["headType"]
@@ -10670,6 +10700,40 @@ mod tests {
             fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0),
             wal_before
         );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn schema_create_rejects_extended_aliases_at_real_admission_before_wal() {
+        let path = temp_path("agdb-native-schema-create-alias-admission");
+        let mut server = Server::open(path.clone()).expect("open server");
+        begin_batch(&mut server);
+        let state_before = serde_json::to_vec(&server.state).unwrap();
+        let wal_path = path.with_extension("agdb.wal");
+        let wal_before = fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0);
+        let response = server.handle(RpcRequest {
+            id: 1,
+            method: "memory_upsert".to_string(),
+            params: json!({
+                "corpusId":"c1", "passages":[], "facts":[],
+                "schemaMerges":[{
+                    "mode":"create", "expectedAbsent":true,
+                    "schema":schema_fixture("schema:private-create", vec!["doc:new".to_string()])
+                }],
+                "exportedAt":"2026-09-23T00:00:00.000Z"
+            }),
+        });
+        assert!(!response.ok, "create aliases are strict admission values");
+        let error = response.error.expect("structured admission error");
+        assert_eq!(error.failure_class.as_deref(), Some("CLIENT_INPUT"));
+        assert!(!error.message.contains("schema:private-create"));
+        assert!(!error.message.contains("alias-history-secret"));
+        assert_eq!(serde_json::to_vec(&server.state).unwrap(), state_before);
+        assert_eq!(
+            fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0),
+            wal_before
+        );
+        assert!(server.fatal, "real mutation admission fails closed");
         cleanup(&path);
     }
 
