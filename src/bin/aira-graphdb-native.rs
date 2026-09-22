@@ -10593,6 +10593,27 @@ mod tests {
             fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0),
             wal_before
         );
+
+        let oversized = RpcRequest {
+            id: 4,
+            method: "memory_upsert".to_string(),
+            params: json!({
+                "corpusId":"c1",
+                "schemaMerges":[{"oversized": "x".repeat(MAX_INDEXING_REQUEST_BYTES as usize)}]
+            }),
+        };
+        let oversized_error = server
+            .validate_mutation_params(&oversized)
+            .expect_err("request over 64 MiB must fail before semantic validation");
+        assert_eq!(
+            oversized_error.message,
+            "bounded indexing request exceeds its byte limit"
+        );
+        assert_eq!(serde_json::to_vec(&server.state).unwrap(), state_before);
+        assert_eq!(
+            fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0),
+            wal_before
+        );
         cleanup(&path);
     }
 
