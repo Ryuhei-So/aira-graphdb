@@ -2715,7 +2715,20 @@ fn bounded_indexing_memory_reads_and_activation_preserve_transaction_authority()
             "maxDeltaItemsPerSection":4096,
             "maxDomainIdBytes":4096,
             "maxCorpusIdBytes":1024,
-            "maxUpdatedAtBytes":128
+            "maxUpdatedAtBytes":128,
+            "schemaCanonicalization": {
+                "schema":"native-schema-canonicalization@1",
+                "projection":"canonicalization@1",
+                "merge":"preserve-cas@1",
+                "graphHydration":"memory-schema@1",
+                "maxProjectedSchemas":32,
+                "maxSchemaMerges":32,
+                "maxGraphHydrations":32,
+                "maxAliasAdditions":4096,
+                "maxFactIdAdditions":4096,
+                "maxSchemaNodeIdBytes":4103,
+                "maxSchemaNodeLabelBytes":12290
+            }
         })
     );
     assert_eq!(
