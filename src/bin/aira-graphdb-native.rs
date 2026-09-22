@@ -34,6 +34,19 @@ use aira_graphdb::unicode16_lowercase;
 #[path = "aira-graphdb-native/bounded_retrieval_runtime.rs"]
 mod bounded_retrieval_runtime;
 
+struct Sha256Writer(Sha256);
+
+impl Write for Sha256Writer {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct GraphNode {
@@ -1505,6 +1518,15 @@ const MAX_INDEXING_DELTA_ITEMS_PER_SECTION: usize = 4096;
 const MAX_INDEXING_DOMAIN_ID_BYTES: usize = 4096;
 const MAX_INDEXING_CORPUS_ID_BYTES: usize = 1024;
 const MAX_INDEXING_UPDATED_AT_BYTES: usize = 128;
+const SCHEMA_CANONICALIZATION_PROTOCOL_SCHEMA: &str = "native-schema-canonicalization@1";
+const SCHEMA_CANONICALIZATION_PROJECTION: &str = "canonicalization@1";
+const SCHEMA_CANONICALIZATION_MERGE: &str = "preserve-cas@1";
+const SCHEMA_REFERENCE_HYDRATION: &str = "memory-schema@1";
+const MAX_CANONICALIZATION_SCHEMAS: usize = 32;
+const MAX_SCHEMA_ALIAS_ADDITIONS: usize = MAX_INDEXING_DELTA_ITEMS_PER_SECTION;
+const MAX_SCHEMA_FACT_ID_ADDITIONS: usize = MAX_INDEXING_DELTA_ITEMS_PER_SECTION;
+const MAX_SCHEMA_NODE_ID_BYTES: usize = "schema:".len() + MAX_INDEXING_DOMAIN_ID_BYTES;
+const MAX_SCHEMA_NODE_LABEL_BYTES: usize = 3 * MAX_INDEXING_DOMAIN_ID_BYTES + 2;
 // Targeted memory reads (literature-hub #545). They share the bounded
 // indexing wire profile (request/response byte caps) and advertise their own
 // count bounds under `limits.memoryRead` so consumers never assume them.
@@ -5842,6 +5864,713 @@ impl Server {
         Ok(())
     }
 
+    fn require_exact_object_keys(
+        object: &serde_json::Map<String, Value>,
+        allowed: &[&str],
+        label: &str,
+    ) -> Result<(), AppError> {
+        if object.len() != allowed.len()
+            || object.keys().any(|key| !allowed.contains(&key.as_str()))
+        {
+            return Err(Self::execution_client_error(format!(
+                "{label} has an invalid field set"
+            )));
+        }
+        Ok(())
+    }
+
+    fn bounded_object_string<'a>(
+        object: &'a serde_json::Map<String, Value>,
+        field: &str,
+        maximum: usize,
+        label: &str,
+    ) -> Result<&'a str, AppError> {
+        object
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= maximum)
+            .ok_or_else(|| {
+                Self::execution_client_error(format!(
+                    "{label}.{field} must be a bounded non-empty string"
+                ))
+            })
+    }
+
+    fn safe_u64_field(
+        object: &serde_json::Map<String, Value>,
+        field: &str,
+        label: &str,
+    ) -> Result<u64, AppError> {
+        object
+            .get(field)
+            .and_then(Value::as_u64)
+            .filter(|value| *value <= JSON_SAFE_INTEGER_MAX)
+            .ok_or_else(|| {
+                Self::execution_client_error(format!(
+                    "{label}.{field} must be a nonnegative safe integer"
+                ))
+            })
+    }
+
+    fn validate_schema_alias<'a>(
+        value: &'a Value,
+        label: &str,
+    ) -> Result<(&'a str, &'a str, &'a str), AppError> {
+        let alias = value
+            .as_object()
+            .ok_or_else(|| Self::execution_client_error(format!("{label} must be an object")))?;
+        Self::require_exact_object_keys(
+            alias,
+            &["label", "language", "source", "confidence", "isCanonical"],
+            label,
+        )?;
+        let text =
+            Self::bounded_object_string(alias, "label", MAX_INDEXING_DOMAIN_ID_BYTES, label)?;
+        let language =
+            Self::bounded_object_string(alias, "language", MAX_INDEXING_DOMAIN_ID_BYTES, label)?;
+        if !matches!(language, "en" | "ja" | "mixed" | "unknown") {
+            return Err(Self::execution_client_error(format!(
+                "{label}.language is unsupported"
+            )));
+        }
+        let source =
+            Self::bounded_object_string(alias, "source", MAX_INDEXING_DOMAIN_ID_BYTES, label)?;
+        if !matches!(
+            source,
+            "llm" | "nlp" | "dictionary" | "thesaurus" | "manual" | "import"
+        ) {
+            return Err(Self::execution_client_error(format!(
+                "{label}.source is unsupported"
+            )));
+        }
+        if !alias
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .is_some_and(f64::is_finite)
+        {
+            return Err(Self::execution_client_error(format!(
+                "{label}.confidence must be finite"
+            )));
+        }
+        if !alias.get("isCanonical").is_some_and(Value::is_boolean) {
+            return Err(Self::execution_client_error(format!(
+                "{label}.isCanonical must be boolean"
+            )));
+        }
+        Ok((text, language, source))
+    }
+
+    fn validate_schema_value<'a>(
+        value: &'a Value,
+        corpus_id: &str,
+        label: &str,
+    ) -> Result<&'a serde_json::Map<String, Value>, AppError> {
+        let schema = value
+            .as_object()
+            .ok_or_else(|| Self::execution_client_error(format!("{label} must be an object")))?;
+        let embedded_corpus =
+            Self::bounded_object_string(schema, "corpusId", MAX_INDEXING_CORPUS_ID_BYTES, label)?;
+        if embedded_corpus != corpus_id {
+            return Err(Self::execution_client_error(format!(
+                "{label}.corpusId does not match corpusId"
+            )));
+        }
+        for field in [
+            "schemaId",
+            "headType",
+            "relation",
+            "tailType",
+            "canonicalKey",
+        ] {
+            Self::bounded_object_string(schema, field, MAX_INDEXING_DOMAIN_ID_BYTES, label)?;
+        }
+        for field in ["createdAt", "updatedAt"] {
+            Self::bounded_object_string(schema, field, MAX_INDEXING_UPDATED_AT_BYTES, label)?;
+        }
+        for field in ["frequency", "stabilizationThreshold", "version"] {
+            Self::safe_u64_field(schema, field, label)?;
+        }
+        if !schema
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| matches!(state, "pending" | "stable"))
+        {
+            return Err(Self::execution_client_error(format!(
+                "{label}.state is unsupported"
+            )));
+        }
+        let aliases = schema
+            .get("aliases")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                Self::execution_client_error(format!("{label}.aliases must be an array"))
+            })?;
+        for alias in aliases {
+            Self::validate_schema_alias(alias, "schema alias")?;
+        }
+        for field in ["factIds", "sourceDocumentIds"] {
+            let values = schema.get(field).and_then(Value::as_array).ok_or_else(|| {
+                Self::execution_client_error(format!("{label}.{field} must be an array"))
+            })?;
+            for item in values {
+                if !item.as_str().is_some_and(|text| {
+                    !text.is_empty() && text.len() <= MAX_INDEXING_DOMAIN_ID_BYTES
+                }) {
+                    return Err(Self::execution_client_error(format!(
+                        "{label}.{field} must contain bounded non-empty strings"
+                    )));
+                }
+            }
+        }
+        Ok(schema)
+    }
+
+    fn schema_merge_token(schema: &Value) -> Result<String, AppError> {
+        let mut writer = Sha256Writer(Sha256::new());
+        writer.0.update(b"aira-graphdb-schema-merge-token-v1\0");
+        serde_json::to_writer(&mut writer, schema).map_err(|_| {
+            Self::execution_client_error("stored schema token serialization failed".to_string())
+        })?;
+        let digest: [u8; 32] = writer.0.finalize().into();
+        Ok(Self::digest_hex(&digest))
+    }
+
+    fn validate_merge_token<'a>(value: &'a Value, label: &str) -> Result<&'a str, AppError> {
+        value
+            .as_str()
+            .filter(|token| {
+                token.len() == 64
+                    && token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or_else(|| {
+                Self::execution_client_error(format!(
+                    "{label}.expectedMergeToken must be lowercase SHA-256 hex"
+                ))
+            })
+    }
+
+    fn schema_projection(
+        schema: &Value,
+        corpus_id: &str,
+        contribution_document_id: &str,
+    ) -> Result<Value, AppError> {
+        let object = Self::validate_schema_value(schema, corpus_id, "stored schema")?;
+        let source_document_ids = object
+            .get("sourceDocumentIds")
+            .and_then(Value::as_array)
+            .expect("stored schema sourceDocumentIds validated above");
+        let first_source_document_id = source_document_ids.first().cloned().unwrap_or(Value::Null);
+        let contribution_present = source_document_ids
+            .iter()
+            .any(|value| value.as_str() == Some(contribution_document_id));
+        Ok(json!({
+            "schemaId": object["schemaId"].clone(),
+            "corpusId": object["corpusId"].clone(),
+            "headType": object["headType"].clone(),
+            "relation": object["relation"].clone(),
+            "tailType": object["tailType"].clone(),
+            "canonicalKey": object["canonicalKey"].clone(),
+            "frequency": object["frequency"].clone(),
+            "state": object["state"].clone(),
+            "stabilizationThreshold": object["stabilizationThreshold"].clone(),
+            "firstSourceDocumentId": first_source_document_id,
+            "contributionPresent": contribution_present,
+            "mergeToken": Self::schema_merge_token(schema)?,
+        }))
+    }
+
+    fn validate_schema_merge_intents(
+        &self,
+        corpus_id: &str,
+        intents: &[Value],
+    ) -> Result<(), AppError> {
+        if intents.is_empty() || intents.len() > MAX_CANONICALIZATION_SCHEMAS {
+            return Err(Self::execution_client_error(format!(
+                "schemaMerges length must be in [1, {MAX_CANONICALIZATION_SCHEMAS}]"
+            )));
+        }
+
+        let mut intent_ids = HashSet::with_capacity(intents.len());
+        let mut alias_additions = 0usize;
+        let mut fact_id_additions = 0usize;
+        for intent in intents {
+            let object = intent.as_object().ok_or_else(|| {
+                Self::execution_client_error("schemaMerges items must be objects".to_string())
+            })?;
+            let mode = object.get("mode").and_then(Value::as_str).ok_or_else(|| {
+                Self::execution_client_error("schemaMerges.mode must be a string".to_string())
+            })?;
+            let schema_id = match mode {
+                "create" => {
+                    Self::require_exact_object_keys(
+                        object,
+                        &["mode", "expectedAbsent", "schema"],
+                        "schema create",
+                    )?;
+                    if object.get("expectedAbsent") != Some(&Value::Bool(true)) {
+                        return Err(Self::execution_client_error(
+                            "schema create.expectedAbsent must be true".to_string(),
+                        ));
+                    }
+                    let schema = object.get("schema").ok_or_else(|| {
+                        Self::execution_client_error("schema create.schema is missing".to_string())
+                    })?;
+                    let schema = Self::validate_schema_value(schema, corpus_id, "schema create")?;
+                    schema
+                        .get("schemaId")
+                        .and_then(Value::as_str)
+                        .expect("created schema id validated above")
+                }
+                "merge" => {
+                    Self::require_exact_object_keys(
+                        object,
+                        &[
+                            "mode",
+                            "schemaId",
+                            "expectedMergeToken",
+                            "contributionDocumentId",
+                            "frequencyDelta",
+                            "desiredState",
+                            "stabilizationThreshold",
+                            "updatedAt",
+                            "aliasAdditions",
+                            "factIdAdditions",
+                        ],
+                        "schema merge",
+                    )?;
+                    let schema_id = Self::bounded_object_string(
+                        object,
+                        "schemaId",
+                        MAX_INDEXING_DOMAIN_ID_BYTES,
+                        "schema merge",
+                    )?;
+                    Self::validate_merge_token(
+                        object
+                            .get("expectedMergeToken")
+                            .expect("exact merge fields checked above"),
+                        "schema merge",
+                    )?;
+                    Self::bounded_object_string(
+                        object,
+                        "contributionDocumentId",
+                        MAX_INDEXING_DOMAIN_ID_BYTES,
+                        "schema merge",
+                    )?;
+                    Self::safe_u64_field(object, "frequencyDelta", "schema merge")?;
+                    Self::safe_u64_field(object, "stabilizationThreshold", "schema merge")?;
+                    Self::bounded_object_string(
+                        object,
+                        "updatedAt",
+                        MAX_INDEXING_UPDATED_AT_BYTES,
+                        "schema merge",
+                    )?;
+                    if !object
+                        .get("desiredState")
+                        .and_then(Value::as_str)
+                        .is_some_and(|state| matches!(state, "pending" | "stable"))
+                    {
+                        return Err(Self::execution_client_error(
+                            "schema merge.desiredState is unsupported".to_string(),
+                        ));
+                    }
+                    let aliases = object
+                        .get("aliasAdditions")
+                        .and_then(Value::as_array)
+                        .expect("exact merge fields checked above");
+                    alias_additions =
+                        alias_additions.checked_add(aliases.len()).ok_or_else(|| {
+                            Self::execution_client_error(
+                                "schema merge alias addition count overflow".to_string(),
+                            )
+                        })?;
+                    let mut alias_keys = HashSet::with_capacity(aliases.len());
+                    for alias in aliases {
+                        let key = Self::validate_schema_alias(alias, "schema alias addition")?;
+                        if !alias_keys.insert(key) {
+                            return Err(Self::execution_client_error(
+                                "schema alias additions must be unique".to_string(),
+                            ));
+                        }
+                    }
+                    let fact_ids = object
+                        .get("factIdAdditions")
+                        .and_then(Value::as_array)
+                        .expect("exact merge fields checked above");
+                    fact_id_additions =
+                        fact_id_additions
+                            .checked_add(fact_ids.len())
+                            .ok_or_else(|| {
+                                Self::execution_client_error(
+                                    "schema merge fact ID addition count overflow".to_string(),
+                                )
+                            })?;
+                    let mut seen_facts = HashSet::with_capacity(fact_ids.len());
+                    for fact_id in fact_ids {
+                        let fact_id = fact_id.as_str().filter(|value| {
+                            !value.is_empty() && value.len() <= MAX_INDEXING_DOMAIN_ID_BYTES
+                        });
+                        if fact_id.is_none_or(|value| !seen_facts.insert(value)) {
+                            return Err(Self::execution_client_error(
+                                "schema fact ID additions must be bounded and unique".to_string(),
+                            ));
+                        }
+                    }
+                    schema_id
+                }
+                _ => {
+                    return Err(Self::execution_client_error(
+                        "schemaMerges.mode is unsupported".to_string(),
+                    ));
+                }
+            };
+            if !intent_ids.insert(schema_id) {
+                return Err(Self::execution_client_error(
+                    "schemaMerges must not contain duplicate schemaId values".to_string(),
+                ));
+            }
+        }
+        if alias_additions > MAX_SCHEMA_ALIAS_ADDITIONS {
+            return Err(Self::execution_client_error(format!(
+                "schema alias additions must not exceed {MAX_SCHEMA_ALIAS_ADDITIONS}"
+            )));
+        }
+        if fact_id_additions > MAX_SCHEMA_FACT_ID_ADDITIONS {
+            return Err(Self::execution_client_error(format!(
+                "schema fact ID additions must not exceed {MAX_SCHEMA_FACT_ID_ADDITIONS}"
+            )));
+        }
+
+        let mut stored = HashMap::with_capacity(intent_ids.len());
+        for schema in self
+            .stored_snapshot_section(corpus_id, "schemas")?
+            .into_iter()
+            .flatten()
+        {
+            Self::validate_stored_section_item(schema, corpus_id, "schemas", "schemaId")?;
+            let schema_id = schema
+                .get("schemaId")
+                .and_then(Value::as_str)
+                .expect("stored schema id validated above");
+            if intent_ids.contains(schema_id) && stored.insert(schema_id, schema).is_some() {
+                return Err(Self::execution_client_error(
+                    "stored schemas contain a duplicate requested schemaId".to_string(),
+                ));
+            }
+        }
+
+        for intent in intents {
+            let object = intent
+                .as_object()
+                .expect("schema merge intent validated above");
+            if object.get("mode").and_then(Value::as_str) == Some("create") {
+                let schema_id = object["schema"]["schemaId"]
+                    .as_str()
+                    .expect("created schema id validated above");
+                if stored.contains_key(schema_id) {
+                    return Err(Self::execution_client_error(
+                        "schema create expected absence".to_string(),
+                    ));
+                }
+                continue;
+            }
+            let schema_id = object["schemaId"]
+                .as_str()
+                .expect("merged schema id validated above");
+            let schema = stored.get(schema_id).copied().ok_or_else(|| {
+                Self::execution_client_error("schema merge target is absent".to_string())
+            })?;
+            let current = Self::validate_schema_value(schema, corpus_id, "stored schema")?;
+            let expected = object["expectedMergeToken"]
+                .as_str()
+                .expect("merge token validated above");
+            if Self::schema_merge_token(schema)? != expected {
+                return Err(Self::execution_client_error(
+                    "schema merge token is stale".to_string(),
+                ));
+            }
+            let contribution_document_id = object["contributionDocumentId"]
+                .as_str()
+                .expect("contribution document id validated above");
+            let contribution_present = current["sourceDocumentIds"]
+                .as_array()
+                .expect("stored sourceDocumentIds validated above")
+                .iter()
+                .any(|value| value.as_str() == Some(contribution_document_id));
+            let frequency_delta = object["frequencyDelta"]
+                .as_u64()
+                .expect("frequency delta validated above");
+            if contribution_present && frequency_delta != 0 {
+                return Err(Self::execution_client_error(
+                    "schema merge frequencyDelta must be zero for an existing contribution"
+                        .to_string(),
+                ));
+            }
+            if !contribution_present && frequency_delta == 0 {
+                return Err(Self::execution_client_error(
+                    "schema merge frequencyDelta must be positive for a new contribution"
+                        .to_string(),
+                ));
+            }
+            current["frequency"]
+                .as_u64()
+                .expect("stored frequency validated above")
+                .checked_add(frequency_delta)
+                .filter(|value| *value <= JSON_SAFE_INTEGER_MAX)
+                .ok_or_else(|| {
+                    Self::execution_client_error(
+                        "schema merge frequency exceeds the safe integer range".to_string(),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn schema_for_hydration<'a>(
+        &'a self,
+        corpus_id: &str,
+        schema_id: &str,
+    ) -> Result<&'a Value, AppError> {
+        let mut found = None;
+        for schema in self
+            .stored_snapshot_section(corpus_id, "schemas")?
+            .into_iter()
+            .flatten()
+        {
+            Self::validate_stored_section_item(schema, corpus_id, "schemas", "schemaId")?;
+            if schema.get("schemaId").and_then(Value::as_str) != Some(schema_id) {
+                continue;
+            }
+            if found.replace(schema).is_some() {
+                return Err(Self::execution_client_error(
+                    "stored schemas contain a duplicate hydration target".to_string(),
+                ));
+            }
+        }
+        found.ok_or_else(|| {
+            Self::execution_client_error("schema hydration target is absent".to_string())
+        })
+    }
+
+    fn validate_schema_node_hydrations(
+        &self,
+        params: &serde_json::Map<String, Value>,
+    ) -> Result<(), AppError> {
+        let has_version = params.contains_key("schemaRefHydration");
+        let has_markers = params.contains_key("schemaNodeRefs");
+        if !has_version && !has_markers {
+            return Ok(());
+        }
+        if !(has_version && has_markers) {
+            return Err(Self::execution_client_error(
+                "schema hydration version and markers must be supplied together".to_string(),
+            ));
+        }
+        Self::reject_unknown_params(params, &["nodes", "schemaRefHydration", "schemaNodeRefs"])?;
+        if params.get("schemaRefHydration").and_then(Value::as_str)
+            != Some(SCHEMA_REFERENCE_HYDRATION)
+        {
+            return Err(Self::execution_client_error(
+                "schemaRefHydration is unsupported".to_string(),
+            ));
+        }
+        let markers = Self::optional_array(params, "schemaNodeRefs")?
+            .expect("schemaNodeRefs presence checked above");
+        if markers.is_empty() || markers.len() > MAX_CANONICALIZATION_SCHEMAS {
+            return Err(Self::execution_client_error(format!(
+                "schemaNodeRefs length must be in [1, {MAX_CANONICALIZATION_SCHEMAS}]"
+            )));
+        }
+        let mut node_keys = HashSet::new();
+        for node in Self::optional_array(params, "nodes")?.into_iter().flatten() {
+            let parsed = serde_json::from_value::<GraphNode>(node.clone())
+                .map_err(|err| Self::execution_client_error(format!("invalid node: {err}")))?;
+            node_keys.insert((parsed.corpus_id, parsed.node_id));
+        }
+        for marker in markers {
+            let marker = marker.as_object().ok_or_else(|| {
+                Self::execution_client_error("schemaNodeRefs items must be objects".to_string())
+            })?;
+            Self::require_exact_object_keys(
+                marker,
+                &["nodeId", "corpusId", "schemaId", "label"],
+                "schema node reference",
+            )?;
+            let node_id = Self::bounded_object_string(
+                marker,
+                "nodeId",
+                MAX_SCHEMA_NODE_ID_BYTES,
+                "schema node reference",
+            )?;
+            let corpus_id = Self::bounded_object_string(
+                marker,
+                "corpusId",
+                MAX_INDEXING_CORPUS_ID_BYTES,
+                "schema node reference",
+            )?;
+            let schema_id = Self::bounded_object_string(
+                marker,
+                "schemaId",
+                MAX_INDEXING_DOMAIN_ID_BYTES,
+                "schema node reference",
+            )?;
+            let label = Self::bounded_object_string(
+                marker,
+                "label",
+                MAX_SCHEMA_NODE_LABEL_BYTES,
+                "schema node reference",
+            )?;
+            if node_id != format!("schema:{schema_id}") {
+                return Err(Self::execution_client_error(
+                    "schema node reference nodeId is inconsistent".to_string(),
+                ));
+            }
+            if !node_keys.insert((corpus_id.to_string(), node_id.to_string())) {
+                return Err(Self::execution_client_error(
+                    "upsert_nodes contains a duplicate node key".to_string(),
+                ));
+            }
+            let schema = self.schema_for_hydration(corpus_id, schema_id)?;
+            let schema = Self::validate_schema_value(schema, corpus_id, "stored schema")?;
+            let expected_label = format!(
+                "{} {} {}",
+                schema["headType"]
+                    .as_str()
+                    .expect("schema headType validated above"),
+                schema["relation"]
+                    .as_str()
+                    .expect("schema relation validated above"),
+                schema["tailType"]
+                    .as_str()
+                    .expect("schema tailType validated above")
+            );
+            if label != expected_label {
+                return Err(Self::execution_client_error(
+                    "schema node reference label is inconsistent".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_schema_merge_intents(snapshot: &mut Value, intents: &[Value]) {
+        if !snapshot.get("schemas").is_some_and(Value::is_array) {
+            snapshot["schemas"] = json!([]);
+        }
+        let schemas = snapshot["schemas"]
+            .as_array_mut()
+            .expect("snapshot schemas prepared as an array");
+        for intent in intents {
+            let object = intent
+                .as_object()
+                .expect("schema merge intent validated before WAL");
+            if object["mode"].as_str() == Some("create") {
+                schemas.push(object["schema"].clone());
+                continue;
+            }
+            let schema_id = object["schemaId"]
+                .as_str()
+                .expect("merge schema id validated before WAL");
+            let schema = schemas
+                .iter_mut()
+                .find(|schema| schema["schemaId"].as_str() == Some(schema_id))
+                .expect("merge target validated before WAL")
+                .as_object_mut()
+                .expect("merge target object validated before WAL");
+            let frequency = schema["frequency"]
+                .as_u64()
+                .expect("stored frequency validated before WAL")
+                .checked_add(
+                    object["frequencyDelta"]
+                        .as_u64()
+                        .expect("frequency delta validated before WAL"),
+                )
+                .expect("frequency overflow rejected before WAL");
+            schema.insert("frequency".to_string(), json!(frequency));
+            schema.insert("state".to_string(), object["desiredState"].clone());
+            schema.insert(
+                "stabilizationThreshold".to_string(),
+                object["stabilizationThreshold"].clone(),
+            );
+            schema.insert("updatedAt".to_string(), object["updatedAt"].clone());
+
+            let aliases = schema["aliases"]
+                .as_array_mut()
+                .expect("stored aliases validated before WAL");
+            for addition in object["aliasAdditions"]
+                .as_array()
+                .expect("alias additions validated before WAL")
+            {
+                let addition_object = addition
+                    .as_object()
+                    .expect("alias addition validated before WAL");
+                let exists = aliases.iter().any(|alias| {
+                    alias["label"] == addition_object["label"]
+                        && alias["language"] == addition_object["language"]
+                        && alias["source"] == addition_object["source"]
+                });
+                if !exists {
+                    aliases.push(addition.clone());
+                }
+            }
+            let fact_ids = schema["factIds"]
+                .as_array_mut()
+                .expect("stored factIds validated before WAL");
+            for addition in object["factIdAdditions"]
+                .as_array()
+                .expect("fact ID additions validated before WAL")
+            {
+                if !fact_ids.contains(addition) {
+                    fact_ids.push(addition.clone());
+                }
+            }
+            let source_document_ids = schema["sourceDocumentIds"]
+                .as_array_mut()
+                .expect("stored sourceDocumentIds validated before WAL");
+            let contribution = &object["contributionDocumentId"];
+            if !source_document_ids.contains(contribution) {
+                source_document_ids.push(contribution.clone());
+            }
+        }
+    }
+
+    fn hydrated_schema_nodes(&self, params: &serde_json::Map<String, Value>) -> Vec<GraphNode> {
+        let Some(markers) = params.get("schemaNodeRefs").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        markers
+            .iter()
+            .map(|marker| {
+                let marker = marker
+                    .as_object()
+                    .expect("schema hydration marker validated before WAL");
+                let corpus_id = marker["corpusId"]
+                    .as_str()
+                    .expect("hydration corpus id validated before WAL");
+                let schema_id = marker["schemaId"]
+                    .as_str()
+                    .expect("hydration schema id validated before WAL");
+                GraphNode {
+                    node_id: marker["nodeId"]
+                        .as_str()
+                        .expect("hydration node id validated before WAL")
+                        .to_string(),
+                    corpus_id: corpus_id.to_string(),
+                    layer: "ontology".to_string(),
+                    r#ref: self
+                        .schema_for_hydration(corpus_id, schema_id)
+                        .expect("hydration target validated before WAL")
+                        .clone(),
+                    label: marker["label"]
+                        .as_str()
+                        .expect("hydration label validated before WAL")
+                        .to_string(),
+                }
+            })
+            .collect()
+    }
+
     fn validate_stored_fact_item<'a>(
         fact: &'a Value,
         corpus_id: &str,
@@ -5928,6 +6657,7 @@ impl Server {
                         })?;
                     }
                 }
+                self.validate_schema_node_hydrations(params)?;
             }
             "upsert_edges" => {
                 if let Some(items) = Self::optional_array(params, "edges")? {
@@ -5984,13 +6714,25 @@ impl Server {
                 Self::validate_indexing_request_size(req)?;
                 Self::reject_unknown_params(
                     params,
-                    &["corpusId", "passages", "facts", "schemas", "exportedAt"],
+                    &[
+                        "corpusId",
+                        "passages",
+                        "facts",
+                        "schemas",
+                        "schemaMerges",
+                        "exportedAt",
+                    ],
                 )?;
                 let corpus_id = Self::bounded_required_string(
                     params,
                     "corpusId",
                     MAX_INDEXING_CORPUS_ID_BYTES,
                 )?;
+                if params.contains_key("schemaMerges") && params.contains_key("schemas") {
+                    return Err(Self::execution_client_error(
+                        "schemas and schemaMerges are mutually exclusive".to_string(),
+                    ));
+                }
                 for (section, id_key) in [
                     ("passages", "passageId"),
                     ("facts", "factId"),
@@ -6043,6 +6785,9 @@ impl Server {
                 // deterministic shape/corpus error after durability evidence
                 // has already been written.
                 self.validate_stored_snapshot_for_upsert(corpus_id)?;
+                if let Some(intents) = Self::optional_array(params, "schemaMerges")? {
+                    self.validate_schema_merge_intents(corpus_id, intents)?;
+                }
             }
             "memory_activate_facts_by_schema_ids" => {
                 Self::validate_indexing_request_size(req)?;
@@ -6458,6 +7203,19 @@ impl Server {
                                 "maxDomainIdBytes": MAX_INDEXING_DOMAIN_ID_BYTES,
                                 "maxCorpusIdBytes": MAX_INDEXING_CORPUS_ID_BYTES,
                                 "maxUpdatedAtBytes": MAX_INDEXING_UPDATED_AT_BYTES,
+                                "schemaCanonicalization": {
+                                    "schema": SCHEMA_CANONICALIZATION_PROTOCOL_SCHEMA,
+                                    "projection": SCHEMA_CANONICALIZATION_PROJECTION,
+                                    "merge": SCHEMA_CANONICALIZATION_MERGE,
+                                    "graphHydration": SCHEMA_REFERENCE_HYDRATION,
+                                    "maxProjectedSchemas": MAX_CANONICALIZATION_SCHEMAS,
+                                    "maxSchemaMerges": MAX_CANONICALIZATION_SCHEMAS,
+                                    "maxGraphHydrations": MAX_CANONICALIZATION_SCHEMAS,
+                                    "maxAliasAdditions": MAX_SCHEMA_ALIAS_ADDITIONS,
+                                    "maxFactIdAdditions": MAX_SCHEMA_FACT_ID_ADDITIONS,
+                                    "maxSchemaNodeIdBytes": MAX_SCHEMA_NODE_ID_BYTES,
+                                    "maxSchemaNodeLabelBytes": MAX_SCHEMA_NODE_LABEL_BYTES,
+                                },
                             },
                             "memoryRead": {
                                 "schema": MEMORY_READ_PROTOCOL_SCHEMA,
@@ -6650,6 +7408,11 @@ impl Server {
                     outcome
                 }
                 "upsert_nodes" => {
+                    let params = req
+                        .params
+                        .as_object()
+                        .expect("mutation params validated before WAL");
+                    let hydrated = self.hydrated_schema_nodes(params);
                     let nodes = req
                         .params
                         .get("nodes")
@@ -6663,6 +7426,11 @@ impl Server {
                         self.state
                             .nodes
                             .insert(Self::key(&parsed.corpus_id, &parsed.node_id), parsed);
+                    }
+                    for node in hydrated {
+                        self.state
+                            .nodes
+                            .insert(Self::key(&node.corpus_id, &node.node_id), node);
                     }
                     self.mark_cache_dirty();
                     self.persist_if_needed().map_err(|err| {
@@ -7095,6 +7863,7 @@ impl Server {
                             Self::execution_client_error("missing corpusId".to_string())
                         })?
                         .to_string();
+                    let schema_merges = req.params.get("schemaMerges").and_then(Value::as_array);
                     let snapshot = self
                         .state
                         .snapshots
@@ -7123,6 +7892,9 @@ impl Server {
                         } else {
                             snapshot[section] = Value::Array(incoming);
                         }
+                    }
+                    if let Some(intents) = schema_merges {
+                        Self::apply_schema_merge_intents(snapshot, intents);
                     }
                     if let Some(exported) = req.params.get("exportedAt").cloned() {
                         snapshot["exportedAt"] = exported;
@@ -7180,7 +7952,33 @@ impl Server {
                 }
                 "memory_get_schemas_by_ids" => {
                     let params = Self::params_object(&req.params)?;
-                    Self::require_exact_params(params, &["corpusId", "schemaIds"])?;
+                    let projected = params.contains_key("projection");
+                    let contribution_document_id = if projected {
+                        Self::require_exact_params(
+                            params,
+                            &[
+                                "corpusId",
+                                "schemaIds",
+                                "projection",
+                                "contributionDocumentId",
+                            ],
+                        )?;
+                        if params.get("projection").and_then(Value::as_str)
+                            != Some(SCHEMA_CANONICALIZATION_PROJECTION)
+                        {
+                            return Err(Self::execution_client_error(
+                                "schema projection is unsupported".to_string(),
+                            ));
+                        }
+                        Some(Self::bounded_required_string(
+                            params,
+                            "contributionDocumentId",
+                            MAX_INDEXING_DOMAIN_ID_BYTES,
+                        )?)
+                    } else {
+                        Self::require_exact_params(params, &["corpusId", "schemaIds"])?;
+                        None
+                    };
                     let corpus_id = Self::bounded_required_string(
                         params,
                         "corpusId",
@@ -7189,7 +7987,11 @@ impl Server {
                     let schema_ids = Self::bounded_unique_ids(
                         params,
                         "schemaIds",
-                        MAX_INDEXING_SCHEMA_IDS,
+                        if projected {
+                            MAX_CANONICALIZATION_SCHEMAS
+                        } else {
+                            MAX_INDEXING_SCHEMA_IDS
+                        },
                         true,
                     )?;
                     if schema_ids.is_empty() {
@@ -7228,13 +8030,19 @@ impl Server {
                                         .to_string(),
                                 ));
                             }
+                            let response_item = if let Some(document_id) = contribution_document_id
+                            {
+                                Self::schema_projection(schema, corpus_id, document_id)?
+                            } else {
+                                schema.clone()
+                            };
                             response_bytes = Self::add_bounded_indexing_response_item(
                                 response_bytes,
-                                schema,
+                                &response_item,
                                 !found.is_empty(),
                                 response_limit,
                             )?;
-                            found.insert(schema_id.to_string(), schema.clone());
+                            found.insert(schema_id.to_string(), response_item);
                         }
                     }
                     Ok(Value::Array(
@@ -9333,6 +10141,459 @@ mod tests {
         });
         assert!(response.ok, "batch_commit failed: {response:?}");
         response
+    }
+
+    fn schema_fixture(schema_id: &str, source_document_ids: Vec<String>) -> Value {
+        json!({
+            "schemaId": schema_id,
+            "corpusId": "c1",
+            "headType": "drug",
+            "relation": "treats",
+            "tailType": "condition",
+            "canonicalKey": "drug::treats::condition",
+            "aliases": [{
+                "label": "treats",
+                "language": "en",
+                "source": "llm",
+                "confidence": 0.9,
+                "isCanonical": true
+            }],
+            "frequency": 7,
+            "state": "stable",
+            "stabilizationThreshold": 2,
+            "factIds": ["fact:historical"],
+            "sourceDocumentIds": source_document_ids,
+            "version": 3,
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "updatedAt": "2026-02-01T00:00:00.000Z",
+            "futureUnknownField": {"historicalSecret": "must-survive"}
+        })
+    }
+
+    fn install_schema_snapshot(server: &mut Server, schemas: Vec<Value>) {
+        server.state.snapshots.insert(
+            "c1".to_string(),
+            json!({
+                "corpusId": "c1",
+                "schemaVersion": 1,
+                "passages": [],
+                "facts": [],
+                "schemas": schemas,
+            }),
+        );
+    }
+
+    fn projected_schema(server: &mut Server, schema_id: &str, document_id: &str) -> Value {
+        let response = server.handle_prepared(RpcRequest {
+            id: 21,
+            method: "memory_get_schemas_by_ids".to_string(),
+            params: json!({
+                "corpusId": "c1",
+                "schemaIds": [schema_id],
+                "projection": SCHEMA_CANONICALIZATION_PROJECTION,
+                "contributionDocumentId": document_id,
+            }),
+        });
+        assert!(response.ok, "schema projection failed: {response:?}");
+        response.result.expect("projection result")[0].clone()
+    }
+
+    #[test]
+    fn canonicalization_projection_bounds_oversized_history_and_keeps_legacy_shape() {
+        let path = temp_path("agdb-native-schema-projection");
+        let mut server = Server::open(path.clone()).expect("open server");
+        let mut schema = schema_fixture(
+            "schema:historical",
+            std::iter::once("historical-first".to_string())
+                .chain((0..20_000).map(|index| format!("doc-{index:08}-{}", "x".repeat(72))))
+                .collect(),
+        );
+        schema["factIds"] = Value::Array(
+            (0..100_000)
+                .map(|index| json!(format!("fact-{index:08}-{}", "x".repeat(72))))
+                .collect(),
+        );
+        install_schema_snapshot(&mut server, vec![schema.clone()]);
+
+        let legacy = server.handle_prepared(RpcRequest {
+            id: u64::MAX,
+            method: "memory_get_schemas_by_ids".to_string(),
+            params: json!({"corpusId": "c1", "schemaIds": ["schema:historical"]}),
+        });
+        assert!(!legacy.ok, "full cumulative schema must exceed 8 MiB");
+        assert_eq!(
+            legacy
+                .error
+                .as_ref()
+                .and_then(|error| error.failure_class.as_deref()),
+            Some("CLIENT_INPUT")
+        );
+
+        let projected = server.handle_prepared(RpcRequest {
+            id: u64::MAX,
+            method: "memory_get_schemas_by_ids".to_string(),
+            params: json!({
+                "corpusId": "c1",
+                "schemaIds": ["schema:historical"],
+                "projection": SCHEMA_CANONICALIZATION_PROJECTION,
+                "contributionDocumentId": "doc:new",
+            }),
+        });
+        assert!(projected.ok, "projected cumulative schema must fit");
+        Server::validate_indexing_response_size(&projected).expect("projection envelope fits");
+        let item = &projected.result.as_ref().expect("projected result")[0];
+        assert_eq!(item["firstSourceDocumentId"], json!("historical-first"));
+        assert_eq!(item["contributionPresent"], json!(false));
+        assert_eq!(item["mergeToken"].as_str().map(str::len), Some(64));
+        assert!(item.get("factIds").is_none());
+        assert!(item.get("sourceDocumentIds").is_none());
+        assert!(item.get("aliases").is_none());
+
+        let mut changed_unknown = schema.clone();
+        changed_unknown["futureUnknownField"]["historicalSecret"] = json!("changed");
+        assert_ne!(
+            Server::schema_merge_token(&schema).unwrap(),
+            Server::schema_merge_token(&changed_unknown).unwrap(),
+            "the opaque CAS token must cover unknown fields"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn canonicalization_capability_and_maximum_escaped_projection_agree() {
+        let path = temp_path("agdb-native-schema-projection-cap");
+        let mut server = Server::open(path.clone()).expect("open server");
+        let control = "\u{1}".repeat(MAX_INDEXING_DOMAIN_ID_BYTES - 16);
+        let mut schemas = Vec::new();
+        let mut schema_ids = Vec::new();
+        for index in 0..MAX_CANONICALIZATION_SCHEMAS {
+            let schema_id = format!("schema:{index:02}:{control}");
+            let mut schema = schema_fixture(&schema_id, vec![format!("doc:{index:02}:{control}")]);
+            schema["headType"] = json!(format!("head:{index:02}:{control}"));
+            schema["relation"] = json!(format!("rel:{index:02}:{control}"));
+            schema["tailType"] = json!(format!("tail:{index:02}:{control}"));
+            schema["canonicalKey"] = json!(format!("key:{index:02}:{control}"));
+            schemas.push(schema);
+            schema_ids.push(schema_id);
+        }
+        install_schema_snapshot(&mut server, schemas);
+
+        let info = server.handle_prepared(RpcRequest {
+            id: 1,
+            method: "protocol_info".to_string(),
+            params: json!({}),
+        });
+        assert_eq!(
+            info.result.as_ref().unwrap()["limits"]["indexingMemory"]["schemaCanonicalization"],
+            json!({
+                "schema": SCHEMA_CANONICALIZATION_PROTOCOL_SCHEMA,
+                "projection": SCHEMA_CANONICALIZATION_PROJECTION,
+                "merge": SCHEMA_CANONICALIZATION_MERGE,
+                "graphHydration": SCHEMA_REFERENCE_HYDRATION,
+                "maxProjectedSchemas": MAX_CANONICALIZATION_SCHEMAS,
+                "maxSchemaMerges": MAX_CANONICALIZATION_SCHEMAS,
+                "maxGraphHydrations": MAX_CANONICALIZATION_SCHEMAS,
+                "maxAliasAdditions": MAX_SCHEMA_ALIAS_ADDITIONS,
+                "maxFactIdAdditions": MAX_SCHEMA_FACT_ID_ADDITIONS,
+                "maxSchemaNodeIdBytes": MAX_SCHEMA_NODE_ID_BYTES,
+                "maxSchemaNodeLabelBytes": MAX_SCHEMA_NODE_LABEL_BYTES,
+            })
+        );
+        let response = server.handle_prepared(RpcRequest {
+            id: u64::MAX,
+            method: "memory_get_schemas_by_ids".to_string(),
+            params: json!({
+                "corpusId": "c1",
+                "schemaIds": schema_ids,
+                "projection": SCHEMA_CANONICALIZATION_PROJECTION,
+                "contributionDocumentId": "doc:current",
+            }),
+        });
+        assert!(
+            response.ok,
+            "declared maximum projection must fit: {response:?}"
+        );
+        Server::validate_indexing_response_size(&response).expect("complete response fits");
+        assert_eq!(
+            response.result.as_ref().unwrap().as_array().unwrap().len(),
+            MAX_CANONICALIZATION_SCHEMAS
+        );
+
+        let too_many = server.handle_prepared(RpcRequest {
+            id: 2,
+            method: "memory_get_schemas_by_ids".to_string(),
+            params: json!({
+                "corpusId": "c1",
+                "schemaIds": (0..=MAX_CANONICALIZATION_SCHEMAS)
+                    .map(|index| format!("schema:extra:{index}"))
+                    .collect::<Vec<_>>(),
+                "projection": SCHEMA_CANONICALIZATION_PROJECTION,
+                "contributionDocumentId": "doc:current",
+            }),
+        });
+        assert!(!too_many.ok);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn schema_hydration_accepts_exact_composite_id_and_label_bounds() {
+        let path = temp_path("agdb-native-schema-hydration-bounds");
+        let mut server = Server::open(path.clone()).expect("open server");
+        let schema_id = format!("schema:{}", "s".repeat(MAX_INDEXING_DOMAIN_ID_BYTES - 7));
+        let tuple = "t".repeat(MAX_INDEXING_DOMAIN_ID_BYTES);
+        let mut schema = schema_fixture(&schema_id, vec!["doc:first".to_string()]);
+        schema["headType"] = json!(tuple.clone());
+        schema["relation"] = json!(tuple.clone());
+        schema["tailType"] = json!(tuple.clone());
+        schema["canonicalKey"] = json!(tuple.clone());
+        install_schema_snapshot(&mut server, vec![schema]);
+        let node_id = format!("schema:{schema_id}");
+        let label = format!("{tuple} {tuple} {tuple}");
+        assert_eq!(node_id.len(), MAX_SCHEMA_NODE_ID_BYTES);
+        assert_eq!(label.len(), MAX_SCHEMA_NODE_LABEL_BYTES);
+        let params = json!({
+            "nodes": [],
+            "schemaRefHydration": SCHEMA_REFERENCE_HYDRATION,
+            "schemaNodeRefs": [{
+                "nodeId": node_id,
+                "corpusId": "c1",
+                "schemaId": schema_id,
+                "label": label,
+            }]
+        });
+        server
+            .validate_schema_node_hydrations(params.as_object().unwrap())
+            .expect("exact composite bounds are valid");
+
+        let mut too_long = params;
+        too_long["schemaNodeRefs"][0]["nodeId"] = json!("n".repeat(MAX_SCHEMA_NODE_ID_BYTES + 1));
+        assert!(
+            server
+                .validate_schema_node_hydrations(too_long.as_object().unwrap())
+                .is_err()
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn canonicalization_merge_preserves_history_and_hydrates_exact_graph_ref() {
+        let path = temp_path("agdb-native-schema-merge");
+        let mut server = Server::open(path.clone()).expect("open server");
+        let original = schema_fixture("schema:historical", vec!["historical-first".to_string()]);
+        install_schema_snapshot(&mut server, vec![original.clone()]);
+        let legacy = server.handle_prepared(RpcRequest {
+            id: 20,
+            method: "memory_get_schemas_by_ids".to_string(),
+            params: json!({"corpusId":"c1", "schemaIds":["schema:historical"]}),
+        });
+        assert_eq!(legacy.result.unwrap(), json!([original]));
+        let projection = projected_schema(&mut server, "schema:historical", "doc:new");
+        let created = json!({
+            "schemaId": "schema:new",
+            "corpusId": "c1",
+            "headType": "gene",
+            "relation": "causes",
+            "tailType": "condition",
+            "canonicalKey": "gene::causes::condition",
+            "aliases": [{"label":"causes","language":"en","source":"llm","confidence":0.8,"isCanonical":true}],
+            "frequency": 1,
+            "state": "pending",
+            "stabilizationThreshold": 2,
+            "factIds": ["fact:new-schema"],
+            "sourceDocumentIds": ["doc:new"],
+            "version": 1,
+            "createdAt": "2026-09-23T00:00:00.000Z",
+            "updatedAt": "2026-09-23T00:00:00.000Z"
+        });
+
+        begin_batch(&mut server);
+        apply_mutation(
+            &mut server,
+            RpcRequest {
+                id: 1,
+                method: "memory_upsert".to_string(),
+                params: json!({
+                    "corpusId": "c1",
+                    "passages": [],
+                    "facts": [],
+                    "schemaMerges": [
+                        {
+                            "mode": "merge",
+                            "schemaId": "schema:historical",
+                            "expectedMergeToken": projection["mergeToken"],
+                            "contributionDocumentId": "doc:new",
+                            "frequencyDelta": 3,
+                            "desiredState": "stable",
+                            "stabilizationThreshold": 2,
+                            "updatedAt": "2026-09-23T00:00:00.000Z",
+                            "aliasAdditions": [
+                                {"label":"treats","language":"en","source":"llm","confidence":0.1,"isCanonical":false},
+                                {"label":"therapy","language":"en","source":"llm","confidence":0.8,"isCanonical":false}
+                            ],
+                            "factIdAdditions": ["fact:historical", "fact:new"]
+                        },
+                        {"mode": "create", "expectedAbsent": true, "schema": created}
+                    ],
+                    "exportedAt": "2026-09-23T00:00:00.000Z"
+                }),
+            },
+        );
+        apply_mutation(
+            &mut server,
+            RpcRequest {
+                id: 2,
+                method: "upsert_nodes".to_string(),
+                params: json!({
+                    "nodes": [{
+                        "nodeId":"fact:current", "corpusId":"c1", "layer":"fact",
+                        "ref":{"factId":"fact:current"}, "label":"current fact"
+                    }],
+                    "schemaRefHydration": SCHEMA_REFERENCE_HYDRATION,
+                    "schemaNodeRefs": [
+                        {"nodeId":"schema:schema:historical","corpusId":"c1","schemaId":"schema:historical","label":"drug treats condition"},
+                        {"nodeId":"schema:schema:new","corpusId":"c1","schemaId":"schema:new","label":"gene causes condition"}
+                    ]
+                }),
+            },
+        );
+
+        let snapshot = &server.state.snapshots["c1"];
+        let historical = snapshot["schemas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|schema| schema["schemaId"] == json!("schema:historical"))
+            .unwrap();
+        assert_eq!(historical["frequency"], json!(10));
+        assert_eq!(historical["createdAt"], json!("2026-01-01T00:00:00.000Z"));
+        assert_eq!(historical["version"], json!(3));
+        assert_eq!(
+            historical["futureUnknownField"]["historicalSecret"],
+            json!("must-survive")
+        );
+        assert_eq!(
+            historical["sourceDocumentIds"],
+            json!(["historical-first", "doc:new"])
+        );
+        assert_eq!(
+            historical["factIds"],
+            json!(["fact:historical", "fact:new"])
+        );
+        assert_eq!(historical["aliases"].as_array().unwrap().len(), 2);
+        let graph_ref = &server.state.nodes["c1:schema:schema:historical"].r#ref;
+        assert_eq!(
+            graph_ref, historical,
+            "hydrated graph ref must equal memory"
+        );
+
+        let wal = fs::read(path.with_extension("agdb.wal")).expect("read active WAL");
+        let wal_text = String::from_utf8_lossy(&wal);
+        assert!(wal_text.contains(SCHEMA_REFERENCE_HYDRATION));
+        assert!(
+            !wal_text.contains("must-survive"),
+            "WAL must not copy full history"
+        );
+
+        commit_batch(&mut server);
+        let reopened = Server::open(path.clone()).expect("reopen committed state");
+        assert_eq!(
+            reopened.state.nodes["c1:schema:schema:historical"].r#ref,
+            reopened.state.snapshots["c1"]["schemas"][0]
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn schema_merge_rejections_are_pre_wal_atomic_and_payload_free() {
+        let path = temp_path("agdb-native-schema-merge-reject");
+        let mut server = Server::open(path.clone()).expect("open server");
+        install_schema_snapshot(
+            &mut server,
+            vec![schema_fixture(
+                "schema:private-id",
+                vec!["doc:already".to_string()],
+            )],
+        );
+        let projection = projected_schema(&mut server, "schema:private-id", "doc:already");
+        begin_batch(&mut server);
+        let state_before = serde_json::to_vec(&server.state).unwrap();
+        let wal_path = path.with_extension("agdb.wal");
+        let wal_before = fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0);
+
+        let stale_token = "0".repeat(64);
+        let stale = RpcRequest {
+            id: 1,
+            method: "memory_upsert".to_string(),
+            params: json!({
+                "corpusId":"c1", "passages":[], "facts":[],
+                "schemaMerges":[{
+                    "mode":"merge", "schemaId":"schema:private-id",
+                    "expectedMergeToken":stale_token,
+                    "contributionDocumentId":"doc:new", "frequencyDelta":1,
+                    "desiredState":"stable", "stabilizationThreshold":2,
+                    "updatedAt":"2026-09-23T00:00:00.000Z",
+                    "aliasAdditions":[], "factIdAdditions":[]
+                }],
+                "exportedAt":"2026-09-23T00:00:00.000Z"
+            }),
+        };
+        let stale_error = server
+            .validate_mutation_params(&stale)
+            .expect_err("stale full-value token must fail");
+        assert!(!stale_error.message.contains("schema:private-id"));
+        assert!(!stale_error.message.contains(&"0".repeat(64)));
+        assert_eq!(serde_json::to_vec(&server.state).unwrap(), state_before);
+        assert_eq!(
+            fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0),
+            wal_before
+        );
+
+        let request = RpcRequest {
+            id: 2,
+            method: "memory_upsert".to_string(),
+            params: json!({
+                "corpusId":"c1", "passages":[], "facts":[],
+                "schemaMerges":[{
+                    "mode":"merge", "schemaId":"schema:private-id",
+                    "expectedMergeToken":projection["mergeToken"],
+                    "contributionDocumentId":"doc:already", "frequencyDelta":1,
+                    "desiredState":"stable", "stabilizationThreshold":2,
+                    "updatedAt":"2026-09-23T00:00:00.000Z",
+                    "aliasAdditions":[], "factIdAdditions":[]
+                }],
+                "exportedAt":"2026-09-23T00:00:00.000Z"
+            }),
+        };
+        let error = server
+            .validate_mutation_params(&request)
+            .expect_err("repeat contribution with a nonzero delta must fail");
+        assert!(!error.message.contains("schema:private-id"));
+        assert!(
+            !error
+                .message
+                .contains(projection["mergeToken"].as_str().unwrap())
+        );
+        assert_eq!(serde_json::to_vec(&server.state).unwrap(), state_before);
+        assert_eq!(
+            fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0),
+            wal_before
+        );
+
+        let mixed = RpcRequest {
+            id: 3,
+            method: "memory_upsert".to_string(),
+            params: json!({
+                "corpusId":"c1", "passages":[], "facts":[], "schemas":[],
+                "schemaMerges":[], "exportedAt":""
+            }),
+        };
+        assert!(server.validate_mutation_params(&mixed).is_err());
+        assert_eq!(serde_json::to_vec(&server.state).unwrap(), state_before);
+        assert_eq!(
+            fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0),
+            wal_before
+        );
+        cleanup(&path);
     }
 
     #[test]

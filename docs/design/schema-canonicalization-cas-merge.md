@@ -120,7 +120,9 @@ remain unchanged. Native adds this nested capability:
         "maxSchemaMerges": 32,
         "maxGraphHydrations": 32,
         "maxAliasAdditions": 4096,
-        "maxFactIdAdditions": 4096
+        "maxFactIdAdditions": 4096,
+        "maxSchemaNodeIdBytes": 4103,
+        "maxSchemaNodeLabelBytes": 12290
       }
     }
   }
@@ -257,6 +259,11 @@ with it, validates that the resolved full node is a valid `GraphNode`, and
 finishes that preparation before WAL append. The WAL stores the bounded marker,
 not the full schema. Apply resolves the same already validated memory value and
 installs a normal ontology node with the exact full schema as `ref`.
+
+The composite marker bounds are derived rather than borrowed from a scalar
+domain-id bound: `nodeId` permits the 4,096-byte schema id plus the seven-byte
+`schema:` prefix, and `label` permits three 4,096-byte tuple fields plus two
+spaces. Exact-boundary tests prevent a valid maximum tuple from being rejected.
 
 `memory_upsert` and graph persistence are separate RPCs inside the same
 existing whole-document native transaction. Failure between them poisons and
