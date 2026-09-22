@@ -180,10 +180,12 @@ The first code issue after this design is **CommittedCatalog and migration proof
 
 1. build `GenerationCatalog(N)` in normal native mode only from a validated Idle committed state;
 2. index memory IDs and document provenance with collision verification, plus generation tags for existing graph/vector/passage indexes;
-3. route existing clean-state `memory_get_schemas_by_ids`, `memory_get_active_facts`, and deletion *planning* through the catalog without changing their result shapes;
+3. route existing clean-state `memory_get_schemas_by_ids` and `memory_get_active_facts` through the catalog without changing their result shapes, and produce deletion plans only as internal test/diagnostic output;
 4. keep all dirty-state reads and all normal-mode bounded-retrieval methods unavailable;
 5. add the streaming normalized-section loader/serializer as a compatibility and peak-memory test seam, without switching production storage until its equivalence and budget gates pass; and
 6. advertise no committed-read-during-write capability.
+
+Deletion in this boundary is **plan-only**: the plan does not execute a mutation, contribute to an RPC result, or change Synapse/SQLite. Current native `delete_by_document` removes GraphDB nodes, incident edges, vectors, and passages (`83ef0eb309deec7e1ddc156ecda19eb4edb51010:src/bin/aira-graphdb-native.rs:6840`), while Synapse separately deletes SQLite passages, facts, document associations, and adjusts schema frequency/state (`c50e0754caf207eba1a0e2e2f377c56b47c10c4b:packages/memgraphrag/src/application/indexing/DeleteDocumentService.ts:22`). Cross-repository deletion mutation routing remains blocked until shared-provenance fixtures and one reviewed authority contract define both sides together.
 
 Proceed to overlay mutation routing only if:
 
