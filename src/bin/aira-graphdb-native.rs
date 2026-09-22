@@ -5915,15 +5915,18 @@ impl Server {
     fn validate_schema_alias<'a>(
         value: &'a Value,
         label: &str,
+        exact_fields: bool,
     ) -> Result<(&'a str, &'a str, &'a str), AppError> {
         let alias = value
             .as_object()
             .ok_or_else(|| Self::execution_client_error(format!("{label} must be an object")))?;
-        Self::require_exact_object_keys(
-            alias,
-            &["label", "language", "source", "confidence", "isCanonical"],
-            label,
-        )?;
+        if exact_fields {
+            Self::require_exact_object_keys(
+                alias,
+                &["label", "language", "source", "confidence", "isCanonical"],
+                label,
+            )?;
+        }
         let text =
             Self::bounded_object_string(alias, "label", MAX_INDEXING_DOMAIN_ID_BYTES, label)?;
         let language =
@@ -6006,7 +6009,7 @@ impl Server {
                 Self::execution_client_error(format!("{label}.aliases must be an array"))
             })?;
         for alias in aliases {
-            Self::validate_schema_alias(alias, "schema alias")?;
+            Self::validate_schema_alias(alias, "schema alias", false)?;
         }
         for field in ["factIds", "sourceDocumentIds"] {
             let values = schema.get(field).and_then(Value::as_array).ok_or_else(|| {
@@ -6187,7 +6190,8 @@ impl Server {
                         })?;
                     let mut alias_keys = HashSet::with_capacity(aliases.len());
                     for alias in aliases {
-                        let key = Self::validate_schema_alias(alias, "schema alias addition")?;
+                        let key =
+                            Self::validate_schema_alias(alias, "schema alias addition", true)?;
                         if !alias_keys.insert(key) {
                             return Err(Self::execution_client_error(
                                 "schema alias additions must be unique".to_string(),
@@ -10156,7 +10160,10 @@ mod tests {
                 "language": "en",
                 "source": "llm",
                 "confidence": 0.9,
-                "isCanonical": true
+                "isCanonical": true,
+                "futureAliasEvidence": {
+                    "nested": ["alias-history-secret", {"rank": 7}]
+                }
             }],
             "frequency": 7,
             "state": "stable",
@@ -10255,6 +10262,13 @@ mod tests {
             Server::schema_merge_token(&schema).unwrap(),
             Server::schema_merge_token(&changed_unknown).unwrap(),
             "the opaque CAS token must cover unknown fields"
+        );
+        let mut changed_alias_unknown = schema.clone();
+        changed_alias_unknown["aliases"][0]["futureAliasEvidence"]["nested"][1]["rank"] = json!(8);
+        assert_ne!(
+            Server::schema_merge_token(&schema).unwrap(),
+            Server::schema_merge_token(&changed_alias_unknown).unwrap(),
+            "the opaque CAS token must cover nested unknown alias evidence"
         );
         cleanup(&path);
     }
@@ -10480,6 +10494,12 @@ mod tests {
             json!(["fact:historical", "fact:new"])
         );
         assert_eq!(historical["aliases"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            historical["aliases"][0]["futureAliasEvidence"],
+            json!({"nested":["alias-history-secret", {"rank":7}]})
+        );
+        assert_eq!(historical["aliases"][0]["confidence"], json!(0.9));
+        assert_eq!(historical["aliases"][0]["isCanonical"], json!(true));
         let graph_ref = &server.state.nodes["c1:schema:schema:historical"].r#ref;
         assert_eq!(
             graph_ref, historical,
@@ -10493,12 +10513,20 @@ mod tests {
             !wal_text.contains("must-survive"),
             "WAL must not copy full history"
         );
+        assert!(
+            !wal_text.contains("alias-history-secret"),
+            "WAL must not copy historical alias extensions"
+        );
 
         commit_batch(&mut server);
         let reopened = Server::open(path.clone()).expect("reopen committed state");
         assert_eq!(
             reopened.state.nodes["c1:schema:schema:historical"].r#ref,
             reopened.state.snapshots["c1"]["schemas"][0]
+        );
+        assert_eq!(
+            reopened.state.snapshots["c1"]["schemas"][0]["aliases"][0]["futureAliasEvidence"],
+            json!({"nested":["alias-history-secret", {"rank":7}]})
         );
         cleanup(&path);
     }
@@ -10579,8 +10607,36 @@ mod tests {
             wal_before
         );
 
-        let mixed = RpcRequest {
+        let extended_addition = RpcRequest {
             id: 3,
+            method: "memory_upsert".to_string(),
+            params: json!({
+                "corpusId":"c1", "passages":[], "facts":[],
+                "schemaMerges":[{
+                    "mode":"merge", "schemaId":"schema:private-id",
+                    "expectedMergeToken":projection["mergeToken"],
+                    "contributionDocumentId":"doc:already", "frequencyDelta":0,
+                    "desiredState":"stable", "stabilizationThreshold":2,
+                    "updatedAt":"2026-09-23T00:00:00.000Z",
+                    "aliasAdditions":[{
+                        "label":"new", "language":"en", "source":"llm",
+                        "confidence":0.5, "isCanonical":false,
+                        "futureAliasEvidence":{"not":"accepted on additions"}
+                    }],
+                    "factIdAdditions":[]
+                }],
+                "exportedAt":"2026-09-23T00:00:00.000Z"
+            }),
+        };
+        assert!(server.validate_mutation_params(&extended_addition).is_err());
+        assert_eq!(serde_json::to_vec(&server.state).unwrap(), state_before);
+        assert_eq!(
+            fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0),
+            wal_before
+        );
+
+        let mixed = RpcRequest {
+            id: 4,
             method: "memory_upsert".to_string(),
             params: json!({
                 "corpusId":"c1", "passages":[], "facts":[], "schemas":[],
@@ -10595,7 +10651,7 @@ mod tests {
         );
 
         let oversized = RpcRequest {
-            id: 4,
+            id: 5,
             method: "memory_upsert".to_string(),
             params: json!({
                 "corpusId":"c1",
