@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -112,12 +113,20 @@ impl Drop for NativeProcess {
     }
 }
 
+// SystemTime is only microsecond-granular on macOS; pid plus a per-process
+// sequence keeps names unique when tests run in parallel.
+static NEXT_TEMP_DB: AtomicU64 = AtomicU64::new(0);
+
 fn temp_db_path() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time")
         .as_nanos();
-    std::env::temp_dir().join(format!("agdb-native-rpc-{nanos}.json"))
+    let seq = NEXT_TEMP_DB.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "agdb-native-rpc-{}-{nanos}-{seq}.json",
+        std::process::id()
+    ))
 }
 
 #[test]

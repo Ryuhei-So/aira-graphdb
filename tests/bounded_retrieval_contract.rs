@@ -3,6 +3,7 @@ use serde_json::{Number, Value, json};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CONTRACT_DIR: &str = "spec/contracts/bounded-retrieval";
@@ -53,6 +54,10 @@ fn normalize(dependency: &str, value: &str) -> Option<String> {
     (dependency == contract::NORMALIZATION_DIGEST).then(|| value.to_lowercase())
 }
 
+// SystemTime is only microsecond-granular on macOS; a per-process sequence
+// keeps names unique when tests run in parallel.
+static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
 struct TestDir(PathBuf);
 
 impl TestDir {
@@ -61,8 +66,9 @@ impl TestDir {
             .duration_since(UNIX_EPOCH)
             .expect("clock before epoch")
             .as_nanos();
+        let seq = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "aira-graphdb-bounded-retrieval-{}-{nonce}",
+            "aira-graphdb-bounded-retrieval-{}-{nonce}-{seq}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("create test directory");
