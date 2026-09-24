@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CONTRACT_DIR: &str = "spec/contracts/bounded-domain";
@@ -207,6 +208,10 @@ fn verify_contract_dir(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// SystemTime is only microsecond-granular on macOS; a per-process sequence
+// keeps names unique when tests run in parallel.
+static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
 struct TestDir(PathBuf);
 
 impl TestDir {
@@ -215,8 +220,9 @@ impl TestDir {
             .duration_since(UNIX_EPOCH)
             .expect("clock before epoch")
             .as_nanos();
+        let seq = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "aira-graphdb-bounded-domain-{}-{nonce}",
+            "aira-graphdb-bounded-domain-{}-{nonce}-{seq}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("create test directory");
