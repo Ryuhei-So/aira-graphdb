@@ -99,6 +99,7 @@ cargo run --bin aira-graphdb-native -- --db /path/to/aira-graphdb-native.db
 | `memory_save_checkpoint` / `memory_load_checkpoint` | チェックポイント保存・読込 |
 | `memory_validate_integrity` | メモリ整合性検証（現状は空配列を返す） |
 | `projection_get_transitions` / `projection_get_dangling_nodes` / `projection_get_node_count` | 投影情報（遷移/ダングリング/ノード数）の取得 |
+| `projection_get_transitions_page` | 1 つの確定世代の遷移をページ単位で取得（下記） |
 
 ### メソッドポリシー（自動生成）
 
@@ -148,6 +149,7 @@ cargo run --bin aira-graphdb-native -- --print-method-policy-table
 | `memory_load_checkpoint` | read | false | normal |
 | `memory_validate_integrity` | read | false | normal |
 | `projection_get_transitions` | read | false | normal |
+| `projection_get_transitions_page` | read | false | bounded-indexing |
 | `projection_get_dangling_nodes` | read | false | normal |
 | `projection_get_node_count` | read | false | normal |
 | `lexical_index_passages` | mutation | true | normal |
@@ -158,6 +160,8 @@ cargo run --bin aira-graphdb-native -- --print-method-policy-table
 <!-- METHOD_SPECS:END -->
 
 bounded-indexing メソッドは要求 `limits.indexingMemory.maxRequestBytes`（64 MiB）、応答 `limits.indexingMemory.maxResponseBytes`（8 MiB）で上限が掛かり、シリアライズ前に検査される。限定メモリ読み取りはさらに `limits.memoryRead`（`schema`, `maxIdsPerRequest`, `maxEntitiesPerRequest`, `maxLimit`）を公開する。利用側は値を仮定せず `protocol_info` から読むこと。
+
+`projection_get_transitions_page {corpusId, generation, offset}` は `{generation, offset, nextOffset, totalEntries, entries}` を返す。entries は `projection_get_transitions` と同じ `{sourceNodeId, targetNodeId, weight}` で、順序は `(sourceNodeId, targetNodeId, edge key)` のバイト順の全順序（`limits.projectionRead.order = source-target-key@1`）。1 ページには `limits.projectionRead.maxResponseBytes` に収まるだけ（最低 1 件）入る。`generation: null` は `offset: 0` のときだけ許され、応答が確定世代を返す。以降のページはその世代と直前の `nextOffset` を渡す。指定世代が確定世代でなくなったとき、または batch が開いているときは拒否されるため、commit を跨いだ読み取りは fail closed になり offset 0 からやり直す。最終ページの `nextOffset` は `null`。
 
 ## 3. Conformance レポート
 
