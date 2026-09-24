@@ -2455,7 +2455,7 @@ impl Server {
                 io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!(
-                        "native persistence requires Linux renameat2 RENAME_NOREPLACE support in {}: {err}",
+                        "native persistence requires atomic no-replace rename support (renameat2 RENAME_NOREPLACE / renamex_np RENAME_EXCL) in {}: {err}",
                         parent.display()
                     ),
                 )
