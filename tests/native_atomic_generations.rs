@@ -747,7 +747,12 @@ fn injected_write_sync_rename_and_directory_failures_never_return_a_token() {
         "wal_zero_sync",
         "wal_zero_validate",
         "wal_retire",
-    ] {
+    ]
+    .into_iter()
+    // The page-cache eviction stages exist only on Linux; elsewhere the
+    // commit path has no cache step, so there is nothing to inject.
+    .filter(|stage| cfg!(target_os = "linux") || !stage.ends_with("_cache_evict"))
+    {
         for phase in ["before", "after"] {
             let failpoint = format!("{phase}_{stage}");
             let db = TempDb::new(&format!("{phase}-{stage}"));
