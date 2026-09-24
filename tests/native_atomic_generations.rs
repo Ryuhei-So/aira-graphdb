@@ -2608,6 +2608,7 @@ fn protocol_info_is_the_method_policy_and_unknown_is_not_a_read() {
         ("memory_load_checkpoint", "read", false),
         ("memory_validate_integrity", "read", false),
         ("projection_get_transitions", "read", false),
+        ("projection_get_transitions_page", "read", false),
         ("projection_get_dangling_nodes", "read", false),
         ("projection_get_node_count", "read", false),
         ("lexical_index_passages", "mutation", true),

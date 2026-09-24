@@ -99,6 +99,7 @@ Search:
 | `memory_save_checkpoint` / `memory_load_checkpoint` | Save and load checkpoints |
 | `memory_validate_integrity` | Memory integrity check (currently returns an empty list) |
 | `projection_get_transitions` / `projection_get_dangling_nodes` / `projection_get_node_count` | Projection reads: transitions, dangling nodes, and node count |
+| `projection_get_transitions_page` | Paged transitions for one committed generation (see below) |
 
 ### Method policy (generated)
 
@@ -148,6 +149,7 @@ A unit test (`usage_guide_method_policy_table_matches_method_specs`) fails when 
 | `memory_load_checkpoint` | read | false | normal |
 | `memory_validate_integrity` | read | false | normal |
 | `projection_get_transitions` | read | false | normal |
+| `projection_get_transitions_page` | read | false | bounded-indexing |
 | `projection_get_dangling_nodes` | read | false | normal |
 | `projection_get_node_count` | read | false | normal |
 | `lexical_index_passages` | mutation | true | normal |
@@ -158,6 +160,8 @@ A unit test (`usage_guide_method_policy_table_matches_method_specs`) fails when 
 <!-- METHOD_SPECS:END -->
 
 Bounded-indexing methods are capped at `limits.indexingMemory.maxRequestBytes` (64 MiB) per request and `limits.indexingMemory.maxResponseBytes` (8 MiB) per reply, enforced before serialization. The targeted memory reads additionally advertise `limits.memoryRead` (`schema`, `maxIdsPerRequest`, `maxEntitiesPerRequest`, `maxLimit`); consumers must read those values from `protocol_info` rather than assume them.
+
+`projection_get_transitions_page {corpusId, generation, offset}` returns `{generation, offset, nextOffset, totalEntries, entries}`. Entries are the same `{sourceNodeId, targetNodeId, weight}` objects as `projection_get_transitions`, in the total order `(sourceNodeId, targetNodeId, edge key)` by bytes (`limits.projectionRead.order = source-target-key@1`). Each page holds as many entries as fit `limits.projectionRead.maxResponseBytes`, and always at least one. Pass `generation: null` only with `offset: 0`: the reply names the committed generation, and every later page must pin it by passing that generation back, with `offset` equal to the previous `nextOffset`. A page is rejected when the pinned generation is no longer the committed one or a batch is open, so a read that spans a commit fails closed and restarts from offset 0. `nextOffset` is `null` on the last page.
 
 ## 3. Conformance Report
 

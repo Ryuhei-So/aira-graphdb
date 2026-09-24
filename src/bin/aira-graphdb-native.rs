@@ -1443,6 +1443,9 @@ struct Server {
     fatal: bool,
     node_keys_by_corpus: HashMap<String, Vec<String>>,
     edge_keys_by_corpus: HashMap<String, Vec<String>>,
+    /// Page order of `edge_keys_by_corpus` per corpus as indices into it,
+    /// built on the first projection page after each cache rebuild.
+    projection_order_by_corpus: HashMap<String, Vec<u32>>,
     adjacent_edge_keys_by_node: HashMap<String, Vec<String>>,
     vector_keys_by_corpus_namespace: HashMap<String, Vec<String>>,
     passage_keys_by_corpus: HashMap<String, Vec<String>>,
@@ -1547,6 +1550,15 @@ const MAX_MEMORY_READ_LIMIT: usize = MAX_INDEXING_ACTIVE_FACTS;
 // entity that fails to fold within it is rejected. The value is generous
 // on purpose; it only prevents unbounded allocation.
 const MAX_MEMORY_READ_FOLDED_ENTITY_BYTES: usize = 4 * 3 * MAX_INDEXING_DOMAIN_ID_BYTES;
+// Paged ranking-graph read (literature-hub #594). The whole-corpus
+// projection_get_transitions reply outgrew the owner's line bound; pages are
+// cut against the bounded indexing response cap and advertised under
+// `limits.projectionRead`. Within one committed generation the page order is
+// the total order (sourceNodeId, targetNodeId, edge key) by bytes, so an
+// integer offset is a sound cursor; the generation pin makes a read that
+// spans a commit fail closed.
+const PROJECTION_READ_PROTOCOL_SCHEMA: &str = "native-projection-read@1";
+const PROJECTION_READ_ORDER: &str = "source-target-key@1";
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1782,6 +1794,14 @@ const METHOD_SPECS: &[MethodSpec] = &[
         classification: "read",
         wal: false,
         wire_profile: MethodWireProfile::Normal,
+    },
+    // Paged form of projection_get_transitions (#594); bounds live in
+    // limits.projectionRead.
+    MethodSpec {
+        name: "projection_get_transitions_page",
+        classification: "read",
+        wal: false,
+        wire_profile: MethodWireProfile::BoundedIndexing,
     },
     MethodSpec {
         name: "projection_get_dangling_nodes",
@@ -2140,6 +2160,7 @@ impl Server {
             fatal: false,
             node_keys_by_corpus: HashMap::new(),
             edge_keys_by_corpus: HashMap::new(),
+            projection_order_by_corpus: HashMap::new(),
             adjacent_edge_keys_by_node: HashMap::new(),
             vector_keys_by_corpus_namespace: HashMap::new(),
             passage_keys_by_corpus: HashMap::new(),
@@ -3773,6 +3794,7 @@ impl Server {
             fatal: false,
             node_keys_by_corpus: HashMap::new(),
             edge_keys_by_corpus: HashMap::new(),
+            projection_order_by_corpus: HashMap::new(),
             adjacent_edge_keys_by_node: HashMap::new(),
             vector_keys_by_corpus_namespace: HashMap::new(),
             passage_keys_by_corpus: HashMap::new(),
@@ -5129,6 +5151,7 @@ impl Server {
         }
 
         self.edge_keys_by_corpus.clear();
+        self.projection_order_by_corpus.clear();
         self.adjacent_edge_keys_by_node.clear();
         for (key, edge) in &self.state.edges {
             self.edge_keys_by_corpus
@@ -5705,6 +5728,158 @@ impl Server {
             "bounded indexing request exceeds its byte limit",
         )?;
         Ok(())
+    }
+
+    /// Builds the page order for one corpus once per cache rebuild: indices
+    /// into `edge_keys_by_corpus` sorted by (source, target, edge key) bytes.
+    /// The edge key is unique, so the order is total and a pure function of
+    /// the committed state.
+    fn ensure_projection_order(&mut self, corpus_id: &str) -> Result<(), AppError> {
+        self.ensure_cache();
+        if self.projection_order_by_corpus.contains_key(corpus_id) {
+            return Ok(());
+        }
+        let Some(keys) = self.edge_keys_by_corpus.get(corpus_id) else {
+            // Unknown corpora are not cached: a caller must not grow this map.
+            return Ok(());
+        };
+        let edges = &self.state.edges;
+        let mut decorated: Vec<(&str, &str, &str, u32)> = Vec::with_capacity(keys.len());
+        for (index, key) in keys.iter().enumerate() {
+            let Some(edge) = edges.get(key) else {
+                continue;
+            };
+            let index = u32::try_from(index).map_err(|_| {
+                Self::execution_client_error(
+                    "projection has more edges than a page cursor addresses".to_string(),
+                )
+            })?;
+            decorated.push((
+                edge.source_node_id.as_str(),
+                edge.target_node_id.as_str(),
+                key.as_str(),
+                index,
+            ));
+        }
+        decorated.sort_unstable();
+        let order = decorated
+            .into_iter()
+            .map(|(_, _, _, index)| index)
+            .collect();
+        self.projection_order_by_corpus
+            .insert(corpus_id.to_string(), order);
+        Ok(())
+    }
+
+    /// One page of the corpus transitions from `offset`, as many entries as
+    /// fit the bounded indexing response cap (at least one).
+    fn projection_page(
+        &mut self,
+        request_id: u64,
+        corpus_id: &str,
+        generation: u64,
+        offset: u64,
+    ) -> Result<Value, AppError> {
+        self.ensure_projection_order(corpus_id)?;
+        let order = self
+            .projection_order_by_corpus
+            .get(corpus_id)
+            .map_or(&[][..], Vec::as_slice);
+        let keys = self
+            .edge_keys_by_corpus
+            .get(corpus_id)
+            .map_or(&[][..], Vec::as_slice);
+        let total = order.len() as u64;
+        if offset > total || (offset == total && total > 0) {
+            return Err(Self::execution_client_error(
+                "offset is outside the projection".to_string(),
+            ));
+        }
+        let array_limit = Self::projection_page_array_limit(request_id, generation, offset, total)?;
+        let mut response_bytes = 2_u64;
+        let mut entries = Vec::new();
+        let mut index = offset as usize;
+        while index < order.len() {
+            let key = &keys[order[index] as usize];
+            let edge = self
+                .state
+                .edges
+                .get(key)
+                .expect("page order only indexes present edges");
+            let entry = json!({
+                "sourceNodeId": edge.source_node_id,
+                "targetNodeId": edge.target_node_id,
+                "weight": edge.weight
+            });
+            match Self::add_bounded_indexing_response_item(
+                response_bytes,
+                &entry,
+                !entries.is_empty(),
+                array_limit,
+            ) {
+                Ok(next) => {
+                    response_bytes = next;
+                    entries.push(entry);
+                    index += 1;
+                }
+                Err(_) if !entries.is_empty() => break,
+                Err(_) => {
+                    return Err(Self::execution_client_error(
+                        "projection entry exceeds the page byte limit".to_string(),
+                    ));
+                }
+            }
+        }
+        let next_offset = if index < order.len() {
+            json!(index as u64)
+        } else {
+            Value::Null
+        };
+        Ok(json!({
+            "generation": generation,
+            "offset": offset,
+            "nextOffset": next_offset,
+            "totalEntries": total,
+            "entries": entries,
+        }))
+    }
+
+    /// Bytes left for the page's `entries` array: the cap minus the exact
+    /// envelope, measured with the widest `nextOffset` so the real reply can
+    /// only be shorter.
+    fn projection_page_array_limit(
+        request_id: u64,
+        generation: u64,
+        offset: u64,
+        total: u64,
+    ) -> Result<u64, AppError> {
+        let empty_response = RpcResponse {
+            id: request_id,
+            ok: true,
+            result: Some(json!({
+                "generation": generation,
+                "offset": offset,
+                "nextOffset": u64::MAX,
+                "totalEntries": total,
+                "entries": [],
+            })),
+            error: None,
+        };
+        let empty_bytes = Self::bounded_serialized_bytes(
+            &empty_response,
+            MAX_INDEXING_RESPONSE_BYTES,
+            "projection page envelope exceeds its byte limit",
+        )?;
+        let envelope_bytes = empty_bytes.checked_sub(2).ok_or_else(|| {
+            Self::execution_client_error("projection page envelope accounting failed".to_string())
+        })?;
+        MAX_INDEXING_RESPONSE_BYTES
+            .checked_sub(envelope_bytes)
+            .ok_or_else(|| {
+                Self::execution_client_error(
+                    "projection page envelope exceeds its byte limit".to_string(),
+                )
+            })
     }
 
     fn indexing_result_array_limit(request_id: u64) -> Result<u64, AppError> {
@@ -7256,6 +7431,11 @@ impl Server {
                                 "maxIdsPerRequest": MAX_MEMORY_READ_IDS_PER_REQUEST,
                                 "maxEntitiesPerRequest": MAX_MEMORY_READ_ENTITIES_PER_REQUEST,
                                 "maxLimit": MAX_MEMORY_READ_LIMIT,
+                            },
+                            "projectionRead": {
+                                "schema": PROJECTION_READ_PROTOCOL_SCHEMA,
+                                "maxResponseBytes": MAX_INDEXING_RESPONSE_BYTES,
+                                "order": PROJECTION_READ_ORDER,
                             }
                         },
                         "methods": methods,
@@ -8390,6 +8570,54 @@ impl Server {
                         ak.cmp(bk)
                     });
                     Ok(json!(out))
+                }
+                "projection_get_transitions_page" => {
+                    let params = Self::params_object(&req.params)?;
+                    Self::require_exact_params(params, &["corpusId", "generation", "offset"])?;
+                    let corpus_id = Self::bounded_required_string(
+                        params,
+                        "corpusId",
+                        MAX_INDEXING_CORPUS_ID_BYTES,
+                    )?
+                    .to_string();
+                    let offset = params
+                        .get("offset")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            Self::execution_client_error(
+                                "offset must be a nonnegative integer".to_string(),
+                            )
+                        })?;
+                    let pinned = match params.get("generation") {
+                        Some(Value::Null) => None,
+                        Some(value) => Some(value.as_u64().ok_or_else(|| {
+                            Self::execution_client_error(
+                                "generation must be null or a nonnegative integer".to_string(),
+                            )
+                        })?),
+                        None => unreachable!("exact params include generation"),
+                    };
+                    if pinned.is_none() && offset != 0 {
+                        return Err(Self::execution_client_error(
+                            "generation may be null only at offset 0".to_string(),
+                        ));
+                    }
+                    // Pages are a committed-generation read: an open batch could
+                    // expose uncommitted edges under the committed number.
+                    if !matches!(self.transaction, TransactionState::Idle) {
+                        return Err(Self::execution_client_error(
+                            "projection pages require an idle committed generation".to_string(),
+                        ));
+                    }
+                    let committed = self.state.generation;
+                    if let Some(pinned) = pinned
+                        && pinned != committed
+                    {
+                        return Err(Self::execution_client_error(format!(
+                            "projection page generation {pinned} does not match committed generation {committed}"
+                        )));
+                    }
+                    self.projection_page(req.id, &corpus_id, committed, offset)
                 }
                 "projection_get_dangling_nodes" => {
                     let corpus_id = req
@@ -11139,6 +11367,7 @@ mod tests {
             "memory_load_checkpoint",
             "memory_validate_integrity",
             "projection_get_transitions",
+            "projection_get_transitions_page",
             "projection_get_dangling_nodes",
             "projection_get_node_count",
             "lexical_index_passages",
@@ -11164,6 +11393,7 @@ mod tests {
             "memory_find_facts_by_entities",
             "memory_section_counts",
             "memory_activate_facts_by_schema_ids",
+            "projection_get_transitions_page",
         ]
         .into_iter()
         .collect::<BTreeSet<_>>();

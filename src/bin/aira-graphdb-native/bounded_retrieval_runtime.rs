@@ -1582,6 +1582,7 @@ mod tests {
             fatal: false,
             node_keys_by_corpus: HashMap::new(),
             edge_keys_by_corpus: HashMap::new(),
+            projection_order_by_corpus: HashMap::new(),
             adjacent_edge_keys_by_node: HashMap::new(),
             vector_keys_by_corpus_namespace: HashMap::new(),
             passage_keys_by_corpus: HashMap::new(),
