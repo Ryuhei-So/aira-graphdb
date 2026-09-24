@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aira_graphdb::auth::AuthConfig;
@@ -6,12 +7,17 @@ use aira_graphdb::protocol::HandshakeRequest;
 use aira_graphdb::query::execute_query;
 use aira_graphdb::runtime::{DeploymentMode, RuntimeConfig, ServerRuntime};
 
+// SystemTime is only microsecond-granular on macOS; pid plus a per-process
+// sequence keeps names unique when tests run in parallel.
+static NEXT_TEMP_DB: AtomicU64 = AtomicU64::new(0);
+
 fn temp_db() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time")
         .as_nanos();
-    std::env::temp_dir().join(format!("agdb-int-{nanos}.db"))
+    let seq = NEXT_TEMP_DB.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("agdb-int-{}-{nanos}-{seq}.db", std::process::id()))
 }
 
 #[test]
