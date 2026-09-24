@@ -13,7 +13,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
 use serde::de::IgnoredAny;
@@ -2395,7 +2395,24 @@ impl Server {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+        let source = CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+        let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+        })?;
+        // SAFETY: both C strings remain alive for the duration of renamex_np.
+        let result =
+            unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -10349,7 +10366,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn no_replace_rename_preserves_an_existing_destination() {
         let source = temp_path("agdb-native-rename-source");
