@@ -2117,11 +2117,7 @@ impl Server {
         let legacy_vector_blob_path = db_path.with_extension("vblob");
         let (vector_values, vector_blob_lineage) =
             Self::load_vector_values(&state, &db_path, &legacy_vector_blob_path)?;
-        for (key, values) in &vector_values {
-            if let Some(vector) = state.vectors.get_mut(key) {
-                vector.values = values.clone();
-            }
-        }
+        Self::release_state_vector_values(&mut state);
         Self::cleanup_recognized_temps(
             &Self::parent_dir(&db_path),
             db_path
@@ -3258,6 +3254,15 @@ impl Server {
         Ok(raw)
     }
 
+    /// `Server.vector_values` is the only owner of decoded vector values
+    /// (aira-graphdb#55). Once they are decoded, drop the inline copies a
+    /// legacy store carried in `state` and return their allocation.
+    fn release_state_vector_values(state: &mut State) {
+        for vector in state.vectors.values_mut() {
+            vector.values = Vec::new();
+        }
+    }
+
     /// Vectors still waiting for their payload, keyed by the segment generation
     /// their `blobRef` names (`None` = format 1 base). Inline values are
     /// copied straight into `values` and never wait.
@@ -3697,7 +3702,7 @@ impl Server {
         let blob_header = Self::parse_blob_header(&blob_raw)?;
         let canonical_sha256 = Self::sha256_hex(&canonical_raw);
         let vector_blob_sha256 = Self::sha256_hex(&blob_raw);
-        let state: State = serde_json::from_slice(&canonical_raw)
+        let mut state: State = serde_json::from_slice(&canonical_raw)
             .map_err(|err| io::Error::other(format!("parse canonical descriptor failed: {err}")))?;
         Self::validate_state_commit_evidence(&state)?;
         if state.generation > JSON_SAFE_INTEGER_MAX {
@@ -3781,6 +3786,7 @@ impl Server {
         }];
         let vector_values = Self::decode_vector_values(&state, &segments)?;
         drop(segments);
+        Self::release_state_vector_values(&mut state);
         let handshake = DescriptorReadHandshake {
             canonical_sha256,
             vector_blob_sha256,
@@ -4329,7 +4335,7 @@ impl Server {
                 .vectors
                 .get_mut(&key)
                 .expect("prepared vector key came from live state");
-            vector.values.clear();
+            vector.values = Vec::new();
             vector.blob_ref = Some(blob_ref);
         }
         self.last_persist_bytes = json_bytes;
@@ -7942,17 +7948,15 @@ impl Server {
                         .cloned()
                         .unwrap_or_default();
                     for record in records {
-                        let parsed =
-                            serde_json::from_value::<VectorRecord>(record).map_err(|err| {
+                        let mut persisted = serde_json::from_value::<VectorRecord>(record)
+                            .map_err(|err| {
                                 Self::execution_client_error(format!(
                                     "invalid vector record: {err}"
                                 ))
                             })?;
-                        let key = Self::key(&parsed.corpus_id, &parsed.id);
+                        let key = Self::key(&persisted.corpus_id, &persisted.id);
                         self.vector_values
-                            .insert(key.clone(), parsed.values.clone());
-                        let mut persisted = parsed.clone();
-                        persisted.values.clear();
+                            .insert(key.clone(), std::mem::take(&mut persisted.values));
                         persisted.blob_ref = None;
                         self.state.vectors.insert(key, persisted);
                     }
@@ -11156,6 +11160,107 @@ mod tests {
             .and_then(|v| v.get("id"))
             .and_then(Value::as_str);
         assert_eq!(first_id, Some("vec-1"));
+
+        cleanup(&path);
+    }
+
+    fn assert_state_holds_no_vector_values(server: &Server, stage: &str) {
+        for (key, vector) in &server.state.vectors {
+            assert_eq!(
+                vector.values.capacity(),
+                0,
+                "{stage}: state.vectors[{key}] still owns a values allocation"
+            );
+            assert!(
+                server.vector_values.contains_key(key),
+                "{stage}: vector_values is missing {key}"
+            );
+        }
+    }
+
+    fn top_vector_id(server: &mut Server, id: u64, query: Value) -> Option<String> {
+        let search = server.handle(RpcRequest {
+            id,
+            method: "vector_search".to_string(),
+            params: json!({
+                "corpusId":"c1",
+                "namespace":"default",
+                "queryVector": query,
+                "topK": 1
+            }),
+        });
+        assert!(search.ok);
+        search.result.and_then(|result| {
+            result
+                .as_array()?
+                .first()?
+                .get("id")?
+                .as_str()
+                .map(str::to_string)
+        })
+    }
+
+    #[test]
+    fn vector_values_are_held_once_after_load_upsert_and_persist() {
+        // aira-graphdb#55 V1/V2: `Server.vector_values` is the only owner of
+        // decoded values; `state.vectors[k].values` keeps no allocation.
+        let path = temp_path("agdb-native-vectors-once");
+        let legacy = json!({
+            "nodes": {},
+            "edges": {},
+            "vectors": {
+                "c1:vec-inline": {
+                    "id": "vec-inline",
+                    "corpusId": "c1",
+                    "namespace": "default",
+                    "values": [0.0, 1.0],
+                    "metadata": {"documentId":"d1"}
+                }
+            },
+            "passages": {},
+            "snapshots": {},
+            "checkpoints": {}
+        });
+        fs::write(&path, legacy.to_string()).expect("write legacy state");
+
+        let mut server = Server::open(path.clone()).expect("open legacy");
+        assert_state_holds_no_vector_values(&server, "after legacy load");
+        assert_eq!(server.vector_values["c1:vec-inline"], vec![0.0, 1.0]);
+
+        begin_batch(&mut server);
+        apply_mutation(
+            &mut server,
+            RpcRequest {
+                id: 1,
+                method: "vector_upsert".to_string(),
+                params: json!({
+                    "records": [{
+                        "id": "vec-new",
+                        "corpusId": "c1",
+                        "namespace": "default",
+                        "values": [1.0, 0.0],
+                        "metadata": {"documentId":"d2"}
+                    }]
+                }),
+            },
+        );
+        assert_state_holds_no_vector_values(&server, "after upsert");
+        commit_batch(&mut server);
+        assert_state_holds_no_vector_values(&server, "after persist");
+        assert!(server.state.vectors.values().all(|v| v.blob_ref.is_some()));
+
+        let mut reopened = Server::open(path.clone()).expect("reopen");
+        assert_state_holds_no_vector_values(&reopened, "after blob load");
+        assert_eq!(reopened.vector_values["c1:vec-inline"], vec![0.0, 1.0]);
+        assert_eq!(reopened.vector_values["c1:vec-new"], vec![1.0, 0.0]);
+        assert_eq!(
+            top_vector_id(&mut reopened, 2, json!([0.0, 1.0])).as_deref(),
+            Some("vec-inline")
+        );
+        assert_eq!(
+            top_vector_id(&mut reopened, 3, json!([1.0, 0.0])).as_deref(),
+            Some("vec-new")
+        );
 
         cleanup(&path);
     }
