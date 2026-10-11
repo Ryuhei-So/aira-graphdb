@@ -2609,6 +2609,7 @@ fn protocol_info_is_the_method_policy_and_unknown_is_not_a_read() {
         ("memory_find_facts_by_entities", "read", false),
         ("memory_section_counts", "read", false),
         ("memory_activate_facts_by_schema_ids", "mutation", true),
+        ("memory_delete_document", "mutation", true),
         ("memory_save_checkpoint", "mutation", true),
         ("memory_load_checkpoint", "read", false),
         ("memory_validate_integrity", "read", false),
