@@ -78,6 +78,25 @@ fn prune_ids(array: Option<&mut Value>, ids: &HashSet<String>) {
     }
 }
 
+/// True when a non-empty passage id array would become empty once `removed`
+/// ids are pruned: the fact would lose all of its grounding.
+fn loses_all_passages(value: Option<&Value>, removed: &HashSet<String>) -> bool {
+    value.and_then(Value::as_array).is_some_and(|items| {
+        !items.is_empty()
+            && items
+                .iter()
+                .all(|item| item.as_str().is_some_and(|id| removed.contains(id)))
+    })
+}
+
+/// Stamps `updatedAt` only on an object that already carries the key, so a
+/// pruned ref keeps exactly its original key set.
+fn stamp_existing_updated_at(value: &mut Value, updated_at: &str) {
+    if let Some(slot) = value.get_mut("updatedAt") {
+        *slot = json!(updated_at);
+    }
+}
+
 fn string_array_contains(value: Option<&Value>, needle: &str) -> bool {
     value
         .and_then(Value::as_array)
@@ -218,15 +237,6 @@ impl Server {
                     }
                 }
             };
-            if matches!(fate, NodeFate::Remove) && node.layer == "fact" {
-                let fact_id = node
-                    .r#ref
-                    .get("factId")
-                    .and_then(Value::as_str)
-                    .or_else(|| node.node_id.strip_prefix("fact:"))
-                    .unwrap_or(&node.node_id);
-                removed_fact_ids.insert(fact_id.to_string());
-            }
             if matches!(fate, NodeFate::Remove) && node.layer == "passage" {
                 let passage_id = node
                     .r#ref
@@ -237,6 +247,50 @@ impl Server {
                 removed_passage_ids.insert(passage_id.to_string());
             }
             node_fates.insert(key.clone(), fate);
+        }
+        // W's passage ids also come from the snapshot (read-only here).
+        if let Some(passages) = self
+            .state
+            .snapshots
+            .get(corpus_id)
+            .and_then(|snapshot| snapshot.get("passages"))
+            .and_then(Value::as_array)
+        {
+            for passage in passages {
+                if passage
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("documentId"))
+                    .and_then(Value::as_str)
+                    == Some(document_id)
+                    && let Some(id) = passage.get("passageId").and_then(Value::as_str)
+                {
+                    removed_passage_ids.insert(id.to_string());
+                }
+            }
+        }
+        // A shared fact whose every passage belongs to W would lose its
+        // grounding; it is removed as if W owned it.
+        for (key, fate) in node_fates.iter_mut() {
+            let Some(node) = self.state.nodes.get(key) else {
+                continue;
+            };
+            if node.layer != "fact" {
+                continue;
+            }
+            if matches!(fate, NodeFate::Prune)
+                && loses_all_passages(node.r#ref.get("passageIds"), &removed_passage_ids)
+            {
+                *fate = NodeFate::Remove;
+            }
+            if matches!(fate, NodeFate::Remove) {
+                let fact_id = node
+                    .r#ref
+                    .get("factId")
+                    .and_then(Value::as_str)
+                    .or_else(|| node.node_id.strip_prefix("fact:"))
+                    .unwrap_or(&node.node_id);
+                removed_fact_ids.insert(fact_id.to_string());
+            }
         }
         for vector in self.state.vectors.values() {
             if vector.corpus_id == corpus_id
@@ -280,11 +334,11 @@ impl Server {
                     if let Some(schema_id) = fact.get("schemaId").and_then(Value::as_str) {
                         fact_schema_ids.insert(schema_id.to_string());
                     }
-                    if has_any_string(fact.get("sourceDocumentIds")) {
+                    if has_any_string(fact.get("sourceDocumentIds"))
+                        && !loses_all_passages(fact.get("passageIds"), removed_passage_ids)
+                    {
                         prune_ids(fact.get_mut("passageIds"), removed_passage_ids);
-                        if let Some(object) = fact.as_object_mut() {
-                            object.insert("updatedAt".to_string(), json!(updated_at));
-                        }
+                        stamp_existing_updated_at(fact, updated_at);
                         if let Some(fact_id) = fact.get("factId").and_then(Value::as_str) {
                             fact_post.insert(fact_id.to_string(), fact.clone());
                         }
@@ -359,7 +413,19 @@ impl Server {
                 rekey.insert(format!("schema:{schema_id}"), first);
             }
         }
-        for (key, fate) in node_fates {
+        for (key, mut fate) in node_fates {
+            if matches!(fate, NodeFate::Prune)
+                && self.state.nodes.get(&key).is_some_and(|node| {
+                    node.layer == "fact"
+                        && node
+                            .r#ref
+                            .get("factId")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| removed_fact_ids.contains(id))
+                })
+            {
+                fate = NodeFate::Remove;
+            }
             match fate {
                 NodeFate::Prune => {
                     let Some(node) = self.state.nodes.get_mut(&key) else {
@@ -377,9 +443,7 @@ impl Server {
                         _ => {
                             prune_string(node.r#ref.get_mut("sourceDocumentIds"), document_id);
                             prune_ids(node.r#ref.get_mut("passageIds"), &removed_passage_ids);
-                            if let Some(object) = node.r#ref.as_object_mut() {
-                                object.insert("updatedAt".to_string(), json!(updated_at));
-                            }
+                            stamp_existing_updated_at(&mut node.r#ref, updated_at);
                         }
                     }
                     if let Some(first) = first_string(node.r#ref.get("sourceDocumentIds")) {
@@ -416,9 +480,7 @@ impl Server {
                 None => {
                     prune_string(node.r#ref.get_mut("sourceDocumentIds"), document_id);
                     prune_ids(node.r#ref.get_mut("factIds"), &removed_fact_ids);
-                    if let Some(object) = node.r#ref.as_object_mut() {
-                        object.insert("updatedAt".to_string(), json!(updated_at));
-                    }
+                    stamp_existing_updated_at(&mut node.r#ref, updated_at);
                     first_string(node.r#ref.get("sourceDocumentIds"))
                 }
             };

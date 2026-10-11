@@ -108,7 +108,7 @@ cargo run --bin aira-graphdb-native -- --db /path/to/aira-graphdb-native.db
 
 文書 W に対する効果:
 
-- `metadata.documentId == W` のスナップショット passage を削除する。`sourceDocumentIds` に W を含む fact からは W を除き、出典が残らない場合だけ削除する。出典が残る fact は保持して `passageIds` から W の passage id を除き、`prunedSharedFacts` に数える。そのグラフノードは刈り込み後のスナップショット fact を写す。
+- `metadata.documentId == W` のスナップショット passage を削除する。`sourceDocumentIds` に W を含む fact からは W を除き、出典が残らない場合だけ削除する。出典が残らない fact、または `passageIds` がすべて W の passage である fact（根拠を失うため）は削除し `removedFacts` に数える。それ以外の fact は保持して W の passage id を除き、`prunedSharedFacts` に数える。他の ref のその場での刈り込みはキーを追加しない。`updatedAt` は既に持つ ref にだけ記録する。そのグラフノードは刈り込み後のスナップショット fact を写す。
 - W を含む schema、削除 fact を含む schema、W が触れた fact の schema を対象とする。対象 schema から W と削除 fact id を除き、`frequency` を 1 減らし（下限 0）、`frequency >= stabilizationThreshold` なら `stable`、そうでなければ `pending` にする（Synapse `DeleteDocumentService` の規則）。支持 0 の schema もスナップショットには残す。
 - グラフ: W の passage ノードと出典が残らない fact ノードを全エッジごと削除し、削除 fact id を持つ `entity_cooccurrence` エッジ（端点から厳密照合）も削除する。共有 fact ノードからは W を除く。schema ノードは支持が残る間は削除後のスナップショット schema を写し、支持 0 でエッジ・ベクトルごと削除する。`entity_mention` / `entity_cooccurrence` エッジが残らない entity は残りのエッジとベクトルごと削除する。残る entity の `ref.factCount` は再計算しない（upsert 単位の値であり全体の件数ではない）。
 - ベクトル: 削除ノードのベクトルと W 自身の非 ontology ベクトルを削除する。`metadata.documentId` が W のまま残るベクトル（W が最初の出典だった schema、共有 fact）は残る最初の出典へ付け替える。値と blob 参照は変えない。

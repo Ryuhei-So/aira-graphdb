@@ -987,7 +987,7 @@ fn graph_only_ontology_nodes_are_pruned_or_removed() {
     native.ok(
         "upsert_nodes",
         json!({"nodes": [
-            node("schema:g1", "ontology", json!({"schemaId": "g1", "sourceDocumentIds": [W, X], "factIds": [F_W1, F_X1]})),
+            node("schema:g1", "ontology", json!({"schemaId": "g1", "sourceDocumentIds": [W, X], "factIds": [F_W1, F_X1], "updatedAt": "old"})),
             node("schema:g2", "ontology", json!({"schemaId": "g2", "sourceDocumentIds": [W], "factIds": [F_W2]})),
             node(&fact_node_id(F_W1), "fact", fact(F_W1, "g1", "Alcohol", "Injury", &[W], &[P_W])),
         ]}),
@@ -1164,4 +1164,96 @@ fn unsupported_legacy_stale_schema_upsert_after_delete_reintroduces_w() {
         "and W's fact ids"
     );
     assert_eq!(s1["frequency"], json!(3));
+}
+
+/// N1: a shared fact whose only passages belong to W would be left
+/// ungrounded, so it is removed as if W owned it.
+#[test]
+fn shared_fact_left_without_passages_is_removed() {
+    let db = TempDb::new("ungrounded-shared-fact");
+    let mut native = Native::spawn(&db.path);
+    let f1 = fact("f1", "s1", "A", "B", &[W, X], &[P_W]);
+    native.begin();
+    native.ok(
+        "memory_upsert",
+        json!({
+            "corpusId": C,
+            "passages": [passage(P_W, W, "a b")],
+            "facts": [f1.clone()],
+            "schemas": [schema("s1", "A", "B", &[W, X], &["f1"], 2, "pending")],
+        }),
+    );
+    native.ok(
+        "upsert_nodes",
+        json!({"nodes": [
+            node("fact:f1", "fact", f1),
+            node(&passage_node_id(P_W), "passage", passage(P_W, W, "a b")),
+            node("entity:a", "entity", json!({"entityName": "a", "factCount": 1})),
+            node("entity:b", "entity", json!({"entityName": "b", "factCount": 1})),
+        ]}),
+    );
+    native.ok(
+        "upsert_edges",
+        json!({"edges": [evidence("f1", P_W), cooccur("a", "b", "f1")]}),
+    );
+    native.ok(
+        "vector_upsert",
+        json!({"records": [vector("fact:f1", "fact", "fact", Some(W), [1.0, 0.0])]}),
+    );
+    assert_eq!(native.commit(), 1);
+
+    native.begin();
+    let result = native.delete(W);
+    assert_eq!(result["removedFacts"], json!(1), "{result}");
+    assert_eq!(result["prunedSharedFacts"], json!(0));
+    assert_eq!(result["removedFactNodes"], json!(1));
+    assert_eq!(result["prunedSharedNodes"], json!(0));
+    assert_eq!(result["removedEntityNodes"], json!(2));
+    assert_eq!(result["removedEdges"], json!(2));
+    assert_eq!(result["removedVectors"], json!(1));
+    assert_eq!(native.commit(), 2);
+
+    let memory = native.ok("memory_load", json!({"corpusId": C}));
+    assert_eq!(memory["facts"], json!([]));
+    let s1 = find(&memory["schemas"], "schemaId", "s1").unwrap();
+    assert_eq!(s1["factIds"], json!([]));
+    assert_eq!(s1["sourceDocumentIds"], json!([X]));
+    assert_eq!(native.ok("get_nodes", json!({"corpusId": C})), json!([]));
+    assert_eq!(native.ok("get_edges", json!({"corpusId": C})), json!([]));
+    assert_eq!(vectors(&mut native, "fact"), json!([]));
+}
+
+/// N2: an in-place prune never adds keys; `updatedAt` is stamped only on a
+/// ref that already carries it.
+#[test]
+fn in_place_prune_keeps_the_original_ref_key_set() {
+    let db = TempDb::new("ref-key-set");
+    let mut native = Native::spawn(&db.path);
+    native.begin();
+    native.ok(
+        "memory_upsert",
+        json!({"corpusId": C, "schemas": [schema("s1", "A", "B", &[W, X], &[], 2, "pending")]}),
+    );
+    native.ok(
+        "upsert_nodes",
+        json!({"nodes": [
+            node("figure:1", "figure", json!({"sourceDocumentIds": [W, X], "caption": "c"})),
+            node("schema:s1", "fact", json!({"sourceDocumentIds": [W, X]})),
+        ]}),
+    );
+    assert_eq!(native.commit(), 1);
+
+    native.begin();
+    let result = native.delete(W);
+    assert_eq!(result["prunedSharedNodes"], json!(2), "{result}");
+    assert_eq!(native.commit(), 2);
+    let nodes = native.ok("get_nodes", json!({"corpusId": C}));
+    let figure = find(&nodes, "nodeId", "figure:1").unwrap();
+    assert_eq!(
+        figure["ref"],
+        json!({"sourceDocumentIds": [X], "caption": "c"})
+    );
+    let fact_layer = find(&nodes, "nodeId", "schema:s1").unwrap();
+    assert_eq!(fact_layer["layer"], json!("fact"));
+    assert_eq!(fact_layer["ref"], json!({"sourceDocumentIds": [X]}));
 }
