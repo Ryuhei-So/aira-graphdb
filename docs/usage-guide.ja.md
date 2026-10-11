@@ -92,6 +92,7 @@ cargo run --bin aira-graphdb-native -- --db /path/to/aira-graphdb-native.db
 | `lexical_index_passages` / `lexical_search` / `lexical_delete_by_document` | 全文インデックス登録・検索・削除 |
 | `memory_save` / `memory_load` | メモリスナップショット保存・読込 |
 | `memory_upsert` / `memory_activate_facts_by_schema_ids` | 上限付き indexing-memory 変更（差分 upsert、fact の活性化） |
+| `memory_delete_document` | 文書単位の置換削除。スナップショット、グラフ、ベクトル、語彙パッセージに及ぶ（下記参照） |
 | `memory_get_schemas_by_ids` / `memory_get_active_facts` | 上限付き indexing-memory 読み取り |
 | `memory_get_passages_by_ids` / `memory_get_facts_by_ids` | クエリ経路向けの限定読み取り: 要求 id の完全オブジェクトを要求順で返し、未知 id は省略 |
 | `memory_find_facts_by_entities` | `headEntity` / `tailEntity` が要求エンティティと Unicode 16 ケースフォールドで一致する fact を `factId` 昇順で返す |
@@ -100,6 +101,28 @@ cargo run --bin aira-graphdb-native -- --db /path/to/aira-graphdb-native.db
 | `memory_validate_integrity` | メモリ整合性検証（現状は空配列を返す） |
 | `projection_get_transitions` / `projection_get_dangling_nodes` / `projection_get_node_count` | 投影情報（遷移/ダングリング/ノード数）の取得 |
 | `projection_get_transitions_page` | 1 つの確定世代の遷移をページ単位で取得（下記） |
+
+### 文書単位の置換削除: `memory_delete_document`
+
+パラメータ（完全一致）: `{corpusId, documentId, updatedAt}`。bounded-indexing ワイヤプロファイルの WAL 変更。呼び出し側の開いたバッチ内で実行するため、削除と後続の `memory_upsert` は同じ世代として公開される。開いているバッチ内の読み取りには削除後の状態が見える。`batch_commit` までは他の読み手にも再起動後にも何も見えず、中断したバッチ（EOF や後続の致命的リクエスト）は `recovery_discard` 後に直前の世代を残す。
+
+文書 W に対する効果:
+
+- `metadata.documentId == W` のスナップショット passage を削除する。`sourceDocumentIds` に W を含む fact からは W を除き、出典が残らない場合だけ削除する。出典が残らない fact、または `passageIds` がすべて W の passage である fact（根拠を失うため）は削除し `removedFacts` に数える。それ以外の fact は保持して W の passage id を除き、`prunedSharedFacts` に数える。他の ref のその場での刈り込みはキーを追加しない。`updatedAt` は既に持つ ref にだけ記録する。そのグラフノードは刈り込み後のスナップショット fact を写す。
+- W を含む schema、削除 fact を含む schema、W が触れた fact の schema を対象とする。対象 schema から W と削除 fact id を除き、`frequency` を 1 減らし（下限 0）、`frequency >= stabilizationThreshold` なら `stable`、そうでなければ `pending` にする（Synapse `DeleteDocumentService` の規則）。支持 0 の schema もスナップショットには残す。
+- グラフ: W の passage ノードと出典が残らない fact ノードを全エッジごと削除し、削除 fact id を持つ `entity_cooccurrence` エッジ（端点から厳密照合）も削除する。共有 fact ノードからは W を除く。schema ノードは支持が残る間は削除後のスナップショット schema を写し、支持 0 でエッジ・ベクトルごと削除する。`entity_mention` / `entity_cooccurrence` エッジが残らない entity は残りのエッジとベクトルごと削除する。残る entity の `ref.factCount` は再計算しない（upsert 単位の値であり全体の件数ではない）。
+- ベクトル: 削除ノードのベクトルと W 自身の非 ontology ベクトルを削除する。`metadata.documentId` が W のまま残るベクトル（W が最初の出典だった schema、共有 fact）は残る最初の出典へ付け替える。値と blob 参照は変えない。
+- 語彙: ネイティブ語彙索引（唯一のエントリ種別は passage）の W のエントリを削除する。
+
+結果は平坦な件数オブジェクト: `corpusId`, `documentId`, `noop`, `removedPassages`, `removedFacts`, `prunedSharedFacts`, `prunedSchemas`, `schemaFrequencyAdjusted`, `removedPassageNodes`, `removedFactNodes`, `removedEntityNodes`, `removedOtherNodes`, `prunedSharedNodes`, `prunedOntologyNodes`, `removedOntologyNodes`, `removedEdges`, `removedVectors`, `rekeyedVectors`, `removedLexicalPassages`。`noop` は全件数が 0 のときに限り `true`。schema ベクトルの `documentId` にだけ現れる文書は、そのベクトルを付け替えて `noop: false` を返す。no-op でも WAL 変更であることは変わらない。
+
+検証は WAL 追記前に行い、不正なパラメータと、コーパスの不正な保存済みスナップショット（`memory_upsert` も要求する item 形状）だけを拒否する。他の変更と同じく、拒否するとこのネイティブプロセスは fail-closed で終了する。
+
+置換は canonical レーンでのみサポートする。`memory_delete_document` 後の legacy レーンの schema 書き込みはサポート外である。legacy の `memory_upsert` は CAS なしで schema オブジェクト全体を置き換えるため、削除前に読んだ schema を書くと W が黙って復活する。legacy レーンで置換するなら削除後に finalSchemas を作り直すこと。そうでなければ使ってはならない。
+
+既知の制約: canonical レーンは文書内の出現数を `frequency` に加算するが、この削除は 1 だけ減らすため、置換で `frequency` が増える方向にずれうる。削除前に計算した schema merge token は削除後には古い。呼び出し側は削除後に同じバッチ内で `memory_get_schemas_by_ids`（projection）を読み直し、merge intent を作り直す。
+
+WAL レコード中のメソッド名は永続的な意図である。このメソッドを持たないバイナリはその WAL を走査できないため、古いバイナリへ戻す前に現行バイナリで保留レコードを解決すること。
 
 ### メソッドポリシー（自動生成）
 
@@ -145,6 +168,7 @@ cargo run --bin aira-graphdb-native -- --print-method-policy-table
 | `memory_find_facts_by_entities` | read | false | bounded-indexing |
 | `memory_section_counts` | read | false | bounded-indexing |
 | `memory_activate_facts_by_schema_ids` | mutation | true | bounded-indexing |
+| `memory_delete_document` | mutation | true | bounded-indexing |
 | `memory_save_checkpoint` | mutation | true | normal |
 | `memory_load_checkpoint` | read | false | normal |
 | `memory_validate_integrity` | read | false | normal |

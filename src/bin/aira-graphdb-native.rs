@@ -33,6 +33,8 @@ use aira_graphdb::unicode16_lowercase;
 
 #[path = "aira-graphdb-native/bounded_retrieval_runtime.rs"]
 mod bounded_retrieval_runtime;
+#[path = "aira-graphdb-native/memory_delete_document.rs"]
+mod memory_delete_document;
 
 struct Sha256Writer(Sha256);
 
@@ -1767,6 +1769,16 @@ const METHOD_SPECS: &[MethodSpec] = &[
     // with the current binary before rolling back to that older binary.
     MethodSpec {
         name: "memory_activate_facts_by_schema_ids",
+        classification: "mutation",
+        wal: true,
+        wire_profile: MethodWireProfile::BoundedIndexing,
+    },
+    // Per-document replace delete (#57). The method name in a WAL record is
+    // durable intent exactly like memory_activate_facts_by_schema_ids: an
+    // older binary cannot scan it, so pending records must be resolved with
+    // the current binary before any rollback.
+    MethodSpec {
+        name: "memory_delete_document",
         classification: "mutation",
         wal: true,
         wire_profile: MethodWireProfile::BoundedIndexing,
@@ -7041,6 +7053,9 @@ impl Server {
                 // unreplayable recovery record.
                 self.validate_stored_facts_for_activation(corpus_id)?;
             }
+            "memory_delete_document" => {
+                self.validate_memory_delete_document(req, params)?;
+            }
             "memory_save" => {
                 let snapshot = params
                     .get("snapshot")
@@ -8523,6 +8538,15 @@ impl Server {
                         Self::execution_io_error(format!("persist failed: {err}"))
                     })?;
                     Ok(json!({"activated": activated}))
+                }
+                "memory_delete_document" => {
+                    // Validated before the WAL append; re-reading the fields
+                    // here never panics, so the apply path stays infallible.
+                    let params = Self::params_object(&req.params)?;
+                    let corpus_id = Self::required_string(params, "corpusId")?.to_string();
+                    let document_id = Self::required_string(params, "documentId")?.to_string();
+                    let updated_at = Self::required_string(params, "updatedAt")?.to_string();
+                    Ok(self.apply_memory_delete_document(&corpus_id, &document_id, &updated_at))
                 }
                 "memory_save_checkpoint" => {
                     let checkpoint = req
@@ -11485,6 +11509,7 @@ mod tests {
             "memory_find_facts_by_entities",
             "memory_section_counts",
             "memory_activate_facts_by_schema_ids",
+            "memory_delete_document",
             "memory_save_checkpoint",
             "memory_load_checkpoint",
             "memory_validate_integrity",
@@ -11515,6 +11540,7 @@ mod tests {
             "memory_find_facts_by_entities",
             "memory_section_counts",
             "memory_activate_facts_by_schema_ids",
+            "memory_delete_document",
             "projection_get_transitions_page",
         ]
         .into_iter()
