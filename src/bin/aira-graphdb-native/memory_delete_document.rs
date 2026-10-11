@@ -71,6 +71,13 @@ fn prune_string(array: Option<&mut Value>, needle: &str) -> bool {
     items.len() != before
 }
 
+/// Removes every string listed in `ids` from a JSON string array in place.
+fn prune_ids(array: Option<&mut Value>, ids: &HashSet<String>) {
+    if let Some(items) = array.and_then(Value::as_array_mut) {
+        items.retain(|item| !item.as_str().is_some_and(|id| ids.contains(id)));
+    }
+}
+
 fn string_array_contains(value: Option<&Value>, needle: &str) -> bool {
     value
         .and_then(Value::as_array)
@@ -162,6 +169,7 @@ impl Server {
         let mut ontology_keys: HashSet<String> = HashSet::new();
         let mut needed_schema_ids: HashSet<String> = HashSet::new();
         let mut removed_fact_ids: HashSet<String> = HashSet::new();
+        let mut removed_passage_ids: HashSet<String> = HashSet::new();
         for (key, node) in &self.state.nodes {
             if node.corpus_id != corpus_id {
                 continue;
@@ -219,6 +227,15 @@ impl Server {
                     .unwrap_or(&node.node_id);
                 removed_fact_ids.insert(fact_id.to_string());
             }
+            if matches!(fate, NodeFate::Remove) && node.layer == "passage" {
+                let passage_id = node
+                    .r#ref
+                    .get("passageId")
+                    .and_then(Value::as_str)
+                    .or_else(|| node.node_id.strip_prefix("passage:"))
+                    .unwrap_or(&node.node_id);
+                removed_passage_ids.insert(passage_id.to_string());
+            }
             node_fates.insert(key.clone(), fate);
         }
         for vector in self.state.vectors.values() {
@@ -235,19 +252,25 @@ impl Server {
         //    `schema_post` holds the post-delete schema of every affected or
         //    needed schema; the graph mirrors it (memory-schema@1 hydration).
         let mut schema_post: HashMap<String, Value> = HashMap::new();
+        let mut fact_post: HashMap<String, Value> = HashMap::new();
         if let Some(snapshot) = self.state.snapshots.get_mut(corpus_id) {
             if let Some(passages) = snapshot.get_mut("passages").and_then(Value::as_array_mut) {
                 let before = passages.len();
                 passages.retain(|passage| {
-                    passage
+                    let owned = passage
                         .get("metadata")
                         .and_then(|metadata| metadata.get("documentId"))
                         .and_then(Value::as_str)
-                        != Some(document_id)
+                        == Some(document_id);
+                    if owned && let Some(id) = passage.get("passageId").and_then(Value::as_str) {
+                        removed_passage_ids.insert(id.to_string());
+                    }
+                    !owned
                 });
-                counts.removed_passages = (before - passages.len()) as u64;
+                counts.removed_passages = before.saturating_sub(passages.len()) as u64;
             }
             let mut fact_schema_ids: HashSet<String> = HashSet::new();
+            let removed_passage_ids = &removed_passage_ids;
             if let Some(facts) = snapshot.get_mut("facts").and_then(Value::as_array_mut) {
                 let before = facts.len();
                 facts.retain_mut(|fact| {
@@ -258,7 +281,13 @@ impl Server {
                         fact_schema_ids.insert(schema_id.to_string());
                     }
                     if has_any_string(fact.get("sourceDocumentIds")) {
-                        fact["updatedAt"] = json!(updated_at);
+                        prune_ids(fact.get_mut("passageIds"), removed_passage_ids);
+                        if let Some(object) = fact.as_object_mut() {
+                            object.insert("updatedAt".to_string(), json!(updated_at));
+                        }
+                        if let Some(fact_id) = fact.get("factId").and_then(Value::as_str) {
+                            fact_post.insert(fact_id.to_string(), fact.clone());
+                        }
                         counts.pruned_shared_facts += 1;
                         return true;
                     }
@@ -267,15 +296,17 @@ impl Server {
                     }
                     false
                 });
-                counts.removed_facts = (before - facts.len()) as u64;
+                counts.removed_facts = before.saturating_sub(facts.len()) as u64;
             }
             if let Some(schemas) = snapshot.get_mut("schemas").and_then(Value::as_array_mut) {
                 for schema in schemas.iter_mut() {
-                    let schema_id = schema
+                    let Some(schema_id) = schema
                         .get("schemaId")
                         .and_then(Value::as_str)
-                        .expect("stored schema id validated before WAL")
-                        .to_string();
+                        .map(ToString::to_string)
+                    else {
+                        continue;
+                    };
                     let lists_document =
                         string_array_contains(schema.get("sourceDocumentIds"), document_id);
                     let lists_removed_fact = schema
@@ -307,7 +338,14 @@ impl Server {
         }
         for schema_id in schema_post.keys() {
             let key = Self::key(corpus_id, &format!("schema:{schema_id}"));
-            if self.state.nodes.contains_key(&key) {
+            // Only an ontology node mirrors a schema; a non-ontology node that
+            // happens to use a `schema:` id is handled by its own layer rule.
+            if self
+                .state
+                .nodes
+                .get(&key)
+                .is_some_and(|node| node.layer == "ontology")
+            {
                 ontology_keys.insert(key);
             }
         }
@@ -322,25 +360,37 @@ impl Server {
             }
         }
         for (key, fate) in node_fates {
-            let node = self
-                .state
-                .nodes
-                .get_mut(&key)
-                .expect("node fate came from live state");
             match fate {
                 NodeFate::Prune => {
-                    prune_string(node.r#ref.get_mut("sourceDocumentIds"), document_id);
+                    let Some(node) = self.state.nodes.get_mut(&key) else {
+                        continue;
+                    };
+                    // A shared fact node mirrors its post-delete snapshot fact;
+                    // any other shared node is pruned in place.
+                    let post = node
+                        .r#ref
+                        .get("factId")
+                        .and_then(Value::as_str)
+                        .and_then(|id| fact_post.get(id));
+                    match post {
+                        Some(post) if node.layer == "fact" => node.r#ref = post.clone(),
+                        _ => {
+                            prune_string(node.r#ref.get_mut("sourceDocumentIds"), document_id);
+                            prune_ids(node.r#ref.get_mut("passageIds"), &removed_passage_ids);
+                            if let Some(object) = node.r#ref.as_object_mut() {
+                                object.insert("updatedAt".to_string(), json!(updated_at));
+                            }
+                        }
+                    }
                     if let Some(first) = first_string(node.r#ref.get("sourceDocumentIds")) {
                         rekey.insert(node.node_id.clone(), first);
                     }
                     counts.pruned_shared_nodes += 1;
                 }
                 NodeFate::Remove => {
-                    let node = self
-                        .state
-                        .nodes
-                        .remove(&key)
-                        .expect("node fate came from live state");
+                    let Some(node) = self.state.nodes.remove(&key) else {
+                        continue;
+                    };
                     match node.layer.as_str() {
                         "passage" => counts.removed_passage_nodes += 1,
                         "fact" => counts.removed_fact_nodes += 1,
@@ -351,11 +401,9 @@ impl Server {
             }
         }
         for key in ontology_keys {
-            let node = self
-                .state
-                .nodes
-                .get_mut(&key)
-                .expect("ontology key came from live state");
+            let Some(node) = self.state.nodes.get_mut(&key) else {
+                continue;
+            };
             let post = schema_id_of_node(node).and_then(|id| schema_post.get(&id));
             let support = match post {
                 Some(post) => {
@@ -367,12 +415,9 @@ impl Server {
                 }
                 None => {
                     prune_string(node.r#ref.get_mut("sourceDocumentIds"), document_id);
-                    if let Some(fact_ids) =
-                        node.r#ref.get_mut("factIds").and_then(Value::as_array_mut)
-                    {
-                        fact_ids.retain(|id| {
-                            !id.as_str().is_some_and(|id| removed_fact_ids.contains(id))
-                        });
+                    prune_ids(node.r#ref.get_mut("factIds"), &removed_fact_ids);
+                    if let Some(object) = node.r#ref.as_object_mut() {
+                        object.insert("updatedAt".to_string(), json!(updated_at));
                     }
                     first_string(node.r#ref.get("sourceDocumentIds"))
                 }
@@ -383,11 +428,9 @@ impl Server {
                     counts.pruned_ontology_nodes += 1;
                 }
                 None => {
-                    let node = self
-                        .state
-                        .nodes
-                        .remove(&key)
-                        .expect("ontology key came from live state");
+                    let Some(node) = self.state.nodes.remove(&key) else {
+                        continue;
+                    };
                     rekey.remove(&node.node_id);
                     removed_node_ids.insert(node.node_id);
                     counts.removed_ontology_nodes += 1;
@@ -464,7 +507,7 @@ impl Server {
                         || removed_node_ids.contains(&edge.target_node_id))
             });
         }
-        counts.removed_edges = (before_edges - self.state.edges.len()) as u64;
+        counts.removed_edges = before_edges.saturating_sub(self.state.edges.len()) as u64;
 
         // 6. Vectors: drop those of removed nodes and the document's own
         //    non-ontology vectors; re-key a survivor still naming the document.
@@ -480,9 +523,9 @@ impl Server {
             if vector.metadata.get("documentId").and_then(Value::as_str) != Some(document_id) {
                 return true;
             }
-            match rekey.get(&vector.id) {
-                Some(first) if vector.metadata.is_object() => {
-                    vector.metadata["documentId"] = json!(first);
+            match (rekey.get(&vector.id), vector.metadata.as_object_mut()) {
+                (Some(first), Some(metadata)) => {
+                    metadata.insert("documentId".to_string(), json!(first));
                     counts.rekeyed_vectors += 1;
                     true
                 }
@@ -502,7 +545,8 @@ impl Server {
         self.state
             .passages
             .retain(|_, p| !(p.corpus_id == corpus_id && p.document_id == document_id));
-        counts.removed_lexical_passages = (before_lexical - self.state.passages.len()) as u64;
+        counts.removed_lexical_passages =
+            before_lexical.saturating_sub(self.state.passages.len()) as u64;
 
         let noop = counts.total() == 0;
         if !noop {
@@ -543,9 +587,10 @@ impl Server {
         counts: &mut DeleteCounts,
     ) {
         prune_string(schema.get_mut("sourceDocumentIds"), document_id);
-        if let Some(fact_ids) = schema.get_mut("factIds").and_then(Value::as_array_mut) {
-            fact_ids.retain(|id| !id.as_str().is_some_and(|id| removed_fact_ids.contains(id)));
-        }
+        prune_ids(schema.get_mut("factIds"), removed_fact_ids);
+        let Some(schema) = schema.as_object_mut() else {
+            return;
+        };
         let safe = |value: Option<&Value>| {
             value
                 .and_then(Value::as_u64)
@@ -553,16 +598,17 @@ impl Server {
         };
         if let Some(frequency) = safe(schema.get("frequency")) {
             let next = frequency.saturating_sub(1);
-            schema["frequency"] = json!(next);
+            schema.insert("frequency".to_string(), json!(next));
             if let Some(threshold) = safe(schema.get("stabilizationThreshold")) {
-                schema["state"] = json!(if next >= threshold {
+                let state = if next >= threshold {
                     "stable"
                 } else {
                     "pending"
-                });
+                };
+                schema.insert("state".to_string(), json!(state));
             }
             counts.schema_frequency_adjusted += 1;
         }
-        schema["updatedAt"] = json!(updated_at);
+        schema.insert("updatedAt".to_string(), json!(updated_at));
     }
 }

@@ -129,6 +129,13 @@ impl Native {
         )
     }
 
+    fn ensure_alive(&mut self) {
+        assert!(
+            self.child.try_wait().expect("query child status").is_none(),
+            "native sidecar exited"
+        );
+    }
+
     fn wait_exit(mut self) -> Option<i32> {
         drop(self.stdin.take());
         let start = Instant::now();
@@ -312,7 +319,7 @@ fn snapshot_facts() -> Vec<Value> {
         fact(F_W1, "s1", "Alcohol", "Injury", &[W], &[P_W]),
         fact(F_W2, "s2", "Smoking", "Cancer", &[W], &[P_W]),
         fact(F_X1, "s1", "Alcohol", "Liver", &[X], &[P_X]),
-        fact(F_SHARED, "s1", "Alcohol", "Falls", &[W, X], &[P_X]),
+        fact(F_SHARED, "s1", "Alcohol", "Falls", &[W, X], &[P_W, P_X]),
     ]
 }
 
@@ -358,6 +365,7 @@ fn seed_graph_vectors_lexical(native: &mut Native) {
             evidence(F_W1, P_W),
             evidence(F_W2, P_W),
             evidence(F_X1, P_X),
+            evidence(F_SHARED, P_W),
             evidence(F_SHARED, P_X),
             cooccur("alcohol", "injury", F_W1),
             cooccur("smoking", "cancer", F_W2),
@@ -369,6 +377,7 @@ fn seed_graph_vectors_lexical(native: &mut Native) {
             mention("cancer", P_W),
             mention("alcohol", P_X),
             mention("liver", P_X),
+            mention("falls", P_W),
             mention("falls", P_X),
             edge("type-bridge:s1:s2", "schema:s1", "schema:s2", "type_based_bridge"),
         ]}),
@@ -471,8 +480,8 @@ fn expected_delete_counts() -> Value {
         "prunedSharedNodes": 1,
         "prunedOntologyNodes": 1,
         "removedOntologyNodes": 1,
-        // instance x2, evidence x2, cooccur x2, mention x4, type bridge x1
-        "removedEdges": 11,
+        // instance x2, evidence x3, cooccur x2, mention x5, type bridge x1
+        "removedEdges": 13,
         // schema:s2, two W facts, W passage, three orphan entities
         "removedVectors": 7,
         // schema:s1 (W was first source) and the shared fact
@@ -532,6 +541,12 @@ fn assert_post_delete_state(native: &mut Native) {
     );
     let shared = find(&memory["facts"], "factId", F_SHARED).expect("shared fact kept");
     assert_eq!(shared["sourceDocumentIds"], json!([X]));
+    assert_eq!(
+        shared["passageIds"],
+        json!([P_X]),
+        "W's passage ids are pruned"
+    );
+    assert_eq!(shared["updatedAt"], json!(UPDATED_AT));
     let s1 = find(&memory["schemas"], "schemaId", "s1").expect("s1 kept");
     assert_eq!(s1["sourceDocumentIds"], json!([X]));
     assert_eq!(s1["factIds"], json!([F_X1, F_SHARED]));
@@ -563,7 +578,10 @@ fn assert_post_delete_state(native: &mut Native) {
         "schema node mirrors the snapshot schema"
     );
     let shared_node = find(&nodes, "nodeId", &fact_node_id(F_SHARED)).expect("shared fact node");
-    assert_eq!(shared_node["ref"]["sourceDocumentIds"], json!([X]));
+    assert_eq!(
+        shared_node["ref"], *shared,
+        "shared fact node mirrors the snapshot fact"
+    );
     let alcohol = find(&nodes, "nodeId", "entity:alcohol").expect("alcohol");
     assert_eq!(
         alcohol["ref"]["factCount"],
@@ -927,4 +945,223 @@ fn protocol_info_advertises_memory_delete_document_as_a_wal_mutation() {
         .clone();
     assert_eq!(method["classification"], json!("mutation"));
     assert_eq!(method["wal"], json!(true));
+}
+
+/// M1: a non-ontology node that happens to use a `schema:` id must follow its
+/// own layer rule and never reach the ontology step (it used to panic after
+/// the WAL append).
+#[test]
+fn non_ontology_node_with_a_schema_id_is_removed_without_panicking() {
+    let db = TempDb::new("schema-id-fact-layer");
+    let mut native = Native::spawn(&db.path);
+    native.begin();
+    native.ok(
+        "memory_upsert",
+        json!({"corpusId": C, "schemas": [schema("s1", "A", "B", &[W], &[], 1, "pending")]}),
+    );
+    native.ok(
+        "upsert_nodes",
+        json!({"nodes": [node("schema:s1", "fact", json!({"sourceDocumentIds": [W]}))]}),
+    );
+    assert_eq!(native.commit(), 1);
+
+    native.begin();
+    let result = native.delete(W);
+    assert_eq!(result["removedFactNodes"], json!(1), "{result}");
+    assert_eq!(result["removedOntologyNodes"], json!(0));
+    assert_eq!(result["prunedSchemas"], json!(1));
+    native.ensure_alive();
+    assert_eq!(native.commit(), 2);
+    let nodes = native.ok("get_nodes", json!({"corpusId": C}));
+    assert_eq!(nodes, json!([]));
+    assert_eq!(native.wait_exit(), Some(0));
+}
+
+/// An ontology node with no snapshot schema is pruned in place, or removed
+/// with its vector at support 0.
+#[test]
+fn graph_only_ontology_nodes_are_pruned_or_removed() {
+    let db = TempDb::new("graph-only-ontology");
+    let mut native = Native::spawn(&db.path);
+    native.begin();
+    native.ok(
+        "upsert_nodes",
+        json!({"nodes": [
+            node("schema:g1", "ontology", json!({"schemaId": "g1", "sourceDocumentIds": [W, X], "factIds": [F_W1, F_X1]})),
+            node("schema:g2", "ontology", json!({"schemaId": "g2", "sourceDocumentIds": [W], "factIds": [F_W2]})),
+            node(&fact_node_id(F_W1), "fact", fact(F_W1, "g1", "Alcohol", "Injury", &[W], &[P_W])),
+        ]}),
+    );
+    native.ok(
+        "upsert_edges",
+        json!({"edges": [
+            edge("schema-instance:g1:x", "schema:g1", &fact_node_id(F_W1), "schema_instance"),
+            edge("type-bridge:g1:g2", "schema:g1", "schema:g2", "type_based_bridge"),
+        ]}),
+    );
+    native.ok(
+        "vector_upsert",
+        json!({"records": [
+            vector("schema:g1", "schema", "ontology", Some(W), [1.0, 0.0]),
+            vector("schema:g2", "schema", "ontology", Some(W), [0.0, 1.0]),
+        ]}),
+    );
+    assert_eq!(native.commit(), 1);
+
+    native.begin();
+    let result = native.delete(W);
+    assert_eq!(result["prunedOntologyNodes"], json!(1), "{result}");
+    assert_eq!(result["removedOntologyNodes"], json!(1));
+    assert_eq!(result["removedFactNodes"], json!(1));
+    assert_eq!(result["rekeyedVectors"], json!(1));
+    assert_eq!(result["removedVectors"], json!(1));
+    assert_eq!(result["removedEdges"], json!(2));
+    assert_eq!(native.commit(), 2);
+
+    let nodes = native.ok("get_nodes", json!({"corpusId": C}));
+    assert_eq!(ids(&nodes, "nodeId"), vec!["schema:g1".to_string()]);
+    assert_eq!(nodes[0]["ref"]["sourceDocumentIds"], json!([X]));
+    assert_eq!(nodes[0]["ref"]["factIds"], json!([F_X1]));
+    assert_eq!(nodes[0]["ref"]["updatedAt"], json!(UPDATED_AT));
+    let schema_vectors = vectors(&mut native, "schema");
+    assert_eq!(ids(&schema_vectors, "id"), vec!["schema:g1".to_string()]);
+    assert_eq!(schema_vectors[0]["metadata"]["documentId"], json!(X));
+    assert_eq!(native.ok("get_edges", json!({"corpusId": C})), json!([]));
+    assert_eq!(native.wait_exit(), Some(0));
+}
+
+fn observe_corpus(native: &mut Native, corpus: &str) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "memory".into(),
+        native.ok("memory_load", json!({"corpusId": corpus})),
+    );
+    out.insert(
+        "nodes".into(),
+        native.ok("get_nodes", json!({"corpusId": corpus})),
+    );
+    out.insert(
+        "edges".into(),
+        native.ok("get_edges", json!({"corpusId": corpus})),
+    );
+    out.insert(
+        "lexical".into(),
+        native.ok(
+            "lexical_search",
+            json!({"corpusId": corpus, "query": "alcohol", "topK": 10}),
+        ),
+    );
+    for namespace in ["schema", "fact", "passage", "entity"] {
+        out.insert(
+            namespace.into(),
+            native.ok(
+                "vector_search",
+                json!({"corpusId": corpus, "namespace": namespace, "queryVector": [1.0, 1.0], "topK": 100}),
+            ),
+        );
+    }
+    Value::Object(out)
+}
+
+/// Deleting W in one corpus never touches the same document id elsewhere.
+#[test]
+fn delete_is_isolated_to_its_corpus() {
+    const C2: &str = "c2";
+    let db = TempDb::new("isolation");
+    let mut native = Native::spawn(&db.path);
+    seed_legacy(&mut native);
+    native.begin();
+    let mut s1 = schema("s1", "Exposure", "Outcome", &[W], &["f2"], 3, "stable");
+    s1["corpusId"] = json!(C2);
+    let mut p = passage(P_W, W, "alcohol in c2");
+    p["corpusId"] = json!(C2);
+    native.ok(
+        "memory_upsert",
+        json!({
+            "corpusId": C2,
+            "passages": [p.clone()],
+            "facts": [{"factId": "f2", "corpusId": C2, "schemaId": "s1", "state": "active",
+                       "headEntity": "Alcohol", "tailEntity": "Injury",
+                       "sourceDocumentIds": [W], "passageIds": [P_W]}],
+            "schemas": [s1.clone()],
+        }),
+    );
+    let c2_node = |node_id: &str, layer: &str, r#ref: Value| json!({"nodeId": node_id, "corpusId": C2, "layer": layer, "ref": r#ref, "label": node_id});
+    native.ok(
+        "upsert_nodes",
+        json!({"nodes": [
+            c2_node("schema:s1", "ontology", s1),
+            c2_node(&passage_node_id(P_W), "passage", p.clone()),
+            c2_node("entity:alcohol", "entity", json!({"entityName": "alcohol", "factCount": 1})),
+        ]}),
+    );
+    native.ok(
+        "upsert_edges",
+        json!({"edges": [{
+            "edgeId": format!("entity-mention:alcohol:{P_W}"), "corpusId": C2,
+            "sourceNodeId": "entity:alcohol", "targetNodeId": passage_node_id(P_W),
+            "relation": "entity_mention", "weight": 1.0, "bridgeKind": null,
+        }]}),
+    );
+    let c2_vector = |id: &str, namespace: &str, layer: &str, document_id: Option<&str>| {
+        let mut record = vector(id, namespace, layer, document_id, [0.3, 0.7]);
+        record["corpusId"] = json!(C2);
+        record
+    };
+    native.ok(
+        "vector_upsert",
+        json!({"records": [
+            c2_vector("schema:s1", "schema", "ontology", Some(W)),
+            c2_vector(&passage_node_id(P_W), "passage", "passage", Some(W)),
+            c2_vector("entity:alcohol", "entity", "entity", None),
+        ]}),
+    );
+    native.ok(
+        "lexical_index_passages",
+        json!({"corpusId": C2, "passages": [p]}),
+    );
+    assert_eq!(native.commit(), 2);
+    let before = observe_corpus(&mut native, C2);
+    assert_eq!(before["schema"][0]["metadata"]["documentId"], json!(W));
+
+    native.begin();
+    assert_eq!(native.delete(W), expected_delete_counts());
+    assert_eq!(native.commit(), 3);
+    assert_post_delete_state(&mut native);
+    assert_eq!(observe_corpus(&mut native, C2), before, "c2 is untouched");
+    assert_eq!(native.wait_exit(), Some(0));
+}
+
+/// UNSUPPORTED BEHAVIOUR, documented on purpose (consumer contract). A
+/// legacy-lane replace that upserts full schemas read before the delete
+/// silently restores W's pruned schema state, because legacy schema writes
+/// replace whole objects without CAS. Replace is supported on the canonical
+/// lane only; a legacy-lane replace must rebuild finalSchemas after the
+/// delete, or must not be used.
+#[test]
+fn unsupported_legacy_stale_schema_upsert_after_delete_reintroduces_w() {
+    let db = TempDb::new("legacy-hazard");
+    let mut native = Native::spawn(&db.path);
+    seed_legacy(&mut native);
+    let (stale_s1, _) = snapshot_schemas();
+    native.begin();
+    native.delete(W);
+    native.ok(
+        "memory_upsert",
+        json!({"corpusId": C, "schemas": [stale_s1]}),
+    );
+    assert_eq!(native.commit(), 2);
+    let memory = native.ok("memory_load", json!({"corpusId": C}));
+    let s1 = find(&memory["schemas"], "schemaId", "s1").unwrap();
+    assert_eq!(
+        s1["sourceDocumentIds"],
+        json!([W, X]),
+        "stale write restores W"
+    );
+    assert_eq!(
+        s1["factIds"],
+        json!([F_W1, F_X1, F_SHARED]),
+        "and W's fact ids"
+    );
+    assert_eq!(s1["frequency"], json!(3));
 }

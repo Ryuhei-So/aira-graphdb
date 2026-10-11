@@ -8540,18 +8540,12 @@ impl Server {
                     Ok(json!({"activated": activated}))
                 }
                 "memory_delete_document" => {
-                    let params = req
-                        .params
-                        .as_object()
-                        .expect("mutation params validated before WAL");
-                    let field = |name: &str| {
-                        params[name]
-                            .as_str()
-                            .expect("delete params validated before WAL")
-                            .to_string()
-                    };
-                    let (corpus_id, document_id, updated_at) =
-                        (field("corpusId"), field("documentId"), field("updatedAt"));
+                    // Validated before the WAL append; re-reading the fields
+                    // here never panics, so the apply path stays infallible.
+                    let params = Self::params_object(&req.params)?;
+                    let corpus_id = Self::required_string(params, "corpusId")?.to_string();
+                    let document_id = Self::required_string(params, "documentId")?.to_string();
+                    let updated_at = Self::required_string(params, "updatedAt")?.to_string();
                     Ok(self.apply_memory_delete_document(&corpus_id, &document_id, &updated_at))
                 }
                 "memory_save_checkpoint" => {

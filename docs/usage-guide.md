@@ -104,19 +104,21 @@ Search:
 
 ### Per-document replace delete: `memory_delete_document`
 
-Params (exact): `{corpusId, documentId, updatedAt}`. A WAL mutation with the bounded-indexing wire profile. It must run inside the caller's open batch, so a delete and the following `memory_upsert` publish in one generation; nothing is visible before `batch_commit`, and an aborted batch (EOF, or any later fatal request) leaves the prior generation after `recovery_discard`.
+Params (exact): `{corpusId, documentId, updatedAt}`. A WAL mutation with the bounded-indexing wire profile. It must run inside the caller's open batch, so a delete and the following `memory_upsert` publish in one generation. Reads inside the active batch DO see the post-delete state; nothing is visible to other readers or to a restart until `batch_commit`, and an aborted batch (EOF, or any later fatal request) leaves the prior generation after `recovery_discard`.
 
 Effects for document W:
 
-- Snapshot passages with `metadata.documentId == W` are removed. A fact listing W in `sourceDocumentIds` loses W; it is removed only when no source remains, otherwise it is kept and counted in `prunedSharedFacts`.
+- Snapshot passages with `metadata.documentId == W` are removed. A fact listing W in `sourceDocumentIds` loses W; it is removed only when no source remains, otherwise it is kept, loses W's passage ids from `passageIds`, and is counted in `prunedSharedFacts`; its graph node mirrors the pruned snapshot fact.
 - A snapshot schema is affected when it lists W, lists a removed fact, or is the schema of a fact W touched. Affected schemas lose W and the removed fact ids, `frequency` is decremented once (floor 0), and `state` becomes `stable` iff `frequency >= stabilizationThreshold`, else `pending` (the Synapse `DeleteDocumentService` rule). A schema whose support reaches 0 is kept in the snapshot.
 - Graph: passage nodes of W and fact nodes left without a source are removed with all their edges, plus the `entity_cooccurrence` edges whose id carries a removed fact id (matched exactly against the edge's endpoints). A shared fact node loses W. A schema node mirrors the post-delete snapshot schema while support > 0 and is removed with its edges and vector at support 0. An entity left without any `entity_mention` or `entity_cooccurrence` edge is removed with its remaining edges and its vector. A surviving entity's `ref.factCount` is not recomputed: it is per-upsert, not a global count.
 - Vectors: those of removed nodes and W's own non-ontology vectors are removed. A surviving vector whose `metadata.documentId` is W (a schema whose first source was W, or a shared fact) is re-keyed to the first remaining source; its values and blob reference are unchanged.
 - Lexical: W's entries in the native lexical index (passages, its only entry kind) are removed.
 
-The result is a flat count object: `corpusId`, `documentId`, `noop`, `removedPassages`, `removedFacts`, `prunedSharedFacts`, `prunedSchemas`, `schemaFrequencyAdjusted`, `removedPassageNodes`, `removedFactNodes`, `removedEntityNodes`, `removedOtherNodes`, `prunedSharedNodes`, `prunedOntologyNodes`, `removedOntologyNodes`, `removedEdges`, `removedVectors`, `rekeyedVectors`, `removedLexicalPassages`. Deleting an absent document returns `noop: true` with every count 0; it is still a WAL mutation.
+The result is a flat count object: `corpusId`, `documentId`, `noop`, `removedPassages`, `removedFacts`, `prunedSharedFacts`, `prunedSchemas`, `schemaFrequencyAdjusted`, `removedPassageNodes`, `removedFactNodes`, `removedEntityNodes`, `removedOtherNodes`, `prunedSharedNodes`, `prunedOntologyNodes`, `removedOntologyNodes`, `removedEdges`, `removedVectors`, `rekeyedVectors`, `removedLexicalPassages`. `noop` is `true` iff every count is 0. A document that appears only as a schema vector's `documentId` re-keys that vector and reports `noop: false`. A no-op is still a WAL mutation.
 
 Validation runs before the WAL append and rejects only malformed params and a malformed stored snapshot of the corpus (the item shape `memory_upsert` also requires). As for every mutation, a rejection makes this native process exit fail-closed.
+
+Replace is supported on the canonical lane only. Legacy-lane schema writes after `memory_delete_document` are unsupported: a legacy `memory_upsert` replaces whole schema objects without CAS, so full schemas read before the delete silently restore W. A legacy-lane replace must rebuild finalSchemas after the delete, or must not be used.
 
 Known limitation: the canonical lane adds a document's occurrence count to `frequency`, while this delete subtracts 1, so a replace can drift `frequency` upward. A schema merge token computed before the delete is stale after it; a caller re-reads `memory_get_schemas_by_ids` (projection) inside the same batch after the delete and rebuilds its merge intents from that read.
 
